@@ -203,7 +203,7 @@ class Model(nn.Module):
         return self.calculate_perceptual_loss(output, target)  
 
 def get_model():
-    return Model()
+    return Model(initial_out_channels=32, mid_out_channels=64)
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

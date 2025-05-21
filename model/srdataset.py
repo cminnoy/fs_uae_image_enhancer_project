@@ -255,7 +255,7 @@ class SRDataset(Dataset):
     Applies synchronized random horizontal and vertical flips.
     Loads pre-cropped images based on the provided paths.
     """
-    # Changed __init__ signature
+
     def __init__(self, sample_pairs_list: list[tuple[str, str]], expected_crop_size: tuple[int, int], num_samples: int):
         """
         Args:
@@ -267,8 +267,6 @@ class SRDataset(Dataset):
                          __len__ will return this value. Samples are drawn randomly
                          from the available pool (sample_pairs_list).
         """
-        # Removed dataset_dir, split, and styles_to_include from args
-        # styles_to_include filtering is done during sample gathering now
 
         self.available_samples_pool: list[tuple[str, str]] = sample_pairs_list # Directly assign the list
         self.expected_crop_w, self.expected_crop_h = expected_crop_size
@@ -278,11 +276,6 @@ class SRDataset(Dataset):
         if not self.available_samples_pool:
             # Warning handled before dataset creation, but defensive check.
             warnings.warn(f"SRDataset initialized with an empty sample pool.")
-
-
-        # self.to_tensor = ToTensor() # No longer use ToTensor for input
-        # Removed _parse_filename and _gather_available_samples methods
-        # Removed self.styles_to_include
 
     def __len__(self):
         """
@@ -315,6 +308,7 @@ class SRDataset(Dataset):
         # Load the images using Pillow.
         try:
             # TODO just keep float32 BCHW format and adapt the onnx converter to add layer on front
+
             # Load input image as RGBA and convert to uint8 tensor (4 channels, HxWxD)
             styled_img_pil = Image.open(styled_img_path).convert('RGBA')
             # Convert PIL image to numpy array (uint8, HxWxChannels)
@@ -329,29 +323,18 @@ class SRDataset(Dataset):
             hr_t = to_tensor(target_img_pil).mul(255.0)
 
         except Exception as e:
-             # If there's an error loading the selected sample, try to get another one randomly.
-             # This is a simple retry mechanism.
-             warnings.warn(f"Error loading images for randomly selected sample ({styled_img_path}, {target_img_path}): {e}. Retrying.")
-             # Recursively call __getitem__ to get another random sample.
-             # Be cautious with deep recursion in case of many corrupted files or infinite loops.
-             # A better approach might be to log and return a dummy blank image, or limit retries.
-             return self.__getitem__(idx) # Pass the original idx (though it's ignored)
+            # If there's an error loading the selected sample, try to get another one randomly.
+            # This is a simple retry mechanism.
+            warnings.warn(f"Error loading images for randomly selected sample ({styled_img_path}, {target_img_path}): {e}. Retrying.")
+            # Recursively call __getitem__ to get another random sample.
+            return self.__getitem__(idx) # Pass the original idx (though it's ignored)
 
-        # Optional: Add validation for image dimensions
-        # You might want to log or handle cases where dimensions don't match
         if styled_img_pil.size != (self.expected_crop_w, self.expected_crop_h): # Use PIL size before numpy conversion
-             warnings.warn(f"Styled image {styled_img_path} has unexpected dimensions: {styled_img_pil.size}. Expected: {(self.expected_crop_w, self.expected_crop_h)}. Proceeding but this may cause issues.")
-        # Validate target image dimensions (already done during gathering, but double check is okay)
+            warnings.warn(f"Styled image {styled_img_path} has unexpected dimensions: {styled_img_pil.size}. Expected: {(self.expected_crop_w, self.expected_crop_h)}. Proceeding but this may cause issues.")
         if target_img_pil.size != (self.expected_crop_w, self.expected_crop_h):
              warnings.warn(f"Target image {target_img_path} has unexpected dimensions: {target_img_pil.size}. Expected: {(self.expected_crop_w, self.expected_crop_h)}. Proceeding but this may cause issues.")
 
-
         # Apply synchronized random horizontal flip
-        # Note: Need to ensure transforms work on the tensor types/ranges
-        # F.hflip works on float tensors. Need to handle lr_t (uint8).
-        # It's easier to flip the PIL images *before* converting to tensor.
-        # Or, convert uint8 to float for flipping and then back if necessary, but that adds overhead.
-        # Let's flip PIL images first.
 
         # Synchronized random flip decision
         do_hflip = random.random() < 0.5
@@ -373,7 +356,6 @@ class SRDataset(Dataset):
         # Target (HR) - RGB float32 scaled to [0, 255]
         to_tensor = ToTensor() # Re-create or use self.to_tensor if in init
         hr_t = to_tensor(target_img_pil.convert('RGBA')).mul(255.0) # Convert back to RGB after flip, float32, 3 channels, CxHxW, scaled
-
 
         # Return the randomly selected styled input (LR) and target (HR) tensors
         # Model expects LR to be uint8 4-channel

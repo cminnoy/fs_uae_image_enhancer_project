@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from loss import PerceptualLoss
 import sys, time
+import argparse
 
 # Import quantization module and function
 try:
@@ -202,17 +203,25 @@ class Model(nn.Module):
     def criterion(self, output, target):
         return self.calculate_perceptual_loss(output, target)  
 
-def get_model():
-    return Model(initial_out_channels=32, mid_out_channels=64)
+def get_model(name:str='lightweight'):
+    if name == 'lightweight':
+        return Model(initial_out_channels=32, mid_out_channels=64)
+    elif name == 'heavyweight':
+        return Model(initial_out_channels=192, mid_out_channels=256)
+    return None
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Test performance')
+    parser.add_argument('--model_type', type=str, required=True, choices=['lightweight', 'heavyweight'], help='Type of model: lightweight, heavyweight')
+    args = parser.parse_args()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
     print("==============================")
     print(" Edge model float16")
     print("==============================")
-    model = get_model().to(device)
+    model = get_model(args.model_type).to(device)
     model.eval()
     model.fuse_layers()
     model.half()

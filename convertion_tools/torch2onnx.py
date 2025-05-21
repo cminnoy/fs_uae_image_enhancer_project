@@ -2,12 +2,14 @@ import torch
 import torch.nn as nn
 import torch.onnx
 import sys
+import os
 import onnx
 import onnx.helper
 import onnx.mapping
 import numpy as np
 import argparse
 import io # For saving ONNX model to a byte stream in memory for verification
+sys.path.append(os.getcwd())
 
 class ONNXConverter:
     """
@@ -27,7 +29,7 @@ class ONNXConverter:
         """
         print(f"Loading PyTorch model from {self.pytorch_model_path}...")
         try:
-            self.model = torch.load(self.pytorch_model_path, weights_only=False)
+            self.model = torch.load(os.path.abspath(self.pytorch_model_path), weights_only=False)
             print("PyTorch model loaded successfully.")
         except Exception as e:
             print(f"Error loading PyTorch model from {self.pytorch_model_path}: {e}")
@@ -521,7 +523,7 @@ class ONNXConverter:
 
         print(f"\nSaving ONNX model to {self.output_onnx_path}...")
         try:
-            onnx.save(model, self.output_onnx_path)
+            onnx.save(model, os.path.abspath(self.output_onnx_path))
             print("ONNX model saved successfully.")
         except Exception as e:
             print(f"Error saving ONNX model: {e}")

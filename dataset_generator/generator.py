@@ -24,7 +24,7 @@ try:
         get_crop_and_pad,
         apply_rotation,
         apply_downscaling,        
-        apply_resolution_style_post_quantization,
+        pre_apply_resolution_style, post_apply_resolution_style,
         load_model,
         run_inference,
         SUPPORTED_DITHER_METHODS,
@@ -194,13 +194,13 @@ def _scan_image_params_task(image_path, crop_w, crop_h, rot_deg, ds_perc, is_pur
 
             # Apply rotation
             if rot_deg != 0:
-                img_rotated_pil = apply_rotation(img_pil_full, rot_deg)
+                img_rotated_pil = apply_rotation(img_pil_full, rot_deg, supersample_factor=1, pil_filter=Image.Resampling.NEAREST) # No need for AA for simply detecting the valid crop areas
             else:
                 img_rotated_pil = img_pil_full.copy()
 
             # Apply downscaling
             if ds_perc > 0 and ds_perc < 100:
-                img_scaled_pil = img_rotated_pil.resize((scaled_width, scaled_height), Image.LANCZOS)
+                img_scaled_pil = img_rotated_pil.resize((scaled_width, scaled_height), Image.Resampling.LANCZOS)
             else:
                 img_scaled_pil = img_rotated_pil.copy()
 
@@ -250,13 +250,13 @@ def save_single_target_worker(target_spec, crop_w, crop_h, dest_dir, split_sourc
 
             # Apply rotation (pre-processing)
             if rot_deg != 0:
-                rotated_img_pil = apply_rotation(img_pil_full, rot_deg)
+                rotated_img_pil = apply_rotation(img_pil_full, rot_deg, supersample_factor=2)
             else:
                 rotated_img_pil = img_pil_full.copy() # Work on a copy if no rotation
 
             # Apply downscaling (pre-processing)
             if ds_perc > 0 and ds_perc < 100:
-                 # apply_downscaling handles the percentage validation internally
+                # apply_downscaling handles the percentage validation internally
                 scaled_img_pil = apply_downscaling(rotated_img_pil, ds_perc)
             else: # ds_perc == 0 or 100 (100% scale) means no downscaling
                 scaled_img_pil = rotated_img_pil.copy() # Work on a copy if no scaling
@@ -409,9 +409,11 @@ def generate_and_save_styled_worker(styled_spec, crop_w_worker, crop_h_worker, d
             img_pil_full = img_pil_full.convert("RGB") # Ensure RGB mode
             # print_image_info(img_pil_full, "Initial Load/Convert", spec_info_str) # Uncomment for verbosity
 
+            # NOTE: Amiga games have a mix of images which use Anti-Aliasing, not clear yet if styled images should use AA or not.
+            #       For maximum quality, we should combine the rotation and downscaling, so the downscale of the AA does the final downscale in one step.
 
             # Apply pre-processing (rotation, scaling, cropping) resulting in a PIL Image
-            if rot_deg != 0: rotated_img_pil = apply_rotation(img_pil_full, rot_deg)
+            if rot_deg != 0: rotated_img_pil = apply_rotation(img_pil_full, rot_deg, supersample_factor=2) # MAYBE SET TO 1 and USE Image.Resampling.NEAREST
             else: rotated_img_pil = img_pil_full.copy()
             # print_image_info(rotated_img_pil, "Rotation", spec_info_str) # Uncomment for verbosity
 
@@ -419,19 +421,27 @@ def generate_and_save_styled_worker(styled_spec, crop_w_worker, crop_h_worker, d
             else: scaled_img_pil = rotated_img_pil.copy()
             # print_image_info(scaled_img_pil, "Scaling", spec_info_str) # Uncomment for verbosity
 
-
             crop_pil = get_crop_and_pad(scaled_img_pil, crop_x, crop_y, crop_w_worker, crop_h_worker)
             # print_image_info(crop_pil, "Cropping/Padding", spec_info_str) # Uncomment for verbosity
 
-
+            # Apply resolution style (expects PIL, assuming returns PIL)
+            # Error 'mode' was previously reported here if the input was wrong.
+            try:
+                processed_res_pil = pre_apply_resolution_style(crop_pil, res)
+                if verbose_worker >= 3: print_image_info(processed_res_pil, "Resolution Styling", spec_info_str)
+            except Exception as e:
+                # This is a likely spot for the 'mode' error if the input was wrong or the function returned NumPy
+                if verbose_worker >= 1: warnings.warn(f"Worker error during resolution styling for {spec_info_str}: {e}", stacklevel=2)
+                return (styled_spec, False, f"Resolution styling failed: {e}")
+            
             # --- Convert PIL Image to NumPy array for quantization/dithering ---
             # The reduce_color_depth_and_dither function expects NumPy.
             try:
-                crop_np = np.array(crop_pil)
-                if verbose_worker >= 3: print_image_info(crop_np, "PIL to NumPy (before quantization)", spec_info_str)
+                processed_res_np = np.array(processed_res_pil)
+                if verbose_worker >= 3: print_image_info(processed_res_np, "PIL to NumPy (before quantization)", spec_info_str)
             except Exception as e:
-                 if verbose_worker >= 1: warnings.warn(f"Worker error converting to NumPy before quantization for {spec_info_str}: {e}", stacklevel=2)
-                 return (styled_spec, False, f"Failed conversion to NumPy: {e}")
+                if verbose_worker >= 1: warnings.warn(f"Worker error converting to NumPy before quantization for {spec_info_str}: {e}", stacklevel=2)
+                return (styled_spec, False, f"Failed conversion to NumPy: {e}")
 
 
             # --- Apply quantization/palette/dither using the reduce_color_depth_and_dither function ---
@@ -450,10 +460,9 @@ def generate_and_save_styled_worker(styled_spec, crop_w_worker, crop_h_worker, d
 
                 if verbose_worker >= 3: print(f"DEBUG WORKER [{spec_info_str}]: Calling reduce_color_depth_and_dither with color_space='{color_space_str}', palette={palette_size_param}, dither='{dithering_method_param}'.")
 
-
                 # Call the function from quantize.py (ensure you have the import)
                 processed_quantized_np = reduce_color_depth_and_dither(
-                    image_np=crop_np, # Pass the NumPy array input
+                    image_np=processed_res_np, # Pass the NumPy array input
                     color_space=color_space_str, # Pass the color space string
                     target_palette_size=palette_size_param, # Pass the palette size (int or None)
                     dithering_method=dithering_method_param, # Pass the corrected dither method string ('None' or a DIFFUSION_MAPS key)
@@ -469,8 +478,6 @@ def generate_and_save_styled_worker(styled_spec, crop_w_worker, crop_h_worker, d
 
 
             # --- Convert NumPy array back to PIL Image for resolution styling ---
-            # Based on the provided quantize.py, reduce_color_depth_and_dither returns NumPy.
-            # apply_resolution_style_post_quantization likely expects PIL.
             try:
                  processed_quantized_pil = Image.fromarray(processed_quantized_np)
                  if verbose_worker >= 3: print_image_info(processed_quantized_pil, "NumPy to PIL (before resolution style)", spec_info_str)
@@ -478,20 +485,11 @@ def generate_and_save_styled_worker(styled_spec, crop_w_worker, crop_h_worker, d
                  if verbose_worker >= 1: warnings.warn(f"Worker error converting back to PIL after quantization for {spec_info_str}: {e}. Original was type {type(processed_quantized_np).__name__}.", stacklevel=2)
                  return (styled_spec, False, f"Failed conversion after quantization: {e}")
 
-
-            # Apply resolution style (expects PIL, assuming returns PIL)
-            # Error 'mode' was previously reported here if the input was wrong.
-            try:
-                 processed_res_pil = apply_resolution_style_post_quantization(processed_quantized_pil, res)
-                 if verbose_worker >= 3: print_image_info(processed_res_pil, "Resolution Styling", spec_info_str)
-            except Exception as e:
-                 # This is a likely spot for the 'mode' error if the input was wrong or the function returned NumPy
-                 if verbose_worker >= 1: warnings.warn(f"Worker error during resolution styling for {spec_info_str}: {e}", stacklevel=2)
-                 return (styled_spec, False, f"Resolution styling failed: {e}")
-
+            # --- Post apply resolution style ---
+            post_quantized_pil = post_apply_resolution_style(processed_quantized_pil, res)
 
             # The result before inference is now expected to be a PIL Image
-            final_output_obj = processed_res_pil.copy() # Make a copy to be safe
+            final_output_obj = post_quantized_pil.copy() # Make a copy to be safe
             if verbose_worker >= 3: print_image_info(final_output_obj, "Before Inference (copy)", spec_info_str)
             
             # --- Save the final output image ---

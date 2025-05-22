@@ -177,4 +177,5 @@ cython_debug/
 checkpoint_*.pth
 checkpoint_*.pt
 
+*.code-workspace
 

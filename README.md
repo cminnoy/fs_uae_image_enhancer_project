@@ -12,9 +12,13 @@ Those pixels are used as follows:
 The artifical network upscales images inside the framebuffer.
 
 Known limitations:
-- Only trained to upscale the resolution; not enhance the colour palette.
-- Very small model to be able to run real-time.
-- Only tested on AMD RT 6900 XT under ROCm with ONNX runtime; Ubuntu 24
+- Conv3 models are trained to upscale the resolution only; not enhance the colour palette.
+- Conv5 models are a mild attempt to upscale resolution and colour.
+- Very small models to be able to run real-time. (Tried EffiencyNet, UNet and Transformers, all to slow for now; maybe retry after the FS-UAE OpenGL pipeline has been reworked).
+- Only tested on AMD RT 6900 XT under ROCm with ONNX runtime; Ubuntu 24; RNDA2 ain't the fastest GPU :-(
 - The framebuffer is created on CPU side; transfered to GPU memory and upscale; this is very fast (< 1ms); but there is no link between ONNX and the OpenGL render engine yet.
   This implies that the upscaled image needs to be copied back to CPU memory before it can be delivered to OpenGL; this is a major bottleneck.
-  
+  That is work to be done later.
+
+See here for the matching emulator:  
+https://github.com/cminnoy/fs-uae/tree/with_ai_upscaler

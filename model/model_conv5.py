@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from loss import PerceptualLoss
 import sys, time
+import argparse
 
 # Import quantization module and function
 try:
@@ -14,7 +15,7 @@ except AttributeError:
     print("Warning: torch.ao.quantization found, but fuse_modules is not in it. Skipping PyTorch-side layer fusion.")
     FUSION_UTILITY = None
 
-# Model
+# Conv2D 5 layer model
 class Model(nn.Module):
 
     def __init__(self, initial_out_channels=32, mid_out_channels=64, final_out_channels=3, kernel_size=3):
@@ -23,9 +24,9 @@ class Model(nn.Module):
         Preserves spatial dimensions. The output FP32 tensor will be scaled to the [0.0, 255.0] range.
 
         Args:
-            initial_out_channels (int): Number of output channels after the first Conv2d and first DS Conv.
-            mid_out_channels (int): Number of output channels after the second Conv2d and second DS Conv.
-            final_out_channels (int): Number of output channels for the final Conv2d (must match target channels).
+            initial_out_channels (int): Number of output channels for the first convolution and BatchNorm. Used also in the second and fourth layer.
+            mid_out_channels (int): Number of output channels for the third convolution and BatchNorm.
+            final_out_channels (int): Number of output channels for the final convolution and BatchNorm (must match target channels).
             kernel_size (int): Size of the convolutional kernel (must be odd, e.g., 3 or 5).
         """
         super(Model, self).__init__()
@@ -35,11 +36,12 @@ class Model(nn.Module):
 
         padding = (kernel_size - 1) // 2
 
+        # Define the sequence of Conv2d (no bias) and BatchNorm2d, and Activation layers
         # Layer 1: Conv -> BatchNorm -> Activation
         self.conv1 = nn.Conv2d(in_channels=3, out_channels=initial_out_channels, kernel_size=kernel_size, stride=1, padding=padding, bias=False)
         self.bn1 = nn.BatchNorm2d(initial_out_channels)
         self.act1 = nn.ReLU(inplace=True)
-        
+
         # Layer 2: Conv -> BatchNorm -> Activation
         self.conv2 = nn.Conv2d(in_channels=initial_out_channels, out_channels=initial_out_channels, kernel_size=kernel_size, stride=1, padding=padding, bias=False)
         self.bn2 = nn.BatchNorm2d(initial_out_channels)
@@ -61,7 +63,6 @@ class Model(nn.Module):
 
         # Instantiate the PerceptualLoss module
         self.perceptual_criterion = PerceptualLoss(pixel_loss_weight=0.8, vgg_weight=0.2, pixel_loss_type='charbonnier', charbonnier_epsilon=1e-6)
-
 
     # Fuse_layers uses the imported fuse_modules
     def fuse_layers(self):
@@ -118,6 +119,7 @@ class Model(nn.Module):
         Input: uint8 RGBA. Output: scaled FP16 RGBA when model is in FP16 mode.
         """
         # Ensure the input is uint8 and has 4 channels (from dataset)
+        # TracerWarning might appear here during ONNX export, which is expected.
         if x.dtype != torch.uint8 or x.shape[1] != 4:
             raise ValueError("Input tensor must be uint8 with 4 channels (RGBA)")
 
@@ -164,10 +166,10 @@ class Model(nn.Module):
         if hasattr(self, 'bn5'):
             output_float = self.bn5(conv_output)
         else:
-            output_float = conv_output # If fused, the output is directly from the fused conv
+            output_float = conv_output # If fused, the output is directly from the fused conv.
 
         # Scale the output towards the [0.0, 255.0] range.
-        # The output dtype will match the dtype of output_float (FP16 if model is in FP16)
+        # The output dtype will match the dtype of output_float.
         scaled_rgb_output = output_float.mul(255.0)
 
         # Create the Alpha channel tensor (filled with 255.0)
@@ -178,7 +180,7 @@ class Model(nn.Module):
         # Concatenate the scaled RGB output and the Alpha channel along the channel dimension
         rgba_output = torch.cat((scaled_rgb_output, alpha_channel), dim=1)
 
-        return rgba_output
+        return rgba_output # Return the scaled RGBA tensor
 
     # L1 loss
     def calculate_L1_loss(self, output, target):
@@ -227,19 +229,27 @@ class Model(nn.Module):
 
     # Criterion used by the training loop (Decided on perceptual loss)
     def criterion(self, output, target):
-        return self.calculate_perceptual_loss(output, target)
-    
-def get_model():
-    return Model()
+        return self.calculate_perceptual_loss(output, target)  
+
+def get_model(name:str='lightweight'):
+    if name == 'lightweight':
+        return Model(initial_out_channels=32, mid_out_channels=64)
+    elif name == 'heavyweight':
+        return Model(initial_out_channels=64, mid_out_channels=128)
+    return None
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Test performance')
+    parser.add_argument('--model_type', type=str, required=True, choices=['lightweight', 'heavyweight'], help='Type of model: lightweight, heavyweight')
+    args = parser.parse_args()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
     print("==============================")
     print(" Edge model float16")
     print("==============================")
-    model = get_model().to(device)
+    model = get_model(args.model_type).to(device)
     model.eval()
     model.fuse_layers()
     model.half()

@@ -169,6 +169,7 @@ def reduce_color_depth_and_dither(
     palette_float = None
     pixels_for_kmeans = None # Prepare variable for pixels used for K-Means
 
+    # CHECKERBOARD IS BROKEN; DON'T USE IT
     # For checkerboard we only use grid quantization
     if dithering_method == 'checkerboard':
         # Only support grid spaces for checkerboard

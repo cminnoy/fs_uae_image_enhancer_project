@@ -116,24 +116,34 @@ def get_crop_and_pad(image_pil: Image.Image, crop_x: int, crop_y: int, crop_w: i
 
     return crop_pil
 
-def apply_rotation(image_pil: Image.Image, angle_degrees: int) -> Image.Image:
+def apply_rotation(image_pil: Image.Image, angle_degrees: int, supersample_factor: int = 2, pil_filter=Image.Resampling.BICUBIC) -> Image.Image:
     """
     Rotates a PIL image by a specified angle in degrees.
     Uses the LANCZOS resampling filter for quality.
+    Applies Anti-Aliasing using the super_sample factor.
     The canvas is expanded to include the entire rotated image without cropping.
     Returns a new PIL Image object.
     """
+    if supersample_factor < 1:
+        raise ValueError("supersample_factor must be an integer greater than or equal to 1.")
+
     # Normalize the angle to be within [0, 360) degrees
     normalized_angle = angle_degrees % 360
     if normalized_angle == 0:
         # No rotation needed, return a copy to ensure the original image isn't modified elsewhere.
         return image_pil.copy()
 
-    # Use expand=True to make the output image canvas large enough to fit the entire rotated image.
-    # Use Image.Resampling.LANCZOS for high-quality resampling, important for subsequent scaling.
     try:
-        rotated_pil = image_pil.rotate(normalized_angle, resample=Image.Resampling.BICUBIC, expand=True)
-        return rotated_pil
+        original_width, original_height = image_pil.size
+        if supersample_factor > 1:
+            supersampled_width = original_width * supersample_factor
+            supersampled_height = original_height * supersample_factor
+            supersampled_image = image_pil.resize((supersampled_width, supersampled_height), Image.Resampling.LANCZOS)
+            rotated_supersampled_image = supersampled_image.rotate(angle_degrees, resample=Image.Resampling.NEAREST)
+            final_image = rotated_supersampled_image.resize((original_width, original_height), Image.Resampling.LANCZOS)
+        else:
+            final_image = image_pil.rotate(angle_degrees, resample=pil_filter)
+        return final_image
     except Exception as e:
          warnings.warn(f"Error during PIL rotate operation by {angle_degrees} degrees: {e}. Returning original image copy.")
          # Return a copy of the original image as a fallback if rotation fails
@@ -175,10 +185,9 @@ def apply_downscaling(image_pil: Image.Image, percentage: int) -> Image.Image:
         # Return a copy of the original image as a fallback if downscaling fails
         return image_pil.copy()
 
-def apply_resolution_style_post_quantization(image_pil: Image.Image, style: str) -> Image.Image:
+def apply_resolution_style(image_pil: Image.Image, style: str) -> Image.Image:
     """
-    Applies resolution style effects (like pixel simulation or interlacing)
-    to a PIL image *after* color processing.
+    Applies resolution style effects (like pixel simulation or interlacing) to a PIL image.
     The input image is expected to be the size of the target crop (W x H).
     The output image will also be the same size (W x H).
     Returns a new PIL Image object.
@@ -204,14 +213,13 @@ def apply_resolution_style_post_quantization(image_pil: Image.Image, style: str)
             output_pil = lores_sim_pil.resize((w, h), Image.Resampling.NEAREST)
 
         elif style == 'lores_laced':
-            # Simulate 2x1 source pixels mapping to 1 visual pixel width (blocky 2x1 pixels) + horizontal interlacing.
+            # Simulate 2x1 source pixels mapping to 1 visual pixel width (blocky 2x1 pixels) + interlacing.
             # Downscale width by 2 using BOX, then upscale width by 2 using Nearest Neighbor.
             lores_sim_pil = output_pil.resize((w // 2, h), Image.Resampling.LANCZOS)
             output_pil = lores_sim_pil.resize((w, h), Image.Resampling.NEAREST)
 
         elif style == 'hires':
-             # Simulate 1x2 source pixels mapping to 1 visual pixel height (blocky 1x2 pixels) + vertical interlacing.
-             # Based on lores_laced implying horizontal for lores, hires likely implies vertical.
+             # Simulate 1x2 source pixels mapping to 1 visual pixel height (blocky 1x2 pixels) + interlacing.
              # Downscale height by 2 using BOX, then upscale height by 2 using Nearest Neighbor.
              hires_sim_pil = output_pil.resize((w, h // 2), Image.Resampling.LANCZOS)
              output_pil = hires_sim_pil.resize((w, h), Image.Resampling.NEAREST)
@@ -226,11 +234,77 @@ def apply_resolution_style_post_quantization(image_pil: Image.Image, style: str)
              # Resize back to expected size using Nearest Neighbor if size changed unexpectedly
              output_pil = output_pil.resize((w, h), Image.Resampling.NEAREST)
 
-
     except Exception as e:
          warnings.warn(f"Error applying resolution style '{style}': {e}. Returning original image copy.")
          return image_pil.copy() # Return original as fallback
 
+    return output_pil
+
+def pre_apply_resolution_style(image_pil: Image.Image, style: str) -> Image.Image:
+    """
+    Applies resolution style effects (like pixel simulation or interlacing) to a PIL image.
+    The input image is expected to be the size of the target crop (W x H).
+    The output image may have a different resolution.
+    Returns a new PIL Image object.
+    """
+    if style not in SUPPORTED_RESOLUTION_STYLES:
+        warnings.warn(f"Unknown resolution style '{style}'. Returning original image copy.")
+        return image_pil.copy()
+
+    output_pil = image_pil.copy() # Start with a copy of the input
+
+    w, h = output_pil.size # Size of the input image (should be the crop size)
+
+    # --- Implement Resolution Style Visual Effects ---
+    # These effects simulate different display resolutions/modes.
+    if style == 'lores':
+        # Simulate 2x2 source pixels mapping to 1 visual pixel (blocky 2x2 pixels).
+        # Downscale by 2x2
+        output_pil = output_pil.resize((w // 2, h // 2), Image.Resampling.LANCZOS)
+    elif style == 'lores_laced':
+        # Simulate 2x1 source pixels mapping to 1 visual pixel width (blocky 2x1 pixels) + interlacing.
+        # Downscale width by 2
+        output_pil = output_pil.resize((w // 2, h), Image.Resampling.LANCZOS)
+    elif style == 'hires':
+        # Simulate 1x2 source pixels mapping to 1 visual pixel height (blocky 1x2 pixels) + interlacing.
+        # Downscale height by 2
+        output_pil = output_pil.resize((w, h // 2), Image.Resampling.LANCZOS)
+    elif style == 'hires_laced':
+        pass
+
+    return output_pil
+
+def post_apply_resolution_style(image_pil: Image.Image, style: str) -> Image.Image:
+    """
+    Applies resolution style effects (like pixel simulation or interlacing) to a PIL image.
+    The input image is expected to be first processed by pre_resolution_style.
+    The output image will be back the original size (W x H).
+    Returns a new PIL Image object.
+    """
+    if style not in SUPPORTED_RESOLUTION_STYLES:
+        warnings.warn(f"Unknown resolution style '{style}'. Returning original image copy.")
+        return image_pil.copy()
+
+    output_pil = image_pil.copy() # Start with a copy of the input quantized image
+
+    w, h = output_pil.size # Size of the input image (should be the crop size)
+
+    # --- Implement Resolution Style Visual Effects ---
+    # These effects simulate different display resolutions/modes.
+    if style == 'lores':
+        # Simulate 2x2 source pixels mapping to 1 visual pixel (blocky 2x2 pixels).
+        # Upscale by 2x2 using Nearest Neighbor.
+        output_pil = output_pil.resize((w * 2, h * 2), Image.Resampling.NEAREST)
+    elif style == 'lores_laced':
+        # Simulate 2x1 source pixels mapping to 1 visual pixel width (blocky 2x1 pixels) + interlacing.
+        # Upscale width by 2 using Nearest Neighbor.
+        output_pil = output_pil.resize((w * 2, h), Image.Resampling.NEAREST)
+    elif style == 'hires':
+        # Simulate 1x2 source pixels mapping to 1 visual pixel height (blocky 1x2 pixels) + interlacing.
+        # Upscale height by 2 using Nearest Neighbor.
+        output_pil = output_pil.resize((w, h * 2), Image.Resampling.NEAREST)
+    elif style == 'hires_laced':
+        pass
 
     return output_pil
 

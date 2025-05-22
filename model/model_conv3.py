@@ -63,14 +63,14 @@ class Model(nn.Module):
         """
         if FUSION_UTILITY is None:
             print("Skipping PyTorch-side layer fusion: No suitable fusion utility found (torch.ao.quantization.fuse_modules).")
-            print("Hopeful that ONNX Runtime will perform Conv+BN+ReLU fusion.")
-            return
+            print("Hopeful that ONNX Runtime will perform Conv+BN[+ReLU] fusion.")
+            return # Exit if no utility
 
-        print("Attempting to fuse Conv2d, BatchNorm2d, and ReLU layers using torch.ao.quantization.fuse_modules...")
+        print("Attempting to fuse standard Conv2d/BatchNorm2d/ReLU sequences using torch.ao.quantization.fuse_modules...")
         self.eval() # Ensure eval mode
 
         try:
-            # Define the modules to fuse by name, including the separate ReLU instances
+            # Define the modules to fuse by name.
             # fuse_modules primarily understands standard Conv/BN/ReLU sequences.
             # We can fuse the standard Conv+BN[+ReLU] sequences and the BN+ReLU sequences.
             fused_modules_list = [
@@ -89,14 +89,14 @@ class Model(nn.Module):
             remaining_act = hasattr(self, 'act1') or hasattr(self, 'act2')
                 
             if not remaining_bn and not remaining_act:
-                print("Layers fused successfully.")
+                 print("Standard Conv/BN/ReLU sequences fused successfully.")
             else:
-                print("Fusion utility ran, but some BatchNorm or Activation layers still exist. Fusion might not have been fully effective.")
+                 print("Fusion utility ran, but some BatchNorm or Activation layers still exist. Fusion might not have been fully effective.")
 
         except Exception as e:
             print(f"\nAn unexpected error occurred during layer fusion using {FUSION_UTILITY.__name__}: {e}")
             print("Skipping PyTorch-side layer fusion.")
-            print("Hopeful that ONNX Runtime will perform Conv+BN+ReLU fusion during inference.")
+            print("Hopeful that ONNX Runtime will perform Conv+BN[+ReLU] fusion during inference.")
 
     # Forward pass
     def forward(self, x):
@@ -114,7 +114,7 @@ class Model(nn.Module):
 
         # Convert RGB from uint8 to float32, normalize to [0.0, 1.0]
         rgb_float_normalized = rgb_input.float().div(255.0) # float32 [0.0, 1.0]
-       
+
         # Determine the dtype for convolution inputs based on model parameters
         # This ensures input dtype matches model parameters (FP16 after model.half())
         model_param_dtype = next(self.parameters()).dtype
@@ -127,7 +127,7 @@ class Model(nn.Module):
         x = self.conv1(rgb_input_for_conv)
         if hasattr(self, 'bn1'): x = self.bn1(x)
         if hasattr(self, 'act1'): x = self.act1(x)
-
+    
         # Layer 2: Conv2d -> BatchNorm -> ReLU6
         x = self.conv2(x)
         if hasattr(self, 'bn2'): x = self.bn2(x)
@@ -147,17 +147,17 @@ class Model(nn.Module):
         # Create the Alpha channel tensor (filled with 255.0)
         # Match the dtype and device of the scaled RGB output
         B, _, H, W = scaled_rgb_output.shape
-        alpha_channel = torch.full((B, 1, H, W), 255.0, dtype=scaled_rgb_output.dtype, device=scaled_rgb_output.device) # Create in FP16 if scaled_rgb_output is FP16
+        alpha_channel = torch.full((B, 1, H, W), 255.0, dtype=scaled_rgb_output.dtype, device=scaled_rgb_output.device)
 
         # Concatenate the scaled RGB output and the Alpha channel along the channel dimension
-        rgba_output = torch.cat((scaled_rgb_output, alpha_channel), dim=1) # Result dtype is FP16 if components are FP16
+        rgba_output = torch.cat((scaled_rgb_output, alpha_channel), dim=1)
 
-        return rgba_output # Return the scaled RGBA tensor (FP16 when exporting FP16 model)
+        return rgba_output # Return the scaled RGBA tensor
 
-    # L1 loss 
+    # L1 loss
     def calculate_L1_loss(self, output, target):
         return nn.L1Loss()(output, target)
-    
+
     # Carbonnier loss
     def calculate_charbonnier_loss(self, output, target, epsilon=1e-6):
         """
@@ -187,7 +187,7 @@ class Model(nn.Module):
     # Perceptual loss
     def calculate_perceptual_loss(self, output, target):
         """
-        Calculates the combined Perceptual Loss (VGG + L1).
+        Calculates the combined Perceptual Loss (VGG + L1/Carbonnier).
 
         Args:
             output (torch.Tensor): The model's output tensor (scaled [0, 255] RGBA).

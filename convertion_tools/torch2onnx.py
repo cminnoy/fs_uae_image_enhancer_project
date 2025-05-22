@@ -8,6 +8,7 @@ import onnx.helper
 import onnx.mapping
 import numpy as np
 import argparse
+import time
 import io # For saving ONNX model to a byte stream in memory for verification
 sys.path.append(os.getcwd())
 
@@ -550,14 +551,17 @@ if __name__ == "__main__":
         output_onnx_path=args.onnx_path
     )
 
-    # Step 1: Load PyTorch model and export to initial ONNX in memory
+    print("Step 1: Load PyTorch model and export to initial ONNX in memory")
     converter.load_pytorch_model()
+    time.sleep(10)
     intermediate_onnx_model = converter.export_to_onnx_in_memory()
+    time.sleep(10)
 
-    # Step 2: Modify the ONNX graph for chunky input/output (in memory)
+    print("Step 2: Modify the ONNX graph for chunky input/output (in memory)")
     modified_onnx_model = converter.modify_onnx_graph_for_chunky(intermediate_onnx_model)
+    time.sleep(10)
 
-    # Step 3: Simplify the ONNX model (including constant folding)
+    print("Step 3: Simplify the ONNX model (including constant folding)")
     print("\nAttempting to simplify the ONNX model (including constant folding)...")
     try:
         import onnxsim
@@ -579,8 +583,9 @@ if __name__ == "__main__":
         print(f"Error during ONNX model simplification: {e}. Using the unsimplified modified model.")
         final_onnx_model = modified_onnx_model
 
-    # Step 4: Verify and save the FINAL (potentially simplified) ONNX model
+    print("Step 4: Verify and save the FINAL (potentially simplified) ONNX model")
     converter.verify_onnx_model(final_onnx_model, is_modified=True)
+    time.sleep(10)
     converter.save_onnx_model(final_onnx_model)
 
     print("\nFull ONNX conversion, modification, and potential simplification process completed.")

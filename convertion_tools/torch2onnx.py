@@ -30,7 +30,9 @@ class ONNXConverter:
         """
         print(f"Loading PyTorch model from {self.pytorch_model_path}...")
         try:
-            self.model = torch.load(os.path.abspath(self.pytorch_model_path), weights_only=False)
+            # Use map_location to ensure CPU loading if current device is CPU, then move.
+            # This avoids CUDA OOM if the model is large and was saved on GPU.
+            self.model = torch.load(os.path.abspath(self.pytorch_model_path), map_location='cpu', weights_only=False)
             print("PyTorch model loaded successfully.")
         except Exception as e:
             print(f"Error loading PyTorch model from {self.pytorch_model_path}: {e}")
@@ -44,9 +46,12 @@ class ONNXConverter:
         self.model.to(self.device)
         print(f"Model moved to device: {self.device}")
 
-        if self.device.type == 'cuda':
+        # Convert to half precision only if running on CUDA and model is not already half
+        if self.device.type == 'cuda' and next(self.model.parameters()).dtype != torch.float16:
             self.model.half()
             print("Model parameters converted to Half precision (FP16) for export.")
+        elif self.device.type == 'cuda' and next(self.model.parameters()).dtype == torch.float16:
+            print("Model parameters already in Half precision (FP16).")
         else:
             print("Running on CPU, skipping FP16 conversion for model parameters.")
 
@@ -83,10 +88,13 @@ class ONNXConverter:
                 dynamic_axes=dynamic_axes,
                 opset_version=13,
                 verbose=False,
-                input_dtypes=[torch.uint8],
-                output_dtypes=[torch.float16]
+                input_dtypes=[torch.uint8], # Specify input dtype for ONNX graph
+                # output_dtypes cannot be specified directly to FP16 if the model output is not directly FP16.
+                # The model's last layer output will be FP16 if model.half() is called.
+                # The final scaling to 255.0 happens and maintains FP16.
+                # Let PyTorch determine the output dtype. We will enforce it later in modification.
             )
-            print("Model exported successfully to FP16 ONNX format in memory!")
+            print("Model exported successfully to ONNX format in memory!")
 
             # Load the ONNX model from the in-memory buffer
             f.seek(0) # Rewind the buffer to the beginning
@@ -113,6 +121,7 @@ class ONNXConverter:
             onnx.save(onnx_model, model_buffer)
             model_buffer.seek(0) # Rewind the buffer
 
+            # Attempt to use ROCmExecutionProvider if available, otherwise fallback
             providers = ['ROCMExecutionProvider', 'CPUExecutionProvider']
             try:
                 ort_session = ort.InferenceSession(model_buffer.getvalue(), providers=providers)
@@ -121,6 +130,7 @@ class ONNXConverter:
                  print(f"Error loading ONNX model with specified providers: {e}. Attempting with default providers.")
                  ort_session = ort.InferenceSession(model_buffer.getvalue())
                  print(f"ONNX model loaded successfully with ONNX Runtime using default providers: {ort_session.get_providers()}")
+
 
             onnx_inputs = ort_session.get_inputs()
             onnx_outputs = ort_session.get_outputs()
@@ -164,6 +174,7 @@ class ONNXConverter:
         """
         Modifies the ONNX graph (in-memory) to accept chunky (HWC) RGBA input
         and output chunky (HWC) UINT8 RGBA.
+        This version is more robust to the PyTorch model's internal preprocessing.
         """
         graph = model.graph
         print("Starting ONNX graph modification for chunky input/output...")
@@ -217,26 +228,20 @@ class ONNXConverter:
             perm=[0, 3, 1, 2]
         )
 
-        # Find the first Conv node and its actual input
+        # --- Dynamic tracing to find the actual first Conv input and intermediate nodes to remove ---
         first_conv_node = None
-        target_input_name_for_conv = None # This will store the name of the tensor that actually feeds the first Conv
-        nodes_to_remove = []
-
-        # Identify the node that directly feeds the first Conv
         for node in graph.node:
-            # Assuming the first Conv node's input is a tensor derived from a Cast node output
-            # This logic needs to be robust. Using startswith to catch variations like /Cast_1_output_0 or /Cast_output_0
-            if node.op_type == "Conv" and node.input[0].startswith("/Cast"): # Broader check for Cast node output
+            if node.op_type == "Conv":
                 first_conv_node = node
-                target_input_name_for_conv = node.input[0]
                 break
 
-        if not first_conv_node or not target_input_name_for_conv:
-            print("Error: Could not find the first Conv node or its expected input tensor.")
+        if not first_conv_node:
+            print("Error: Could not find the first Conv node in the graph.")
             sys.exit(1)
 
-        # Trace back from target_input_name_for_conv to collect nodes to remove
-        current_output_to_trace = target_input_name_for_conv
+        target_input_name_for_conv = first_conv_node.input[0]
+        nodes_to_remove = []
+        visited_nodes = set()
         
         # Helper to find node by output name
         def find_node_by_output(graph_nodes, output_name):
@@ -245,30 +250,125 @@ class ONNXConverter:
                     return n
             return None
 
-        # Trace back to collect nodes to remove
+        current_node_output = target_input_name_for_conv
+        # Trace back from the first Conv's input until we hit the original model input
+        # or a constant/initializer
         while True:
-            node_to_add_to_remove = find_node_by_output(graph.node, current_output_to_trace)
-            # Stop if we reach a node that directly consumes the original input or a constant
-            if node_to_add_to_remove is None or node_to_add_to_remove.output[0] == orig_input_name:
+            node = find_node_by_output(graph.node, current_node_output)
+            if node is None or node.name in visited_nodes: # Stop if node not found or circular reference
                 break
-            nodes_to_remove.append(node_to_add_to_remove)
             
-            # Find the next input to trace back
-            # Ensure we don't try to trace back through constant inputs or if no more inputs
-            if len(node_to_add_to_remove.input) > 0 and node_to_add_to_remove.input[0] != orig_input_name:
-                current_output_to_trace = node_to_add_to_remove.input[0]
-            else:
-                break # Reached a constant or original input
+            # Check if any input of this node is the original input
+            if any(inp == orig_input_name for inp in node.input):
+                nodes_to_remove.append(node) # This node consumes the original input
+                break # We've reached the start of the processing chain
 
-        # Remove identified nodes in reverse order to avoid issues
-        for node_to_remove in reversed(nodes_to_remove):
-            graph.node.remove(node_to_remove)
+            # Check if this node is a constant or initializer input
+            is_constant_input = False
+            for input_name in node.input:
+                if input_name in [i.name for i in graph.initializer]:
+                    is_constant_input = True
+                    break
+            if is_constant_input:
+                break # Stop tracing if we hit a constant
+
+            nodes_to_remove.append(node)
+            visited_nodes.add(node.name)
+
+            # Move to the first input of the current node to continue tracing back
+            if len(node.input) > 0:
+                current_node_output = node.input[0]
+            else:
+                break # No more inputs to trace
+
+
+        # Remove the identified intermediate nodes (e.g., Cast, Div, Slice for RGBA/Downsample)
+        for node_to_remove in nodes_to_remove:
+            if node_to_remove in graph.node: # Ensure it's still in the list before trying to remove
+                graph.node.remove(node_to_remove)
+            else:
+                print(f"Warning: Attempted to remove node {node_to_remove.name} but it was already removed.")
+
+        # --- New Order: Slice RGB, then Slice Downsample, then Cast, then Div ---
+
+        # Add Constant nodes for Slice operator inputs (starts, ends, axes, steps)
+        # For rgb_input = x[:, :3, :, :]
+        slice_rgb_starts_name = "slice_rgb_starts_constant"
+        slice_rgb_starts_node = onnx.helper.make_node(
+            "Constant",
+            inputs=[], outputs=[slice_rgb_starts_name], name="Constant_SliceRGBStarts",
+            value=onnx.helper.make_tensor(name="starts", data_type=onnx.TensorProto.DataType.INT64, dims=[1], vals=[0])
+        )
+        slice_rgb_ends_name = "slice_rgb_ends_constant"
+        slice_rgb_ends_node = onnx.helper.make_node(
+            "Constant",
+            inputs=[], outputs=[slice_rgb_ends_name], name="Constant_SliceRGBEnds",
+            value=onnx.helper.make_tensor(name="ends", data_type=onnx.TensorProto.DataType.INT64, dims=[1], vals=[3])
+        )
+        slice_rgb_axes_name = "slice_rgb_axes_constant"
+        slice_rgb_axes_node = onnx.helper.make_node(
+            "Constant",
+            inputs=[], outputs=[slice_rgb_axes_name], name="Constant_SliceRGBAxes",
+            value=onnx.helper.make_tensor(name="axes", data_type=onnx.TensorProto.DataType.INT64, dims=[1], vals=[1]) # Channel dim
+        )
+        slice_rgb_steps_name = "slice_rgb_steps_constant"
+        slice_rgb_steps_node = onnx.helper.make_node(
+            "Constant",
+            inputs=[], outputs=[slice_rgb_steps_name], name="Constant_SliceRGBSteps",
+            value=onnx.helper.make_tensor(name="steps", data_type=onnx.TensorProto.DataType.INT64, dims=[1], vals=[1])
+        )
+
+        # Add Slice node for RGBA to RGB (dropping A channel) - Input is transposed_input_name (uint8)
+        sliced_rgb_input_name = "input_rgb_uint8_planar"
+        slice_rgb_node = onnx.helper.make_node(
+            "Slice",
+            inputs=[transposed_input_name, slice_rgb_starts_name, slice_rgb_ends_name, slice_rgb_axes_name, slice_rgb_steps_name],
+            outputs=[sliced_rgb_input_name],
+            name="Slice_RGBA_to_RGB"
+        )
+        
+        # Add Constant nodes for Slice operator inputs for downsampling (starts, ends, axes, steps)
+        # For rgb_input_downsampled = rgb_input[:, :, ::2, ::2]
+        slice_downsample_starts_name = "slice_downsample_starts_constant"
+        slice_downsample_starts_node = onnx.helper.make_node(
+            "Constant",
+            inputs=[], outputs=[slice_downsample_starts_name], name="Constant_SliceDownsampleStarts",
+            value=onnx.helper.make_tensor(name="starts", data_type=onnx.TensorProto.DataType.INT64, dims=[2], vals=[0, 0])
+        )
+        slice_downsample_ends_name = "slice_downsample_ends_constant"
+        slice_downsample_ends_node = onnx.helper.make_node(
+            "Constant",
+            inputs=[], outputs=[slice_downsample_ends_name], name="Constant_SliceDownsampleEnds",
+            value=onnx.helper.make_tensor(name="ends", data_type=onnx.TensorProto.DataType.INT64, dims=[2], vals=[sys.maxsize, sys.maxsize]) # Use sys.maxsize for "until end"
+        )
+        slice_downsample_axes_name = "slice_downsample_axes_constant"
+        slice_downsample_axes_node = onnx.helper.make_node(
+            "Constant",
+            inputs=[], outputs=[slice_downsample_axes_name], name="Constant_SliceDownsampleAxes",
+            value=onnx.helper.make_tensor(name="axes", data_type=onnx.TensorProto.DataType.INT64, dims=[2], vals=[2, 3]) # Height and Width dims
+        )
+        slice_downsample_steps_name = "slice_downsample_steps_constant"
+        slice_downsample_steps_node = onnx.helper.make_node(
+            "Constant",
+            inputs=[], outputs=[slice_downsample_steps_name], name="Constant_SliceDownsampleSteps",
+            value=onnx.helper.make_tensor(name="steps", data_type=onnx.TensorProto.DataType.INT64, dims=[2], vals=[2, 2])
+        )
+
+        # Add Slice node for downsampling - Input is sliced_rgb_input_name (uint8)
+        downsampled_rgb_input_name = "input_rgb_uint8_planar_downsampled"
+        slice_downsample_node = onnx.helper.make_node(
+            "Slice",
+            inputs=[sliced_rgb_input_name, slice_downsample_starts_name, slice_downsample_ends_name, slice_downsample_axes_name, slice_downsample_steps_name],
+            outputs=[downsampled_rgb_input_name],
+            name="Slice_Downsample_RGB"
+        )
 
         # Create new Cast(to FP16) and Div nodes for the optimized input path
-        cast_to_fp16_input_name = "input_rgba_float16_planar"
+        # Input to Cast is now downsampled_rgb_input_name (uint8)
+        cast_to_fp16_input_name = "input_rgb_float16_planar_downsampled"
         cast_to_fp16_node = onnx.helper.make_node(
             "Cast",
-            inputs=[transposed_input_name],
+            inputs=[downsampled_rgb_input_name], # Corrected input here!
             outputs=[cast_to_fp16_input_name],
             name="Cast_Input_To_FP16",
             to=onnx.TensorProto.DataType.FLOAT16
@@ -288,91 +388,43 @@ class ONNXConverter:
             )
         )
 
-        normalized_rgba_input_name = "input_rgba_float16_normalized"
+        normalized_rgb_input_name = "input_rgb_float16_normalized_downsampled" # Changed name to reflect RGB
         div_node = onnx.helper.make_node(
             "Div",
             inputs=[cast_to_fp16_input_name, div_by_255_constant_name],
-            outputs=[normalized_rgba_input_name],
+            outputs=[normalized_rgb_input_name],
             name="Div_Input_By_255"
         )
-        
-        # --- NEW: Add Constant nodes for Slice operator inputs (starts, ends, axes) ---
-        slice_starts_constant_name = "slice_starts_constant"
-        slice_starts_node = onnx.helper.make_node(
-            "Constant",
-            inputs=[],
-            outputs=[slice_starts_constant_name],
-            name="Constant_SliceStarts",
-            value=onnx.helper.make_tensor(
-                name="starts",
-                data_type=onnx.TensorProto.DataType.INT64,
-                dims=[1],
-                vals=[0]
-            )
-        )
 
-        slice_ends_constant_name = "slice_ends_constant"
-        slice_ends_node = onnx.helper.make_node(
-            "Constant",
-            inputs=[],
-            outputs=[slice_ends_constant_name],
-            name="Constant_SliceEnds",
-            value=onnx.helper.make_tensor(
-                name="ends",
-                data_type=onnx.TensorProto.DataType.INT64,
-                dims=[1],
-                vals=[3]
-            )
-        )
-
-        slice_axes_constant_name = "slice_axes_constant"
-        slice_axes_node = onnx.helper.make_node(
-            "Constant",
-            inputs=[],
-            outputs=[slice_axes_constant_name],
-            name="Constant_SliceAxes",
-            value=onnx.helper.make_tensor(
-                name="axes",
-                data_type=onnx.TensorProto.DataType.INT64,
-                dims=[1],
-                vals=[1] # Channel dimension in NCHW
-            )
-        )
-
-        # --- MODIFIED SLICE NODE DEFINITION to use constant inputs ---
-        sliced_rgb_input_name = "input_rgb_float16_normalized"
-        slice_rgb_node = onnx.helper.make_node(
-            "Slice",
-            inputs=[normalized_rgba_input_name, 
-                    slice_starts_constant_name, 
-                    slice_ends_constant_name, 
-                    slice_axes_constant_name],
-            outputs=[sliced_rgb_input_name],
-            name="Slice_RGBA_to_RGB"
-        )
-
-
-        # Update the input of the first Conv node to receive the sliced RGB input
+        # Update the input of the first Conv node to receive the downsampled RGB input
         for i, input_name in enumerate(first_conv_node.input):
-            if input_name == target_input_name_for_conv:
-                first_conv_node.input[i] = sliced_rgb_input_name
+            if input_name == target_input_name_for_conv: # target_input_name_for_conv is the original input to the first Conv
+                first_conv_node.input[i] = normalized_rgb_input_name # Corrected input here!
                 break
 
         graph.input.remove(orig_input)
         graph.input.extend([new_input_value_info])
 
-        # Insert the new nodes at the very front of graph.node list in order:
-        # Transpose -> Constant for Div -> Cast -> Div -> Constant_SliceStarts -> Constant_SliceEnds -> Constant_SliceAxes -> Slice
-        graph.node.insert(0, transpose_input_node)
-        graph.node.insert(1, div_by_255_constant_node)
-        graph.node.insert(2, cast_to_fp16_node)
-        graph.node.insert(3, div_node)
-        # Insert the new constant nodes for slice *before* the slice node itself
-        graph.node.insert(4, slice_starts_node)
-        graph.node.insert(5, slice_ends_node)
-        graph.node.insert(6, slice_axes_node)
-        graph.node.insert(7, slice_rgb_node) # Insert the Slice node here
+        # Insert the new nodes at the very front of graph.node list in correct order:
+        # Transpose -> RGB Slice Constants -> RGB Slice -> Downsample Slice Constants -> Downsample Slice -> Constant for Div -> Cast -> Div
+        insert_idx = 0
+        graph.node.insert(insert_idx, transpose_input_node) ; insert_idx += 1
+        graph.node.insert(insert_idx, slice_rgb_starts_node) ; insert_idx += 1
+        graph.node.insert(insert_idx, slice_rgb_ends_node) ; insert_idx += 1
+        graph.node.insert(insert_idx, slice_rgb_axes_node) ; insert_idx += 1
+        graph.node.insert(insert_idx, slice_rgb_steps_node) ; insert_idx += 1
+        graph.node.insert(insert_idx, slice_rgb_node) ; insert_idx += 1
+        graph.node.insert(insert_idx, slice_downsample_starts_node) ; insert_idx += 1
+        graph.node.insert(insert_idx, slice_downsample_ends_node) ; insert_idx += 1
+        graph.node.insert(insert_idx, slice_downsample_axes_node) ; insert_idx += 1
+        graph.node.insert(insert_idx, slice_downsample_steps_node) ; insert_idx += 1
+        graph.node.insert(insert_idx, slice_downsample_node) ; insert_idx += 1
+        graph.node.insert(insert_idx, div_by_255_constant_node) ; insert_idx += 1 # Constant must be before its use
+        graph.node.insert(insert_idx, cast_to_fp16_node) ; insert_idx += 1
+        graph.node.insert(insert_idx, div_node) ; insert_idx += 1
 
+
+        print(f"Replaced model input '{orig_input_name}' with chunky input '{new_input_name}' and optimized input preprocessing including RGBA to RGB slice and downsampling.")
 
         # Add ValueInfo for the intermediate transposed and normalized tensors
         graph.value_info.append(onnx.helper.make_tensor_value_info(
@@ -381,23 +433,26 @@ class ONNXConverter:
             [batch_dim, channel_dim, height_dim, width_dim]
         ))
         graph.value_info.append(onnx.helper.make_tensor_value_info(
-            cast_to_fp16_input_name,
-            onnx.TensorProto.DataType.FLOAT16,
-            [batch_dim, channel_dim, height_dim, width_dim]
+            sliced_rgb_input_name, # This is now 3 channels after RGB Slice, still uint8
+            onnx.TensorProto.DataType.UINT8,
+            [batch_dim, 3, height_dim, width_dim]
         ))
         graph.value_info.append(onnx.helper.make_tensor_value_info(
-            normalized_rgba_input_name, # This is still 4 channels after Div
-            onnx.TensorProto.DataType.FLOAT16,
-            [batch_dim, channel_dim, height_dim, width_dim]
+            downsampled_rgb_input_name, # This is now 3 channels at half resolution, still uint8
+            onnx.TensorProto.DataType.UINT8,
+            [batch_dim, 3, height_dim // 2, width_dim // 2]
         ))
         graph.value_info.append(onnx.helper.make_tensor_value_info(
-            sliced_rgb_input_name, # This is now 3 channels after Slice
+            cast_to_fp16_input_name, # This is after cast, now float16
             onnx.TensorProto.DataType.FLOAT16,
-            [batch_dim, 3, height_dim, width_dim] # Sliced to 3 channels
+            [batch_dim, 3, height_dim // 2, width_dim // 2]
+        ))
+        graph.value_info.append(onnx.helper.make_tensor_value_info(
+            normalized_rgb_input_name, # This is after div, still float16
+            onnx.TensorProto.DataType.FLOAT16,
+            [batch_dim, 3, height_dim // 2, width_dim // 2]
         ))
 
-
-        print(f"Replaced model input '{orig_input_name}' with chunky input '{new_input_name}' and optimized input preprocessing including RGBA to RGB slice.")
 
         # --- STEP 2: Modify the OUTPUT to convert [1, 4, H, W] FLOAT16 → UINT8 → chunky [1, H, W, 4] ---
         # Note: Original output is assumed to be 4 channels (RGBA) from the model's output.
@@ -421,6 +476,7 @@ class ONNXConverter:
                 sys.exit(1)
 
         orig_out_dtype = orig_output.type.tensor_type.elem_type
+        # This will be Float16 due to model.half() and the output scaling.
         if orig_out_dtype != onnx.TensorProto.DataType.FLOAT16:
             print(f"Warning: Original output dtype is not FLOAT16 but "
                   f"{onnx.mapping.TENSOR_TYPE_TO_NP_TYPE[orig_out_dtype].name}")
@@ -553,19 +609,21 @@ if __name__ == "__main__":
 
     print("Step 1: Load PyTorch model and export to initial ONNX in memory")
     converter.load_pytorch_model()
-    time.sleep(10)
+    time.sleep(1) # Reduced sleep for quicker execution
     intermediate_onnx_model = converter.export_to_onnx_in_memory()
-    time.sleep(10)
+    time.sleep(1) # Reduced sleep for quicker execution
 
     print("Step 2: Modify the ONNX graph for chunky input/output (in memory)")
     modified_onnx_model = converter.modify_onnx_graph_for_chunky(intermediate_onnx_model)
-    time.sleep(10)
+    time.sleep(1) # Reduced sleep for quicker execution
 
     print("Step 3: Simplify the ONNX model (including constant folding)")
     print("\nAttempting to simplify the ONNX model (including constant folding)...")
     try:
         import onnxsim
         print("onnx-simplifier found. Proceeding with simplification.")
+        # onnxsim.simplify returns (simplified_model, check_ok)
+        # It's important to pass graph.node as a list or tuple for iteration, not modify during iteration.
         simplified_model, check = onnxsim.simplify(modified_onnx_model)
 
         if check:
@@ -585,7 +643,7 @@ if __name__ == "__main__":
 
     print("Step 4: Verify and save the FINAL (potentially simplified) ONNX model")
     converter.verify_onnx_model(final_onnx_model, is_modified=True)
-    time.sleep(10)
+    time.sleep(1) # Reduced sleep for quicker execution
     converter.save_onnx_model(final_onnx_model)
 
     print("\nFull ONNX conversion, modification, and potential simplification process completed.")

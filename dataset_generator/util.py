@@ -138,9 +138,9 @@ def apply_rotation(image_pil: Image.Image, angle_degrees: int, supersample_facto
         if supersample_factor > 1:
             supersampled_width = original_width * supersample_factor
             supersampled_height = original_height * supersample_factor
-            supersampled_image = image_pil.resize((supersampled_width, supersampled_height), Image.Resampling.LANCZOS)
+            supersampled_image = image_pil.resize((supersampled_width, supersampled_height), Image.Resampling.BICUBIC)
             rotated_supersampled_image = supersampled_image.rotate(angle_degrees, resample=Image.Resampling.NEAREST)
-            final_image = rotated_supersampled_image.resize((original_width, original_height), Image.Resampling.LANCZOS)
+            final_image = rotated_supersampled_image.resize((original_width, original_height), Image.Resampling.BICUBIC)
         else:
             final_image = image_pil.rotate(angle_degrees, resample=pil_filter)
         return final_image
@@ -260,15 +260,15 @@ def pre_apply_resolution_style(image_pil: Image.Image, style: str) -> Image.Imag
     if style == 'lores':
         # Simulate 2x2 source pixels mapping to 1 visual pixel (blocky 2x2 pixels).
         # Downscale by 2x2
-        output_pil = output_pil.resize((w // 2, h // 2), Image.Resampling.LANCZOS)
+        output_pil = output_pil.resize((w // 2, h // 2), Image.Resampling.BICUBIC)
     elif style == 'lores_laced':
         # Simulate 2x1 source pixels mapping to 1 visual pixel width (blocky 2x1 pixels) + interlacing.
         # Downscale width by 2
-        output_pil = output_pil.resize((w // 2, h), Image.Resampling.LANCZOS)
+        output_pil = output_pil.resize((w // 2, h), Image.Resampling.BICUBIC)
     elif style == 'hires':
         # Simulate 1x2 source pixels mapping to 1 visual pixel height (blocky 1x2 pixels) + interlacing.
         # Downscale height by 2
-        output_pil = output_pil.resize((w, h // 2), Image.Resampling.LANCZOS)
+        output_pil = output_pil.resize((w, h // 2), Image.Resampling.BICUBIC)
     elif style == 'hires_laced':
         pass
 
@@ -325,32 +325,3 @@ def load_model(model_path: str):
     except Exception as e:
         warnings.warn(f"Error loading PyTorch model from {model_path}: {e}.")
         return None
-    
-def run_inference(model, image_np):
-    """Runs model inference on a numpy image. Returns numpy image output in the same format as input."""
-    if model is None:
-        # Inference is disabled
-        return image_np
-
-    if torch is None or ToPILImage is None:
-        warnings.warn("PyTorch model inference requested, but torch or torchvision not available.")
-        return image_np
-
-    try:
-        # Convert numpy (HWC, uint8) to torch tensor (NCHW, float 0-1)
-        device = next(model.parameters()).device  # Get model device
-        image_tensor = torch.from_numpy(image_np).permute(2, 0, 1).unsqueeze(0).float() / 255.0
-        image_tensor = image_tensor.to(device)
-
-        model.eval()  # Set model to evaluation mode
-        with torch.no_grad():
-            output_tensor = model(image_tensor)  # Run inference
-        output_tensor = output_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()  # Convert back to HWC
-
-        # Convert back to uint8 format (0-255) to match input format
-        output_tensor = (output_tensor * 255.0).clip(0, 255).astype(np.uint8)
-
-        return output_tensor
-    except Exception as e:
-        warnings.warn(f"Error during model inference: {e}. Skipping inference for this crop.")
-        return image_np

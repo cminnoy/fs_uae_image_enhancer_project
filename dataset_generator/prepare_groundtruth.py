@@ -1,6 +1,6 @@
 import os
 import argparse
-from PIL import Image
+from PIL import Image, ImageCms
 from concurrent.futures import ThreadPoolExecutor
 
 file_formats = [".jpg", ".jpeg", ".webp", ".png", ".gif", ".tiff"] 
@@ -16,11 +16,15 @@ def process_image(filename, input_dir, output_dir, max_crop_size):
     
     try:
         img = Image.open(os.path.join(input_dir, filename))
-        width, height = img.size
+        icc = img.info.get('icc_profile', None)
+        width, height = img.size        
 
         if img.mode != 'RGB':
             print(f"Converting {filename} to RGB")
             img = img.convert('RGB')
+
+        if icc:
+            print(f"ERROR for file {input_dir}/{filename}; ICC profile found but not supported!")
 
         # Resize if max_crop_size is set and both dimensions exceed it
         if max_crop_size and (width > max_crop_size[0] or height > max_crop_size[1]):

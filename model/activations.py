@@ -3,7 +3,6 @@ import torch.nn as nn
 
 # --- Custom Activation Modules ---
 
-@torch.jit.script
 class TeLU(nn.Module):
     """
     Custom activation function: x * tanh(exp(x)).
@@ -12,7 +11,6 @@ class TeLU(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.tanh(torch.exp(x))
 
-@torch.jit.script
 class ScaledTanh(nn.Module):
     """
     Maps the output of Tanh (range [-1, 1]) to the range [0, 1].
@@ -21,7 +19,6 @@ class ScaledTanh(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return (torch.tanh(x) + 1.0) * 0.5
 
-@torch.jit.script
 class SinLU(nn.Module):
     """
     https://www.mdpi.com/2227-7390/10/3/337
@@ -33,6 +30,16 @@ class SinLU(nn.Module):
         self.b = nn.Parameter(torch.ones(1), requires_grad=True)
     def forward(self,x):
         return torch.sigmoid(x)*(x+self.a*torch.sin(self.b*x))
+    
+class BiasedReLU(nn.Module):
+    """
+    ReLU with a learnable bias.
+    """
+    def __init__(self):
+        super().__init__()
+        self.a = nn.Parameter(torch.zeros(1), requires_grad=True)
+    def forward(self,x):
+        return torch.relu(x - self.bias)
 
 # --- Activation Function Registry ---
 
@@ -48,6 +55,7 @@ ACTIVATION_REGISTRY = {
     'relu6': nn.ReLU6,
     'sigmoid': nn.Sigmoid,
     'silu': nn.SiLU, # PyTorch's built-in Swish
+    'swish': nn.SiLU, # Alias for SiLU
     'softplus': nn.Softplus,
     'tanh': nn.Tanh,
 
@@ -58,8 +66,8 @@ ACTIVATION_REGISTRY = {
     # Custom activations 
     'scaled_tanh': ScaledTanh,
     'telu': TeLU,
-    'sinlu': SinLU,  # Custom SinLU activation
-    'swish': nn.SiLU,  # Alias for SiLU, commonly known as Swish
+    'sinlu': SinLU,
+    'biased_relu': BiasedReLU
 }
 
 # --- Activation Factory Function ---

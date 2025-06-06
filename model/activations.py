@@ -37,7 +37,7 @@ class BiasedReLU(nn.Module):
     """
     def __init__(self):
         super().__init__()
-        self.a = nn.Parameter(torch.zeros(1), requires_grad=True)
+        self.bias = nn.Parameter(torch.zeros(1), requires_grad=True)
     def forward(self,x):
         return torch.relu(x - self.bias)
 

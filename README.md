@@ -11,6 +11,9 @@ Those pixels are used as follows:
 
 The artifical network upscales images inside the framebuffer.
 
+pix_shuffle is the latest model.
+Conv3 and Conv5 models are now considered deprecated.
+
 Known limitations:
 - Conv3 models are trained to upscale the resolution only; not enhance the colour palette.
 - Conv5 models are a mild attempt to upscale resolution and colour.

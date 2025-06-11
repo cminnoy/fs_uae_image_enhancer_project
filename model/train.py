@@ -25,7 +25,7 @@ from gamma import srgb_to_linear_approx, linear_to_srgb_approx
 
 import model_conv3
 import model_conv5
-import model_conv6
+import model_pix_shuffle
 
 scaler = GradScaler(device='cuda')
 
@@ -305,7 +305,7 @@ def train_model(model, train_loader, val_loader,
 # Main Function: Prepare Data and Start Training
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train an image enhancement model.')
-    parser.add_argument('--model_type', type=str, required=True, choices=['conv3', 'conv3_heavy', 'conv5', 'conv5_heavy', 'conv6', 'conv6_heavy'],
+    parser.add_argument('--model_type', type=str, required=True, choices=['conv3', 'conv3_heavy', 'conv5', 'conv5_heavy', 'pix_shuffle', 'pix_shuffle_heavy'],
                         help='Type of model to train: "conv3, conv3_heavy, conv5, conv5_heavy, conv6".')
     parser.add_argument('--edge_checkpoint_path', type=str, default=None,
                         help='Path to the trained checkpoint (.pth) to load for combined training.')
@@ -343,12 +343,12 @@ if __name__ == '__main__':
     elif args.model_type == "conv5_heavy":
         model = model_conv5.get_model('heavyweight')
         print("Using Conv2D model with 5 layers; heavyweight.")
-    elif args.model_type == "conv6":
-        model = model_conv6.get_model('lightweight')
-        print("Using Conv2D model with 6 layers; lightweight.")
-    elif args.model_type == "conv6_heavy":
-        model = model_conv6.get_model('heavyweight')
-        print("Using Conv2D model with 6 layers; heavyweight.")
+    elif args.model_type == "pix_shuffle":
+        model = model_pix_shuffle.get_model('lightweight')
+        print("Based on CRN and ESPCN; lightweight.")
+    elif args.model_type == "pix_shuffle_heavy":
+        model = model_pix_shuffle.get_model('heavyweight')
+        print("Based on CRN and ESPCN; heavyweight.")
     else:
         print(f"Error: Unknown model type '{args.model_type}'.")
         sys.exit(1)

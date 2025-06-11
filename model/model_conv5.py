@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
-from loss import PerceptualLoss
+from loss_vgg import PerceptualLoss
+from loss_ssim import SSIMLoss
 import sys, time
 import argparse
 
@@ -60,9 +61,11 @@ class Model(nn.Module):
         # Layer 5 (Output layer): Conv -> BatchNorm (No Activation)
         self.conv5 = nn.Conv2d(in_channels=mid_out_channels, out_channels=final_out_channels, kernel_size=kernel_size, stride=1, padding=padding, bias=False)
         self.bn5 = nn.BatchNorm2d(final_out_channels)
+        self.act5 = nn.Sigmoid()
 
         # Instantiate the PerceptualLoss module
-        self.perceptual_criterion = PerceptualLoss(pixel_loss_weight=0.8, vgg_weight=0.2, pixel_loss_type='charbonnier', charbonnier_epsilon=1e-6)
+       # self.perceptual_criterion = PerceptualLoss(pixel_loss_weight=0.9, vgg_weight=0.1, pixel_loss_type='charbonnier', charbonnier_epsilon=1e-6, input_is_linear=False)
+        self.perceptual_criterion = SSIMLoss(pixel_loss_type='L1', convert_to_linear_for_ssim=False, ssim_weight=0.01, pixel_loss_weight=0.99)
 
     # Fuse_layers uses the imported fuse_modules
     def fuse_layers(self):
@@ -84,23 +87,18 @@ class Model(nn.Module):
             # fuse_modules primarily understands standard Conv/BN/ReLU sequences.
             # We can fuse the standard Conv+BN[+ReLU] sequences and the BN+ReLU sequences.
             fused_modules_list = [
-                # Conv2d -> BN -> Activation
                 ['conv1', 'bn1', 'act1'],
-                # Conv2d -> BN -> Activation
                 ['conv2', 'bn2', 'act2'],
-                # Conv2d -> BN -> Activation
                 ['conv3', 'bn3', 'act3'],
-                # Conv2d -> BN -> Activation
                 ['conv4', 'bn4', 'act4'],
-                # Final Conv2d -> BN (No Activation)
-                ['conv5', 'bn5']
+                ['conv5', 'bn5', 'act5']
             ]
             # Use the assigned fusion utility (fuse_modules)
             FUSION_UTILITY(self, fused_modules_list, inplace=True)
 
             # Check if fusion actually removed the BN and ReLU layers that were expected to fuse
             remaining_bn = hasattr(self, 'bn1') or hasattr(self, 'bn2') or hasattr(self, 'bn3') or hasattr(self, 'bn4') or hasattr(self, 'bn5')
-            remaining_act = hasattr(self, 'act1') or hasattr(self, 'act2') or hasattr(self, 'act3') or hasattr(self, 'act4')
+            remaining_act = hasattr(self, 'act1') or hasattr(self, 'act2') or hasattr(self, 'act3') or hasattr(self, 'act4') or hasattr(self, 'act5')
 
             if not remaining_bn and not remaining_act:
                  print("Standard Conv/BN/ReLU sequences fused successfully.")
@@ -117,119 +115,44 @@ class Model(nn.Module):
         """
         Forward pass of the model. Handles both fused/unfused and FP32/FP16 paths.
         Input: uint8 RGBA. Output: scaled FP16 RGBA when model is in FP16 mode.
-        """
-        # Ensure the input is uint8 and has 4 channels (from dataset)
-        # TracerWarning might appear here during ONNX export, which is expected.
-        if x.dtype != torch.uint8 or x.shape[1] != 4:
-            raise ValueError("Input tensor must be uint8 with 4 channels (RGBA)")
-
-        # Ignore the alpha channel
-        rgb_input = x[:, :3, :, :] # Shape becomes (B, 3, H, W), dtype uint8
-
-        # Convert RGB from uint8 to float32, normalize to [0.0, 1.0]
-        rgb_float_normalized = rgb_input.float().div(255.0) # float32 [0.0, 1.0]
-
-        # Determine the dtype for convolution inputs based on model parameters
-        # This ensures input dtype matches model parameters (FP16 after model.half())
-        model_param_dtype = next(self.parameters()).dtype
-        rgb_input_for_conv = rgb_float_normalized.to(model_param_dtype)
-
+        """        
         # Pass through the sequence of layers.
         # Check if BN/Activation layers still exist after fusion.
 
-        # Layer 1: Conv2d -> BatchNorm -> ReLU6
-        x = self.conv1(rgb_input_for_conv)
+        # Layer 1
+        x = self.conv1(x)
         if hasattr(self, 'bn1'): x = self.bn1(x)
         if hasattr(self, 'act1'): x = self.act1(x)
     
-        # Layer 2: Conv2d -> BatchNorm -> ReLU6
+        # Layer 2
         skip = x
         x = self.conv2(x)
         if hasattr(self, 'bn2'): x = self.bn2(x)
         x = skip + x
         if hasattr(self, 'act2'): x = self.act2(x)
 
-        # Layer 3: Conv2d -> BatchNorm -> ReLU6
+        # Layer 3
         x = self.conv3(x)
         if hasattr(self, 'bn3'): x = self.bn3(x)
         if hasattr(self, 'act3'): x = self.act3(x)
 
-        # Layer 4: Conv2d -> BatchNorm -> ReLU6
+        # Layer 4
         skip = x
         x = self.conv4(x)
         if hasattr(self, 'bn4'): x = self.bn4(x)
         x = skip + x
         if hasattr(self, 'act4'): x = self.act4(x)
 
-        # Layer 5 (Output layer): Conv2d -> BatchNorm (No Activation)
-        conv_output = self.conv5(x)
-        if hasattr(self, 'bn5'):
-            output_float = self.bn5(conv_output)
-        else:
-            output_float = conv_output # If fused, the output is directly from the fused conv.
+        # Layer 5
+        x = self.conv5(x)
+        if hasattr(self, 'bn5'): x = self.bn5(x)
+        if hasattr(self, 'act5'): x = self.act5(x)
 
-        # Scale the output towards the [0.0, 255.0] range.
-        # The output dtype will match the dtype of output_float.
-        scaled_rgb_output = output_float.mul(255.0)
+        return x
 
-        # Create the Alpha channel tensor (filled with 255.0)
-        # Match the dtype and device of the scaled RGB output
-        B, _, H, W = scaled_rgb_output.shape
-        alpha_channel = torch.full((B, 1, H, W), 255.0, dtype=scaled_rgb_output.dtype, device=scaled_rgb_output.device)
-
-        # Concatenate the scaled RGB output and the Alpha channel along the channel dimension
-        rgba_output = torch.cat((scaled_rgb_output, alpha_channel), dim=1)
-
-        return rgba_output # Return the scaled RGBA tensor
-
-    # L1 loss
-    def calculate_L1_loss(self, output, target):
-        return nn.L1Loss()(output, target)
-
-    # Carbonnier loss
-    def calculate_charbonnier_loss(self, output, target, epsilon=1e-6):
-        """
-        Calculates the Carbonnier loss between the output and target tensors.
-
-        Args:
-            output (torch.Tensor): The model's output tensor.
-            target (torch.Tensor): The target tensor.
-            epsilon (float): Small constant to prevent division by zero or infinite gradient.
-
-        Returns:
-            torch.Tensor: The calculated Carbonnier loss (mean reduction).
-        """
-        # Ensure tensors have the same shape
-        if output.shape != target.shape:
-            raise ValueError(f"Output and target tensors must have the same shape, but got {output.shape} and {target.shape}")
-
-        # Calculate the squared difference
-        squared_diff = (output - target)**2
-
-        # Calculate the Carbonnier loss per element
-        loss_per_element = torch.sqrt(squared_diff + epsilon**2)
-
-        # Return the mean loss over all elements
-        return torch.mean(loss_per_element)
-
-    # Perceptual loss
-    def calculate_perceptual_loss(self, output, target):
-        """
-        Calculates the combined Perceptual Loss (VGG + L1/Carbonnier).
-
-        Args:
-            output (torch.Tensor): The model's output tensor (scaled [0, 255] RGBA).
-            target (torch.Tensor): The target tensor (scaled [0, 255] RGBA).
-
-        Returns:
-            torch.Tensor: The calculated total loss.
-        """
-        # Call the instantiated PerceptualLoss module
-        return self.perceptual_criterion(output, target)
-
-    # Criterion used by the training loop (Decided on perceptual loss)
+    # Criterion used by the training loop
     def criterion(self, output, target):
-        return self.calculate_perceptual_loss(output, target)  
+        return self.perceptual_criterion(output, target)
 
 def get_model(name:str='lightweight'):
     if name == 'lightweight':
@@ -263,7 +186,7 @@ if __name__ == "__main__":
         print("Falling back to eager mode.")
         model = model.to(device)
 
-    x = torch.randint(0, 256, (1, 4, 576, 752), dtype=torch.uint8).to(device)
+    x = torch.randint(0, 256, (1, 3, 576, 752), dtype=torch.uint8).to(device)
 
     # Warm-up
     print("Starting warm-up...")

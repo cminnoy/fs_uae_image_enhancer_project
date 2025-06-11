@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from loss import PerceptualLoss
+from loss_vgg import PerceptualLoss
 import sys, time
 import argparse
 
@@ -235,7 +235,7 @@ if __name__ == "__main__":
         print("Falling back to eager mode.")
         model = model.to(device)
 
-    x = torch.randint(0, 256, (1, 4, 576, 752), dtype=torch.uint8).to(device)
+    x = torch.randint(0, 256, (1, 3, 576, 752), dtype=torch.uint8).to(device)
 
     # Warm-up
     print("Starting warm-up...")

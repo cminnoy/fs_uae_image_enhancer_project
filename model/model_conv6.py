@@ -20,34 +20,52 @@ class Model(nn.Module):
     def __init__(self, layer1_out_channels = 36,
                        layer1_kernel_size = 3,
                        layer1_act1 = 'identity',
+                       layer1_act1_params = None,
                        layer1_act2 = 'relu',
+                       layer1_act2_params = None,
                        layer2_out_channels = 36,
                        layer2_kernel_size = 3,
                        layer2_act1 = 'mish',
+                       layer2_act1_params = None,
                        layer2_act2 = 'biased_relu',
+                       layer2_act2_params = None,
                        layer2_act3 = 'tanh',
+                       layer2_act3_params = None,
                        layer2_act4 = 'relu6',
+                       layer2_act4_params = None,
                        layer3_out_channels = 36,
                        layer3_kernel_size = 3,
                        layer3_act1 = 'identity',
+                       layer3_act1_params = None,
                        layer3_act2 = 'identity',
+                       layer3_act2_params = None,
                        layer4_out_channels = 36,
                        layer4_kernel_size = 3,
                        layer4_act1 = 'telu',
+                       layer4_act1_params = None,
                        layer4_act2 = 'leaky_relu',
+                       layer4_act2_params = None,
                        layer4_act3 = 'tanh',
+                       layer4_act3_params = None,
                        layer4_act4 = 'identity',
+                       layer4_act4_params = None,
                        layer5_out_channels = 36,
                        layer5_kernel_size = 3,
                        layer5_act1 = 'identity',
+                       layer5_act1_params = None,
                        layer5_act2 = 'identity',
+                       layer5_act2_params = None,
                        layer6_out_channels = 36,
                        layer6_kernel_size = 3,
                        layer6_act1 = 'mish',
+                       layer6_act1_params = None,
                        layer6_act2 = 'prelu',
+                       layer6_act2_params = None,
                        layer7_kernel_size = 3,
                        layer7_act1 = 'sinlu',
+                       layer7_act1_params = None,
                        layer7_act2 = 'prelu',
+                       layer7_act2_params = None,
                        verbose=False
                 ):
         """
@@ -60,20 +78,32 @@ class Model(nn.Module):
         """
         super(Model, self).__init__()
 
-        for ks in[layer1_kernel_size, layer2_kernel_size, layer3_kernel_size, layer4_kernel_size, layer5_kernel_size, layer6_kernel_size, layer7_kernel_size]: 
+        for ks in[layer1_kernel_size, layer2_kernel_size, layer3_kernel_size, layer4_kernel_size, layer5_kernel_size, layer6_kernel_size, layer7_kernel_size]:
             if ks % 2 == 0:
                 raise ValueError("kernel_size must be odd for symmetric padding")
 
         self.verbose = verbose
         if verbose:
+            def format_act_info(act_name, act_params):
+                return f"{act_name}{f' (params: {act_params})' if act_params else ''}"
+
             print(f"Model initialized with:\n"
-                  f"Layer 1: {layer1_out_channels} channels, kernel size {layer1_kernel_size}, activations {layer1_act1}, {layer1_act2}\n"
-                  f"Layer 2: {layer2_out_channels} channels, kernel size {layer2_kernel_size}, activations {layer2_act1}, {layer2_act2}, {layer2_act3}, {layer2_act4}\n"
-                  f"Layer 3: {layer3_out_channels} channels, kernel size {layer3_kernel_size}, activations {layer3_act1}, {layer3_act2}\n"
-                  f"Layer 4: {layer4_out_channels} channels, kernel size {layer4_kernel_size}, activations {layer4_act1}, {layer4_act2}, {layer4_act3}, {layer4_act4}\n"
-                  f"Layer 5: {layer5_out_channels} channels, kernel size {layer5_kernel_size}, activations {layer5_act1}, {layer5_act2}\n"
-                  f"Layer 6: {layer6_out_channels} channels, kernel size {layer6_kernel_size}, activations {layer6_act1}, {layer6_act2}\n"
-                  f"Layer 7: kernel size {layer7_kernel_size}, activations {layer7_act1}, {layer7_act2}")
+                  f"Layer 1: {layer1_out_channels} channels, kernel size {layer1_kernel_size}, "
+                  f"activations {format_act_info(layer1_act1, layer1_act1_params)}, {format_act_info(layer1_act2, layer1_act2_params)}\n"
+                  f"Layer 2: {layer2_out_channels} channels, kernel size {layer2_kernel_size}, "
+                  f"activations {format_act_info(layer2_act1, layer2_act1_params)}, {format_act_info(layer2_act2, layer2_act2_params)}, "
+                  f"{format_act_info(layer2_act3, layer2_act3_params)}, {format_act_info(layer2_act4, layer2_act4_params)}\n"
+                  f"Layer 3: {layer3_out_channels} channels, kernel size {layer3_kernel_size}, "
+                  f"activations {format_act_info(layer3_act1, layer3_act1_params)}, {format_act_info(layer3_act2, layer3_act2_params)}\n"
+                  f"Layer 4: {layer4_out_channels} channels, kernel size {layer4_kernel_size}, "
+                  f"activations {format_act_info(layer4_act1, layer4_act1_params)}, {format_act_info(layer4_act2, layer4_act2_params)}, "
+                  f"{format_act_info(layer4_act3, layer4_act3_params)}, {format_act_info(layer4_act4, layer4_act4_params)}\n"
+                  f"Layer 5: {layer5_out_channels} channels, kernel size {layer5_kernel_size}, "
+                  f"activations {format_act_info(layer5_act1, layer5_act1_params)}, {format_act_info(layer5_act2, layer5_act2_params)}\n"
+                  f"Layer 6: {layer6_out_channels} channels, kernel size {layer6_kernel_size}, "
+                  f"activations {format_act_info(layer6_act1, layer6_act1_params)}, {format_act_info(layer6_act2, layer6_act2_params)}\n"
+                  f"Layer 7: kernel size {layer7_kernel_size}, "
+                  f"activations {format_act_info(layer7_act1, layer7_act1_params)}, {format_act_info(layer7_act2, layer7_act2_params)}")
 
         # Define padding based on kernel size
         conv1_padding = (layer1_kernel_size - 1) // 2
@@ -84,13 +114,13 @@ class Model(nn.Module):
         conv6_padding = (layer6_kernel_size - 1) // 2
         conv7_padding = (layer7_kernel_size - 1) // 2
 
-        # Layer 0 
+        # Layer 0
         self.pixel_unshuffle = nn.PixelUnshuffle(downscale_factor=2)
 
         # Layer 1
         self.conv1 = nn.Conv2d(in_channels=3 * (2**2), out_channels=layer1_out_channels, kernel_size=layer1_kernel_size, stride=1, padding=conv1_padding, bias=True)
-        self.l1_act1 = activations.get_activation(layer1_act1)
-        self.l1_act2 = activations.get_activation(layer1_act2)
+        self.l1_act1 = activations.get_activation(layer1_act1, params=layer1_act1_params)
+        self.l1_act2 = activations.get_activation(layer1_act2, params=layer1_act2_params)
 
         # Skip connection projection for Layer 2 addition
         self.skip1_proj_conv = None
@@ -99,15 +129,15 @@ class Model(nn.Module):
 
         # Layer 2
         self.conv2 = nn.Conv2d(in_channels=layer1_out_channels, out_channels=layer2_out_channels, kernel_size=layer2_kernel_size, stride=1, padding=conv2_padding, bias=True)
-        self.l2_act1 = activations.get_activation(layer2_act1)
-        self.l2_act2 = activations.get_activation(layer2_act2)
-        self.l2_act3 = activations.get_activation(layer2_act3)
-        self.l2_act4 = activations.get_activation(layer2_act4)
+        self.l2_act1 = activations.get_activation(layer2_act1, params=layer2_act1_params)
+        self.l2_act2 = activations.get_activation(layer2_act2, params=layer2_act2_params)
+        self.l2_act3 = activations.get_activation(layer2_act3, params=layer2_act3_params)
+        self.l2_act4 = activations.get_activation(layer2_act4, params=layer2_act4_params)
 
         # Layer 3
         self.conv3 = nn.Conv2d(in_channels=layer2_out_channels, out_channels=layer3_out_channels, kernel_size=layer3_kernel_size, stride=1, padding=conv3_padding, bias=True)
-        self.l3_act1 = activations.get_activation(layer3_act1)
-        self.l3_act2 = activations.get_activation(layer3_act2)
+        self.l3_act1 = activations.get_activation(layer3_act1, params=layer3_act1_params)
+        self.l3_act2 = activations.get_activation(layer3_act2, params=layer3_act2_params)
 
         # Skip connection projection for Layer 4 addition
         self.skip2_proj_conv = None
@@ -116,25 +146,25 @@ class Model(nn.Module):
 
         # Layer 4
         self.conv4 = nn.Conv2d(in_channels=layer3_out_channels, out_channels=layer4_out_channels, kernel_size=layer4_kernel_size, stride=1, padding=conv4_padding, bias=True)
-        self.l4_act1 = activations.get_activation(layer4_act1)
-        self.l4_act2 = activations.get_activation(layer4_act2)
-        self.l4_act3 = activations.get_activation(layer4_act3)
-        self.l4_act4 = activations.get_activation(layer4_act4)
+        self.l4_act1 = activations.get_activation(layer4_act1, params=layer4_act1_params)
+        self.l4_act2 = activations.get_activation(layer4_act2, params=layer4_act2_params)
+        self.l4_act3 = activations.get_activation(layer4_act3, params=layer4_act3_params)
+        self.l4_act4 = activations.get_activation(layer4_act4, params=layer4_act4_params)
 
         # Layer 5
         self.conv5 = nn.Conv2d(in_channels=layer4_out_channels, out_channels=layer5_out_channels, kernel_size=layer5_kernel_size, stride=1, padding=conv5_padding, bias=True)
-        self.l5_act1 = activations.get_activation(layer5_act1)
-        self.l5_act2 = activations.get_activation(layer5_act2)
+        self.l5_act1 = activations.get_activation(layer5_act1, params=layer5_act1_params)
+        self.l5_act2 = activations.get_activation(layer5_act2, params=layer5_act2_params)
 
         # Layer 6 - Concatenate primary features with later features
         self.conv6 = nn.Conv2d(in_channels=layer1_out_channels + layer5_out_channels, out_channels=layer6_out_channels, kernel_size=layer6_kernel_size, stride=1, padding=conv6_padding, bias=True)
-        self.l6_act1 = activations.get_activation(layer6_act1)
-        self.l6_act2 = activations.get_activation(layer6_act2)
+        self.l6_act1 = activations.get_activation(layer6_act1, params=layer6_act1_params)
+        self.l6_act2 = activations.get_activation(layer6_act2, params=layer6_act2_params)
 
         # Layer 7
         self.conv7 = nn.Conv2d(in_channels=layer6_out_channels, out_channels=3 * (2**2), kernel_size=layer7_kernel_size, stride=1, padding=conv7_padding, bias=True)
-        self.l7_act1 = activations.get_activation(layer7_act1)
-        self.l7_act2 = activations.get_activation(layer7_act2)
+        self.l7_act1 = activations.get_activation(layer7_act1, params=layer7_act1_params)
+        self.l7_act2 = activations.get_activation(layer7_act2, params=layer7_act2_params)
 
         # Layer 8
         self.pixel_shuffle = nn.PixelShuffle(upscale_factor=2)
@@ -149,7 +179,7 @@ class Model(nn.Module):
                                         high_frequency_type='laplacian',
                                         lambda_lum=0.0,
                                         input_is_linear=True
-                                    )        
+                                    )
 
     # Fuse_layers uses the imported fuse_modules
     def fuse_layers(self):
@@ -163,7 +193,7 @@ class Model(nn.Module):
             print("Hopeful that ONNX Runtime will perform some fusion.")
             return # Exit if no utility
 
-        if self.vebose:
+        if self.verbose:
             print("Attempting to fuse standard Conv2d/BatchNorm2d/ReLU sequences using torch.ao.quantization.fuse_modules...")
         self.eval() # Ensure eval mode
 
@@ -173,7 +203,7 @@ class Model(nn.Module):
             # We can fuse the standard Conv+BN[+ReLU] sequences and the BN+ReLU sequences.
             # Note: This is an attempt at fusion. Given the arbitrary activations, it's expected to fail gracefully.
             fused_modules_list = [
-                ['conv1', 'l1_act1'], 
+                ['conv1', 'l1_act1'],
                 ['conv2', 'l2_act1'],
                 ['conv3', 'l3_act1'],
                 ['conv4', 'l4_act1'],
@@ -200,22 +230,22 @@ class Model(nn.Module):
         Input: uint8 RGBA. Output: scaled FP16 RGBA when model is in FP16 mode.
         """
         identity = x
-
+        #---------------------------------------------------------------------- 
         # Apply downsampling by taking every even pixel; this reduces H and W by a factor of 2; x will become (Batch, Channels, H/2, W/2)
         x = self.pixel_unshuffle(x)
-
+        #---------------------------------------------------------------------- 
         # Layer 1
         x = self.conv1(x)
         if hasattr(self, 'l1_act1'): x = self.l1_act1(x)
         if hasattr(self, 'l1_act2'): x = self.l1_act2(x)
         long_skip = x
-    
+        #---------------------------------------------------------------------- 
         # Layer 2
         short_skip_l2 = x # This is the skip connection from layer 1
         x = self.conv2(x)
         if hasattr(self, 'l2_act1'): x = self.l2_act1(x)
         if hasattr(self, 'l2_act2'): x = self.l2_act2(x)
-        
+
         # Apply projection if channel dimensions differ for Layer 2 skip
         if self.skip1_proj_conv:
             short_skip_l2 = self.skip1_proj_conv(short_skip_l2)
@@ -223,12 +253,12 @@ class Model(nn.Module):
 
         if hasattr(self, 'l2_act3'): x = self.l2_act3(x)
         if hasattr(self, 'l2_act4'): x = self.l2_act4(x)
-
+        #---------------------------------------------------------------------- 
         # Layer 3
         x = self.conv3(x)
-        if hasattr(self, 'l3_act1'): x = self.l3_act1(x)
-        if hasattr(self, 'l3_act2'): x = self.l3_act2(x)
-
+        if hasattr(self, 'l3_act1'): x = self.l3_act1(x) 
+        if hasattr(self, 'l3_act2'): x = self.l3_act2(x) 
+        #---------------------------------------------------------------------- 
         # Layer 4
         short_skip_l4 = x # This is the skip connection from layer 3
         x = self.conv4(x)
@@ -242,28 +272,29 @@ class Model(nn.Module):
 
         if hasattr(self, 'l4_act3'): x = self.l4_act3(x)
         if hasattr(self, 'l4_act4'): x = self.l4_act4(x)
-
+        #---------------------------------------------------------------------- 
         # Layer 5
         x = self.conv5(x)
         if hasattr(self, 'l5_act1'): x = self.l5_act1(x)
-        if hasattr(self, 'l5_act2'): x = self.l5_act2(x)      
-
+        if hasattr(self, 'l5_act2'): x = self.l5_act2(x)
+        #---------------------------------------------------------------------- 
         # Layer 6 - Concatenate primary features with later features
         x = torch.cat([long_skip, x], dim=1)
         x = self.conv6(x)
         if hasattr(self, 'l6_act1'): x = self.l6_act1(x)
         if hasattr(self, 'l6_act2'): x = self.l6_act2(x)
-
+        #---------------------------------------------------------------------- 
         # Layer 7
         x = self.conv7(x)
         if hasattr(self, 'l7_act1'): x = self.l7_act1(x)
         if hasattr(self, 'l7_act2'): x = self.l7_act2(x)
-
+        #---------------------------------------------------------------------- 
         # Layer 8 - This will bring it back to original resolution; upscale_factor=2
         x = self.pixel_shuffle(x)
+        #---------------------------------------------------------------------- 
         x = identity + x
         x = self.act8(x) # Make sure negative values can't escape
-
+        #---------------------------------------------------------------------- 
         return x
 
     # Criterion used by the training loop (Decided on perceptual loss)
@@ -272,9 +303,14 @@ class Model(nn.Module):
 
 def get_model(name:str='lightweight'):
     if name == 'lightweight':
-        return Model(layer1_out_channels=36, layer2_out_channels=36, layer3_out_channels=72, layer4_out_channels=72, layer5_out_channels=36, layer6_out_channels=36, layer7_out_channels=36)
+        return Model(layer1_out_channels=36, layer2_out_channels=36, layer3_out_channels=72, layer4_out_channels=72, layer5_out_channels=36, layer6_out_channels=36,
+                     layer1_act1='sinlu', layer1_act2='relu6',
+                     layer2_act1='telu', layer2_act2='identity', layer2_act3='sinlu', layer2_act4='biased_prelu', layer2_act4_params={'num_parameters':36},
+                     layer4_act1='mish', layer4_act2='biased_prelu', layer4_act3='tanh', layer4_act4='relu', layer4_act2_params={'num_parameters':72},
+                     layer6_act1='mish', layer6_act2='relu6',
+                     layer7_act1='identity', layer7_act2='biased_prelu', layer7_act2_params={'num_parameters':1})
     elif name == 'heavyweight':
-        return Model(layer1_out_channels=36, layer2_out_channels=36, layer3_out_channels=108, layer4_out_channels=108, layer5_out_channels=36, layer6_out_channels=36, layer7_out_channels=36)
+        return Model(layer1_out_channels=36, layer2_out_channels=36, layer3_out_channels=108, layer4_out_channels=108, layer5_out_channels=36, layer6_out_channels=36)
     return None
 
 if __name__ == "__main__":
@@ -284,10 +320,17 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    
+
     print("==============================")
     print(" Edge model float16")
     print("==============================")
+    # Example of how to pass parameters:
+    # For a LeakyReLU with negative_slope=0.05 in layer 4, act 2:
+    # model = Model(layer4_act2='leaky_relu', layer4_act2_params={'negative_slope': 0.05}, verbose=True).to(device)
+    # For a PReLU with num_parameters=64 in layer 6, act 2:
+    # model = Model(layer6_act2='prelu', layer6_act2_params={'num_parameters': 64, 'init': 0.3}, verbose=True).to(device)
+
+    # For testing, let's instantiate a heavyweight model with some example parameters
     model = get_model(args.model_type).to(device)
     model.eval()
     model.fuse_layers()

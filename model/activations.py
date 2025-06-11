@@ -26,8 +26,8 @@ class SinLU(nn.Module):
     """
     def __init__(self):
         super().__init__()
-        self.a = nn.Parameter(torch.ones(1), requires_grad=True)
-        self.b = nn.Parameter(torch.ones(1), requires_grad=True)
+        self.a = nn.Parameter(torch.ones(1))
+        self.b = nn.Parameter(torch.ones(1))
     def forward(self,x):
         return torch.sigmoid(x)*(x+self.a*torch.sin(self.b*x))
     
@@ -37,17 +37,30 @@ class BiasedReLU(nn.Module):
     """
     def __init__(self):
         super().__init__()
-        self.bias = nn.Parameter(torch.zeros(1), requires_grad=True)
+        self.bias = nn.Parameter(torch.empty(1))
+        torch.nn.init.uniform_(self.bias, a=-0.1, b=0.1)
     def forward(self,x):
         return torch.relu(x - self.bias)
 
+class BiasedPReLU(nn.Module):
+    """
+    Parametric ReLU with a learnable bias.
+    """
+    def __init__(self, num_parameters, init=0.25):
+        super().__init__()
+        self.bias = nn.Parameter(torch.empty(1))
+        torch.nn.init.uniform_(self.bias, a=-0.1, b=0.1)
+        self.prelu = nn.PReLU(num_parameters=num_parameters, init=init)
+    def forward(self, x):
+        return self.prelu(x - self.bias)
+    
 # --- Activation Function Registry ---
 
 ACTIVATION_REGISTRY = {
     # Standard PyTorch activations
     'identity': nn.Identity,
-    'elu': nn.ELU,
-    'gelu': nn.GELU,
+    'elu': nn.ELU, # Alpha 
+    'gelu': nn.GELU, # approximate='none' 
     'leaky_relu': nn.LeakyReLU,
     'mish': nn.Mish,
     'prelu': nn.PReLU,
@@ -56,7 +69,7 @@ ACTIVATION_REGISTRY = {
     'sigmoid': nn.Sigmoid,
     'silu': nn.SiLU, # PyTorch's built-in Swish
     'swish': nn.SiLU, # Alias for SiLU
-    'softplus': nn.Softplus,
+    'softplus': nn.Softplus, # beta, threshold 
     'tanh': nn.Tanh,
 
     # Standard PyTorch activations often needing 'dim' parameter
@@ -67,7 +80,8 @@ ACTIVATION_REGISTRY = {
     'scaled_tanh': ScaledTanh,
     'telu': TeLU,
     'sinlu': SinLU,
-    'biased_relu': BiasedReLU
+    'biased_relu': BiasedReLU,
+    'biased_prelu': BiasedPReLU
 }
 
 # --- Activation Factory Function ---
@@ -118,6 +132,8 @@ def get_activation(activation_name: str, params: dict = None, inplace: bool = Fa
         if params is None:
             if activation_class == nn.PReLU:
                  return activation_class()
+            elif activation_class == BiasedPReLU:
+                return activation_class()
             elif activation_class in [nn.Softmax, nn.LogSoftmax]:
                  return activation_class(dim=1)
             elif activation_class == nn.LeakyReLU:

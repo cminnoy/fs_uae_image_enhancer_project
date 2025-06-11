@@ -5,6 +5,7 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import ToPILImage
 from torch.optim import lr_scheduler
 from torchvision.utils import save_image
+from torchvision.transforms import ToTensor
 from torch.utils.tensorboard import SummaryWriter
 from PIL import Image
 from torchsummary import summary
@@ -20,62 +21,55 @@ import shutil
 import warnings
 import numpy as np
 from srdataset import SRDataset, gather_all_samples_from_directory
+from gamma import srgb_to_linear_approx, linear_to_srgb_approx
 
 import model_conv3
 import model_conv5
+import model_conv6
 
 scaler = GradScaler(device='cuda')
 
 def inference_on_directory(model, input_dir, output_dir, device):
     """
-    Perform inference on all images in the input directory and save the results in the output directory.
-    Input images are loaded as RGBA uint8 and processed by the model.
-    Output images are expected to be RGBA float32 [0, 255] and saved as PNG.
+    Performs inference on RGB images in input_dir and saves model output to output_dir.
+    Assumes:
+    - Input: sRGB PNGs → converted to linear RGB [0, 1], upscaled to [0, 255]
+    - Model input: float32 linear RGB [0, 255]
+    - Model output: float32 linear RGB [0, 255]
+    - Output saved as sRGB PNG
     """
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    # transform = ToTensor() # Remove this, not needed for input
+    to_tensor = ToTensor()
+    to_pil = ToPILImage(mode='RGB')
+
     model.eval()
     with torch.no_grad():
         for img_path in glob.glob(os.path.join(input_dir, "*.png")):
             try:
-                # Load as RGBA PIL Image
-                img_pil = Image.open(img_path).convert('RGBA')
+                img_pil = Image.open(img_path).convert('RGB')
             except Exception as e:
                 print(f"Error loading image {img_path}: {e}. Skipping.")
                 continue
 
-            # Convert PIL RGBA image to uint8 tensor (CxHxW)
-            # Model expects uint8 4 channels CxHxW
-            img_np = np.array(img_pil) # Convert PIL Image to NumPy array (HxWx4, uint8)
-            # Convert NumPy array to PyTorch tensor and permute dimensions from HxWxC to CxHxW
-            input_tensor = torch.from_numpy(img_np).permute(2, 0, 1) # Shape 4xHxW, dtype uint8
+            # Convert to float32 tensor in [0,1]
+            img_tensor = to_tensor(img_pil)  # (3, H, W)
 
-            # Add batch dimension (inference typically runs on a batch of 1) and move to device
-            input_tensor = input_tensor.unsqueeze(0).to(device) # Shape 1x4xHxW, dtype uint8
+            # Convert to linear RGB and downsample
+            img_linear = srgb_to_linear_approx(img_tensor)# [:, ::2, ::2] # (3, H/2, W/2), linear RGB in [0,1]
 
-            # Perform inference
-            # Model outputs float32 RGBA scaled to [0.0, 255.0] (shape 1x4xHxW)
-            output_tensor = model(input_tensor)
+            # Prepare input tensor
+            input_tensor = img_linear.unsqueeze(0).to(device)
 
-            # Prepare output for saving: clamp, move to CPU, remove batch dim
-            # The model outputs values in the [0.0, 255.0] range for RGB and 255 for Alpha (float32).
-            # Clamping is good practice to ensure values are strictly within this range before casting to uint8.
-            output_tensor_clamped = output_tensor.clamp(0.0, 255.0) # Clamped float32 tensor
+            # Inference
+            output_tensor = model(input_tensor).squeeze(0).cpu() # (3, H, W), linear RGB in [0,1]
 
-            # Move to CPU and remove the batch dimension
-            output_tensor_cpu = output_tensor_clamped.cpu().squeeze(0) # Shape 4xHxW, float32
+            # Convert back to sRGB
+            output_srgb = linear_to_srgb_approx(output_tensor).clamp(0.0, 1.0)
 
-            # Convert the float32 tensor scaled to [0.0, 255.0] to uint8 [0, 255]
-            output_img_uint8 = output_tensor_cpu.to(torch.uint8) # Shape 4xHxW, uint8
-
-            # Convert the uint8 tensor (CxHxW) to a PIL Image (HxWx channels)
-            # ToPILImage correctly handles uint8 tensors in the [0, 255] range.
-            to_pil_image = ToPILImage(mode='RGBA') # Specify the output mode is RGBA
-            output_img = to_pil_image(output_img_uint8)
-
-            # Save the output image
+            # Save image
+            output_img = to_pil(output_srgb)
             output_path = os.path.join(output_dir, os.path.basename(img_path))
             output_img.save(output_path)
             print(f"Saved predicted image: {output_path}")
@@ -175,7 +169,7 @@ def train_model(model, train_loader, val_loader,
                 # Scale and backpropagate the total loss
                 scaled_loss = scaler.scale(batch_loss)
                 scaled_loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+               # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
 
                 # Accumulate losses for reporting
                 with torch.no_grad():                    
@@ -197,6 +191,7 @@ def train_model(model, train_loader, val_loader,
             optimizer.zero_grad(set_to_none=True)
 
         print(f"Epoch [{epoch}/{num_epochs}] - Done")
+        time.sleep(5)
 
         # Average the losses
         epoch_train_loss = epoch_train_loss / len(train_loader.dataset)
@@ -216,6 +211,7 @@ def train_model(model, train_loader, val_loader,
 
         # Step learning rate scheduler
         scheduler.step()
+        time.sleep(5)
 
         # Update CSV and print
         writer.add_scalar('Loss/Train', epoch_train_loss, epoch)
@@ -302,15 +298,15 @@ def train_model(model, train_loader, val_loader,
                         else:
                              print(f"Warning: Skipping saving internal '{key}' from '{prefix}' as it's None or empty.")
 
-        time.sleep(20) # This is to let my GPU cool down a bit; otherwise it sometimes crashes from overheating
+        time.sleep(10)
 
     return best_val_loss, best_epoch, average_inference_time
 
 # Main Function: Prepare Data and Start Training
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train an image enhancement model.')
-    parser.add_argument('--model_type', type=str, required=True, choices=['conv3', 'conv3_heavy', 'conv5', 'conv5_heavy'],
-                        help='Type of model to train: "conv3, conv3_heavy, conv5, conv5_heavy".')
+    parser.add_argument('--model_type', type=str, required=True, choices=['conv3', 'conv3_heavy', 'conv5', 'conv5_heavy', 'conv6', 'conv6_heavy'],
+                        help='Type of model to train: "conv3, conv3_heavy, conv5, conv5_heavy, conv6".')
     parser.add_argument('--edge_checkpoint_path', type=str, default=None,
                         help='Path to the trained checkpoint (.pth) to load for combined training.')
     parser.add_argument('--epochs', type=int, default=10, help='Number of epochs to train')
@@ -322,7 +318,7 @@ if __name__ == '__main__':
     parser.add_argument('--generator_train_dir', type=str, required=True, help='Output directory of the generator\'s train split (e.g., path/to/dataset_quantized/train).')
     parser.add_argument('--train_samples', type=int, default=10000, help='Declared number of samples to use for training per epoch (epoch size).')
     parser.add_argument('--val_samples', type=int, default=1000, help='Declared number of samples to use for validation per epoch (epoch size).')
-    parser.add_argument('--val_split_ratio', type=float, default=0.1, help='Ratio of the available sample pool to use for validation (0.0 to 1.0).') # Added split ratio argument for programmatic splitting
+    parser.add_argument('--val_split_ratio', type=float, default=0.1, help='Ratio of the available sample pool to use for validation (0.0 to 1.0).')
     parser.add_argument("--crop_size", type=int, nargs=2, default=[752, 576], help="Expected crop size as W H (e.g., 752 576) for images in the dataset. Defaults to 752x576.")
     parser.add_argument("--styles_to_include", type=str, nargs='*', help="Optional list of specific style names (e.g., 'lores_rgb888_pNone_none') to include as inputs. If omitted, all styles are included.")
     parser.add_argument('--verbose', type=int, default=1, help='Verbosity level for warnings/messages (0: no warnings, 1: basic, 2: detailed).')
@@ -347,6 +343,12 @@ if __name__ == '__main__':
     elif args.model_type == "conv5_heavy":
         model = model_conv5.get_model('heavyweight')
         print("Using Conv2D model with 5 layers; heavyweight.")
+    elif args.model_type == "conv6":
+        model = model_conv6.get_model('lightweight')
+        print("Using Conv2D model with 6 layers; lightweight.")
+    elif args.model_type == "conv6_heavy":
+        model = model_conv6.get_model('heavyweight')
+        print("Using Conv2D model with 6 layers; heavyweight.")
     else:
         print(f"Error: Unknown model type '{args.model_type}'.")
         sys.exit(1)

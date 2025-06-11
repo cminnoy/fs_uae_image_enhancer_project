@@ -9,6 +9,7 @@ from torch.utils.data import Dataset
 from PIL import Image
 from torchvision.transforms import ToTensor
 import torchvision.transforms.functional as F
+from gamma import srgb_to_linear_approx
 
 def parse_generated_filename(filename: str, verbose: int = 1) -> dict | None:
     """
@@ -301,26 +302,16 @@ class SRDataset(Dataset):
              raise IndexError("SRDataset pool is empty. Cannot draw samples.")
         random_idx = random.randint(0, pool_size - 1)
 
-
         # Get the file paths for the styled input and the target image using the random index
         styled_img_path, target_img_path = self.available_samples_pool[random_idx]
 
         # Load the images using Pillow.
         try:
-            # TODO just keep float32 BCHW format and adapt the onnx converter to add layer on front
+            # Load input image as RGB nd convert to float32 tensor [0..1]
+            styled_img_pil = Image.open(styled_img_path).convert('RGB')
 
-            # Load input image as RGBA and convert to uint8 tensor (4 channels, HxWxD)
-            styled_img_pil = Image.open(styled_img_path).convert('RGBA')
-            # Convert PIL image to numpy array (uint8, HxWxChannels)
-            styled_img_np = np.array(styled_img_pil)
-            # Convert numpy array to torch tensor (uint8, HxWxChannels) and permute to CxHxW
-            lr_t = torch.from_numpy(styled_img_np).permute(2, 0, 1)
-
-            # Load target image as RGB and convert to float32 tensor, scaled to [0.0, 255.0]
-            target_img_pil = Image.open(target_img_path).convert('RGBA')
-            # Use ToTensor to get float32 [0, 1] CxHxW, then scale to [0.0, 255.0]
-            to_tensor = ToTensor() # Can define here or in init if needed elsewhere
-            hr_t = to_tensor(target_img_pil).mul(255.0)
+            # Load target image as RGB and convert to float32 tensor [0..1]
+            target_img_pil = Image.open(target_img_path).convert('RGB')
 
         except Exception as e:
             # If there's an error loading the selected sample, try to get another one randomly.
@@ -328,13 +319,6 @@ class SRDataset(Dataset):
             warnings.warn(f"Error loading images for randomly selected sample ({styled_img_path}, {target_img_path}): {e}. Retrying.")
             # Recursively call __getitem__ to get another random sample.
             return self.__getitem__(idx) # Pass the original idx (though it's ignored)
-
-        if styled_img_pil.size != (self.expected_crop_w, self.expected_crop_h): # Use PIL size before numpy conversion
-            warnings.warn(f"Styled image {styled_img_path} has unexpected dimensions: {styled_img_pil.size}. Expected: {(self.expected_crop_w, self.expected_crop_h)}. Proceeding but this may cause issues.")
-        if target_img_pil.size != (self.expected_crop_w, self.expected_crop_h):
-             warnings.warn(f"Target image {target_img_path} has unexpected dimensions: {target_img_pil.size}. Expected: {(self.expected_crop_w, self.expected_crop_h)}. Proceeding but this may cause issues.")
-
-        # Apply synchronized random horizontal flip
 
         # Synchronized random flip decision
         do_hflip = random.random() < 0.5
@@ -348,16 +332,9 @@ class SRDataset(Dataset):
             styled_img_pil = F.vflip(styled_img_pil)
             target_img_pil = F.vflip(target_img_pil)
 
-        # Convert flipped PIL images to tensors
-        # Input (LR) - RGBA uint8
-        styled_img_np = np.array(styled_img_pil.convert('RGBA')) # Convert back to RGBA after flip
-        lr_t = torch.from_numpy(styled_img_np).permute(2, 0, 1) # uint8, 4 channels, CxHxW
+        # Convert flipped PIL images to tensors; sRGB to linear RGB; lr enforce lores
+        to_tensor = ToTensor()
+        lr_t = srgb_to_linear_approx(to_tensor(styled_img_pil))
+        hr_t = srgb_to_linear_approx(to_tensor(target_img_pil))        
 
-        # Target (HR) - RGB float32 scaled to [0, 255]
-        to_tensor = ToTensor() # Re-create or use self.to_tensor if in init
-        hr_t = to_tensor(target_img_pil.convert('RGBA')).mul(255.0) # Convert back to RGB after flip, float32, 3 channels, CxHxW, scaled
-
-        # Return the randomly selected styled input (LR) and target (HR) tensors
-        # Model expects LR to be uint8 4-channel
-        # Loss expects HR to be float, matching scaled output
         return lr_t, hr_t

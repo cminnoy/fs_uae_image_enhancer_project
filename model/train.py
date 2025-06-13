@@ -26,6 +26,7 @@ from gamma import srgb_to_linear_approx, linear_to_srgb_approx
 import model_conv3
 import model_conv5
 import model_pix_shuffle
+import model_residual_unet
 
 scaler = GradScaler(device='cuda')
 
@@ -305,7 +306,7 @@ def train_model(model, train_loader, val_loader,
 # Main Function: Prepare Data and Start Training
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train an image enhancement model.')
-    parser.add_argument('--model_type', type=str, required=True, choices=['conv3', 'conv3_heavy', 'conv5', 'conv5_heavy', 'pix_shuffle', 'pix_shuffle_heavy'],
+    parser.add_argument('--model_type', type=str, required=True, choices=['conv3', 'conv3_heavy', 'conv5', 'conv5_heavy', 'pix_shuffle', 'pix_shuffle_heavy', 'residual_unet'],
                         help='Type of model to train: "conv3, conv3_heavy, conv5, conv5_heavy, conv6".')
     parser.add_argument('--edge_checkpoint_path', type=str, default=None,
                         help='Path to the trained checkpoint (.pth) to load for combined training.')
@@ -349,6 +350,9 @@ if __name__ == '__main__':
     elif args.model_type == "pix_shuffle_heavy":
         model = model_pix_shuffle.get_model('heavyweight')
         print("Based on CRN and ESPCN; heavyweight.")
+    elif args.model_type == "residual_unet":
+        model = model_residual_unet.get_model('lightweight')
+        print("Based on Unet, ResNet, CRN and ESPCN; lightweight.")
     else:
         print(f"Error: Unknown model type '{args.model_type}'.")
         sys.exit(1)

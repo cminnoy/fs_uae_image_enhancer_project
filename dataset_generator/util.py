@@ -22,7 +22,7 @@ except ImportError:
 try:
     from quantize import DIFFUSION_MAPS, reduce_color_depth_and_dither
     # Add 'None' as a valid dithering method string if your quantize doesn't handle it explicitly
-    _all_dither_methods = ['None', 'checkerboard'] + list(DIFFUSION_MAPS.keys())
+    _all_dither_methods = ['None', 'checkerboard', 'bayer2x2', 'bayer4x4', 'bayer8x8'] + list(DIFFUSION_MAPS.keys())
 except ImportError:
     warnings.warn("Could not import quantization module (quantize.py). Quantization and dithering styles will not work.")
     DIFFUSION_MAPS = {}

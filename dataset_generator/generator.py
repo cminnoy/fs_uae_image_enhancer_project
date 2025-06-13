@@ -702,7 +702,7 @@ class DatasetGenerator:
         supported_rgb_formats = [888, 555, 565, 444, 666] # As per your quantize.py code
         supported_palette_sizes = [0, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096] # 0 means all colours
         # Get supported dither methods keys + 'None' from your quantize.py DIFFUSION_MAPS
-        SUPPORTED_DITHER_METHODS_KEYS = list(DIFFUSION_MAPS.keys()) + ['None', 'checkerboard']
+        SUPPORTED_DITHER_METHODS_KEYS = list(DIFFUSION_MAPS.keys()) + ['None', 'checkerboard', 'bayer2x2', 'bayer4x4', 'bayer8x8']
 
 
         # --- 1. Determine requested values from args, with validation and defaults ---

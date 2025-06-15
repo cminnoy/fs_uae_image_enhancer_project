@@ -184,6 +184,7 @@ def train_model(model, train_loader, val_loader,
 
             if (i + 1) % (num_batches // 10) == 0:
                 print(f"Epoch [{epoch}/{num_epochs}] - {((i + 1) / num_batches) * 100:.2f}% batches processed")
+                time.sleep(5)
 
         # Perform any remaining optimizer steps
         if (i + 1) % accumulation_steps != 0:
@@ -439,7 +440,7 @@ if __name__ == '__main__':
     # num_workers depends on available CPU cores and system
     # persistent_workers=True is good practice with num_workers > 0
     # Pin_memory=True can speed up data transfer to GPU
-    num_dataloader_workers = os.cpu_count() // 2 or 0
+    num_dataloader_workers = min(os.cpu_count() // 2, 4)
     if num_dataloader_workers > 0:
          print(f"Using {num_dataloader_workers} workers for DataLoaders.")
     else:

@@ -4,7 +4,7 @@ import torch.nn as nn
 import time
 from residual_feature_block import ResidualFeatureBlock
 from activations import get_activation
-from loss_vgg import PerceptualLoss, charbonnier_loss # Assuming these are still used for training setup
+from loss_vgg import PerceptualLoss, charbonnier_loss
 import argparse
 
 class ResidualUNet(nn.Module):
@@ -52,40 +52,49 @@ class ResidualUNet(nn.Module):
         }
 
         # --- Encoder Path ---
-        # Encoder downsampling layers (PixelUnshuffle) and block sequences
-        self.encoder_downs = nn.ModuleList()
+        self.encoder_downs = nn.ModuleList() # Stores PixelUnshuffle(2) for d=1 to unet_depth-1
         self.encoder_block_sequences = nn.ModuleList()
 
-        current_channels = input_channels # Start with input_channels
-        for d in range(unet_depth):
-            # Each encoder stage starts with a PixelUnshuffle
-            self.encoder_downs.append(nn.PixelUnshuffle(2))
+        # Step 1: Initial PixelUnshuffle(2) and Conv2d
+        self.first_pixel_unshuffle_and_conv = nn.Sequential(
+            nn.PixelUnshuffle(2), # Input: input_channels -> input_channels * 4 (e.g., 3 -> 12)
+            nn.Conv2d(input_channels * 4, base_channels, kernel_size=1, stride=1, padding=0, bias=True) # 12 -> base_channels
+        )
+        
+        # Step 2: First set of ResidualFeatureBlocks (for d=0 encoder level)
+        # Input to this block sequence is base_channels (from above Conv2d)
+        in_ch_d0_blocks = base_channels
+        out_ch_d0_blocks = base_channels # Output channels for d=0 level blocks
+        mid_ch_d0 = max(1, int(out_ch_d0_blocks * self.internal_block_channels_ratio))
+        level_blocks_d0 = []
+        for i in range(blocks_per_level):
+            current_block_in_ch = in_ch_d0_blocks if i == 0 else out_ch_d0_blocks
+            level_blocks_d0.append(
+                ResidualFeatureBlock(current_block_in_ch, mid_ch_d0, out_ch_d0_blocks, 3, acts=act_config)
+            )
+        self.encoder_block_sequences.append(nn.Sequential(*level_blocks_d0)) # Index 0 for d=0
+
+        current_channels = out_ch_d0_blocks # Channels for the input to the next encoder stage (d=1)
+
+        # --- Subsequent Encoder Stages (d=1 to unet_depth-1) ---
+        for d in range(1, unet_depth): # Loop starts from d=1
+            self.encoder_downs.append(nn.PixelUnshuffle(2)) # Store PixelUnshuffle for this stage
             
-            # Channels after downsampling for the current stage's blocks
-            # Input to the first block of this level will be current_channels * 4
-            in_ch_for_blocks = current_channels * 4
-
-            # Output channels for blocks at this encoder level
-            # These are also the channels of the skip connection for the next decoder level
-            out_ch_for_blocks = base_channels * (2 ** d)
-
-            # Calculate mid_channels for the ResidualFeatureBlocks at this level
+            in_ch_for_blocks = current_channels * 4 # Channels after downsampling by self.encoder_downs[d-1]
+            out_ch_for_blocks = base_channels * (2 ** d) # Why this size? Why not just use in_ch_for_blocks?  
             mid_ch = max(1, int(out_ch_for_blocks * self.internal_block_channels_ratio))
 
             level_blocks = []
             for i in range(blocks_per_level):
-                # The first block takes `in_ch_for_blocks`. Subsequent blocks take `out_ch_for_blocks`.
                 current_block_in_ch = in_ch_for_blocks if i == 0 else out_ch_for_blocks
                 level_blocks.append(
                     ResidualFeatureBlock(current_block_in_ch, mid_ch, out_ch_for_blocks, 3, acts=act_config)
                 )
-            self.encoder_block_sequences.append(nn.Sequential(*level_blocks))
+            self.encoder_block_sequences.append(nn.Sequential(*level_blocks)) # Index d for this stage
             
-            # Update current_channels for the next encoder stage's input
-            current_channels = out_ch_for_blocks
+            current_channels = out_ch_for_blocks # Update for next iteration
 
         # --- Bottleneck ---
-        # Bottleneck input/output channels are the current_channels after the last encoder stage
         bottleneck_ch = current_channels
         self.bottleneck = nn.Sequential(*[
             ResidualFeatureBlock(
@@ -97,30 +106,24 @@ class ResidualUNet(nn.Module):
         ])
 
         # --- Decoder Path ---
-        # Decoder upsampling layers (PixelShuffle) and block sequences
         self.decoder_ups = nn.ModuleList()
         self.decoder_block_sequences = nn.ModuleList()
 
-        # Start with channels from the bottleneck for the first decoder stage
         current_channels = bottleneck_ch 
 
         for d in reversed(range(unet_depth)):
-            # Each decoder stage starts with a PixelShuffle
             self.decoder_ups.append(nn.PixelShuffle(2))
 
-            # Channels after upsampling for the current stage's blocks
             upsampled_ch = current_channels // 4
-
-            # Corrected skip connection channels:
-            # For d=0, skip is the original input_channels.
-            # For d > 0, skip is the output of encoder_block_sequences[d-1],
-            # which has base_channels * (2**(d-1)) channels.
+            
+            # Determine skip connection channels for this decoder stage
             if d == 0:
-                skip_ch = input_channels
+                skip_ch = input_channels # For the highest resolution stage, skip is the original input
             else:
+                # For other stages, skip comes from the output of encoder_block_sequences[d-1]
+                # which has `base_channels * (2**(d-1))` channels from our new encoder structure
                 skip_ch = base_channels * (2**(d-1))
             
-            # Input channels for the first block of this decoder level: concatenated upsampled features and skip
             in_ch_for_blocks = upsampled_ch + skip_ch
 
             level_blocks = []
@@ -128,77 +131,120 @@ class ResidualUNet(nn.Module):
                 level_blocks.append(
                     nn.Conv2d(in_channels=in_ch_for_blocks, out_channels=self.output_channels, kernel_size=1, stride=1, padding=0, bias=True)
                 )
-                # Update current_channels for the next (non-existent) stage, or for direct output
                 current_channels = self.output_channels
             else:
-                # Output channels for blocks at this decoder level (for stages other than the final one)
                 out_ch_for_blocks = base_channels * (2**d)
-                # Calculate mid_channels for the ResidualFeatureBlocks at this level
                 mid_ch = max(1, int(out_ch_for_blocks * self.internal_block_channels_ratio))
 
                 for i in range(blocks_per_level):
-                    # The first block takes `in_ch_for_blocks`. Subsequent blocks take `out_ch_for_blocks`.
                     current_block_in_ch = in_ch_for_blocks if i == 0 else out_ch_for_blocks
                     level_blocks.append(
                         ResidualFeatureBlock(current_block_in_ch, mid_ch, out_ch_for_blocks, 3, acts=act_config)
                     )
-                # Update current_channels for the next decoder stage's input
                 current_channels = out_ch_for_blocks
 
             self.decoder_block_sequences.append(nn.Sequential(*level_blocks))
             
-        # --- Final Layer ---
-        # The final ReLU is applied in the forward pass.
-
     def forward(self, x):
-        skips = [] # To store feature maps for skip connections
+        original_input_x = x # (1, 3, 576, 736)
+        encoder_features = [] # Store features for skip connections (from encoder blocks)
 
-        # --- Encoder Path ---
-        # The 'skips' are saved BEFORE the downsampling at each stage.
-        # So, skips[0] will be the raw input (highest resolution).
-        # skips[d] will be the output of encoder_block_sequences[d-1]
-        
-        current_x = x # Start with the raw input tensor
-        for d in range(self.unet_depth):
-            skips.append(current_x) # Save for skip connection at this resolution
+        if self.verbose:
+            print(f"--- Forward Pass Start ---")
+            print(f"Initial input x shape: {x.shape}")
 
-            current_x = self.encoder_downs[d](current_x) # Apply PixelUnshuffle
-            current_x = self.encoder_block_sequences[d](current_x) # Apply ResidualFeatureBlocks
+        # Initial stage encoder
+        x = self.first_pixel_unshuffle_and_conv(x) # (1, 24, 288, 368)
+        if self.verbose:
+            print(f"After first_pixel_unshuffle_and_conv: {x.shape}")
+        x = self.encoder_block_sequences[0](x) # (1, 24, 288, 368)
+        if self.verbose:
+            print(f"After encoder_block_sequences[0]: {x.shape}")
+        encoder_features.append(x) # encoder_features[0] = output of encoder_block_sequences[0]
 
-        # --- Bottleneck ---
-        current_x = self.bottleneck(current_x)
+        # Subsequent encoder stages
+        for d in range(1, self.unet_depth):
+            if self.verbose:
+                print(f"\n--- Encoder Stage d={d} ---")
+                print(f"Before encoder_downs[{d-1}]: {x.shape}")
+            x = self.encoder_downs[d-1](x) # Downsample
+            if self.verbose:
+                print(f"After encoder_downs[{d-1}]: {x.shape}")
+            x = self.encoder_block_sequences[d](x) # Apply blocks
+            if self.verbose:
+                print(f"After encoder_block_sequences[{d}]: {x.shape}")
+            encoder_features.append(x) # encoder_features[d] = output of encoder_block_sequences[d]
 
-        # --- Decoder Path ---
-        # Iterate in reverse order of encoder (from deepest to highest resolution)
-        for i, dec_up in enumerate(self.decoder_ups):
-            # Pop the corresponding skip connection (skips are in increasing order of depth)
-            # The decoder_ups are appended in reversed order, so decoder_ups[0] is for deepest level.
-            # We need to get skip for the level corresponding to this upsample operation.
-            # (self.unet_depth - 1 - i) gives the 'd' for the current decoder level being processed.
-            skip_idx = self.unet_depth - 1 - i
-            skip = skips[skip_idx] # Retrieve the skip from the correct encoder level
+        if self.verbose:
+            print(f"\n--- Bottleneck ---")
+            print(f"Before bottleneck: {x.shape}")
+        x = self.bottleneck(x)
+        if self.verbose:
+            print(f"After bottleneck: {x.shape}")
 
-            current_x = dec_up(current_x) # Apply PixelShuffle
+        # Decoder Path
+        # Iterate over decoder modules, using a separate `d_val` to track the logical depth
+        for i in range(self.unet_depth): # i goes from 0 to unet_depth-1
+            d_val = self.unet_depth - 1 - i # This computes the encoder depth corresponding to this decoder stage
 
-            # Pad if needed (PixelShuffle should ideally match skip dimensions if resolutions are powers of 2)
-            if current_x.shape[2:] != skip.shape[2:]:
-                diffY = skip.size(2) - current_x.size(2)
-                diffX = skip.size(3) - current_x.size(3)
-                current_x = nn.functional.pad(current_x, [diffX // 2, diffX - diffX // 2,
-                                                          diffY // 2, diffY - diffY // 2])
+            dec_up = self.decoder_ups[i] # Current upsample module (indexed 0 for deepest, 1 for shallowest)
+            dec_block_seq = self.decoder_block_sequences[i] # Current decoder block sequence (indexed 0 for deepest, 1 for shallowest)
+
+            if self.verbose:
+                print(f"\n--- Decoder Stage i={i} (d_val={d_val}) ---")
+                print(f"Input to current decoder stage (x, from prev stage): {x.shape}")
+
+            current_x_upsampled = dec_up(x)
+            if self.verbose:
+                print(f"After decoder_ups[{i}]: {current_x_upsampled.shape}")
             
-            current_x = torch.cat([current_x, skip], dim=1) # Concatenate with skip connection
-            current_x = self.decoder_block_sequences[i](current_x) # Apply decoder blocks
+            skip = None
+            if d_val == 0: # This is the highest resolution decoder stage (i=unet_depth-1)
+                skip = original_input_x # (1, 3, 576, 736)
+            else: # For other decoder stages (d_val > 0)
+                # The skip comes from encoder_features at index d_val-1
+                skip_idx = d_val - 1
+                skip = encoder_features[skip_idx]
+            
+            if self.verbose:
+                print(f"Skip for stage d_val={d_val} (encoder_features[{skip_idx}] or original_input_x) shape: {skip.shape}")
+                
+                # Dynamically determine the expected input channels
+                expected_in_channels = 0
+                if d_val == 0: # Final stage, Conv2d
+                    expected_in_channels = dec_block_seq[0].in_channels
+                else: # ResidualFeatureBlock
+                    expected_in_channels = dec_block_seq[0].conv1.in_channels
+                print(f"Expected input channels for decoder_block_sequences[{i}]: {expected_in_channels}")
+            
+            # Check if spatial dimensions match before concatenation, and pad if necessary
+            if current_x_upsampled.shape[2:] != skip.shape[2:]:
+                if self.verbose:
+                    print(f"Padding needed: upsampled {current_x_upsampled.shape[2:]} vs skip {skip.shape[2:]}")
+                diffY = skip.size(2) - current_x_upsampled.size(2)
+                diffX = skip.size(3) - current_x_upsampled.size(3)
+                current_x_upsampled = nn.functional.pad(current_x_upsampled, [diffX // 2, diffX - diffX // 2,
+                                                                              diffY // 2, diffY - diffY // 2])
+                if self.verbose:
+                    print(f"After padding current_x_upsampled: {current_x_upsampled.shape}")
+            
+            x = torch.cat([current_x_upsampled, skip], dim=1) # Concatenate features
+            if self.verbose:
+                print(f"After concatenation, input to decoder_block_sequences[{i}]: {x.shape}")
+            
+            x = dec_block_seq(x) # Apply decoder blocks
+            if self.verbose:
+                print(f"After decoder_block_sequences[{i}]: {x.shape}")
         
-        # --- Final Layer ---
-        # The output of the last decoder block is now at the correct channel count.
-        # Apply final ReLU as specified.
-        current_x = nn.functional.relu(current_x)
-        return current_x
+        x = nn.functional.relu(x) # Apply final ReLU
+        if self.verbose:
+            print(f"Final output shape: {x.shape}")
+            print(f"--- Forward Pass End ---")
+        return x
 
-    # Criterion used by the training loop (Decided on perceptual loss)
+    # Criterion used by the training loop
     def criterion(self, output, target):
-        return charbonnier_loss(output, target)
+        return self.perceptual_criterion(output, target)
 
     def benchmark(self, input_tensor, warmup_iters=20, test_duration=20.0):
         self.eval()
@@ -219,7 +265,7 @@ class ResidualUNet(nn.Module):
         fps = iterations / elapsed
 
         param_count = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        param_size_mb = param_count * 2 / (1024 ** 2)  # Assuming fp16 = 2 bytes
+        param_size_mb = param_count * 2 / (1024 ** 2)
 
         return {
             'fps': fps,
@@ -228,33 +274,39 @@ class ResidualUNet(nn.Module):
             'output_shape': self(input_tensor).shape
         }
 
-def get_model(name:str='lightweight'):
+def get_model(name:str='lightweight', verbose:bool=False):
     if name == 'lightweight':
-        return ResidualUNet(unet_depth=2, blocks_per_level=2, base_channels=24, internal_block_channels_ratio=1.50)
+        return ResidualUNet(unet_depth=3, blocks_per_level=1, base_channels=36, internal_block_channels_ratio=1.50, verbose=verbose)
     elif name == 'heavyweight':
-        return ResidualUNet(unet_depth=4, blocks_per_level=2, base_channels=48, internal_block_channels_ratio=1.50)
+        return ResidualUNet(unet_depth=4, blocks_per_level=4, base_channels=72, internal_block_channels_ratio=1.50, verbose=verbose)
     return None
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Test performance')
     parser.add_argument('--model_type', type=str, required=True, choices=['lightweight', 'heavyweight'], help='Type of model: lightweight, heavyweight')
+    parser.add_argument('--batch_size', type=int, default=1, help='Batch size for benchmarking')
+    parser.add_argument('--no_compile', action='store_true', help='Disable torch.compile for debugging.')
+    parser.add_argument('--verbose', action='store_true', help='Enable verbose printing for debugging.')
+
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = get_model(args.model_type).to(device).half().eval()
+    model = get_model(args.model_type, verbose=args.verbose).to(device).half().eval()
 
     print("Attempting to compile model...")
-    try:
-        model = torch.compile(model, mode="default", fullgraph=True)
-        print("Model compiled successfully.")
-    except Exception as e:
-        print(f"Model compilation failed: {e}")
-        print("Falling back to eager mode.")
-        model = model.to(device)
+    if not args.no_compile: # Conditional compilation
+        try:
+            model = torch.compile(model, mode="default", fullgraph=True)
+            print("Model compiled successfully.")
+        except Exception as e:
+            print(f"Model compilation failed: {e}")
+            print("Falling back to eager mode.")
+            model = model.to(device)
+    else:
+        print("torch.compile disabled for debugging.")
+        model = model.to(device) # Ensure model is on device even if not compiled
 
-    # Note: Dummy input resolution 576x752 might require adjustments if it's not perfectly divisible
-    # by (2**unet_depth) which is 4 for lightweight, 16 for heavyweight, at each downsample step.
-    dummy_input = torch.rand((1, 3, 576, 752), dtype=torch.float16).to(device)
+    dummy_input = torch.rand((args.batch_size, 3, 576, 736), dtype=torch.float16).to(device)
     results = model.benchmark(dummy_input)
 
     print("\n--- Results ---")

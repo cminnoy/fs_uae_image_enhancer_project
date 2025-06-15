@@ -1047,6 +1047,18 @@ class DatasetGenerator:
                     parsed_params = parse_generated_filename(filename)
                     if parsed_params:                        
                         if original_img_path:
+                            try:
+                                with Image.open(os.path.join(root, filename)) as img:
+                                    size = img.size
+                                    width, height = size
+                                if width != self.crop_w or height != self.crop_h:
+                                    self.invalid_files[split].append(os.path.join(root, filename))
+                                    if self.verbose >= 2: print(f"Found file with incorrect size in subdirectory: {os.path.join(root, filename)}")
+                                    continue
+                            except Exception as e:
+                                self.invalid_files[split].append(os.path.join(root, filename))
+                                if self.verbose >= 2: print(f"Error opening image file {os.path.join(root, filename)}: {e}")
+                                continue
                             if parsed_params['type'] == 'target':
                                 target_spec = (original_img_path, parsed_params['crop_x'], parsed_params['crop_y'], parsed_params['rot_deg'], parsed_params['scale_perc'])
                                 if target_spec not in self.full_valid_target_specs[split_source]:

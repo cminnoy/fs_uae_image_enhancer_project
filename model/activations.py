@@ -39,8 +39,13 @@ class BiasedReLU(nn.Module):
         super().__init__()
         self.bias = nn.Parameter(torch.empty(num_parameters))
         torch.nn.init.uniform_(self.bias, a=-0.1, b=0.1)
-    def forward(self,x):
-        return torch.relu(x - self.bias)
+    def forward(self, x):
+        # Broadcast bias to [1, C, 1, 1] if input is 4D
+        if x.dim() == 4 and self.bias.numel() == x.size(1):
+            bias = self.bias.view(1, -1, 1, 1)
+        else:
+            bias = self.bias
+        return torch.relu(x - bias)
 
 class BiasedPReLU(nn.Module):
     """
@@ -52,7 +57,12 @@ class BiasedPReLU(nn.Module):
         torch.nn.init.uniform_(self.bias, a=-0.1, b=0.1)
         self.prelu = nn.PReLU(num_parameters=num_parameters, init=init)
     def forward(self, x):
-        return self.prelu(x - self.bias)
+        # Broadcast bias to [1, C, 1, 1] if input is 4D
+        if x.dim() == 4 and self.bias.numel() == x.size(1):
+            bias = self.bias.view(1, -1, 1, 1)
+        else:
+            bias = self.bias
+        return self.prelu(x - bias)
     
 # --- Activation Function Registry ---
 

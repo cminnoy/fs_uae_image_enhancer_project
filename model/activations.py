@@ -33,22 +33,22 @@ class SinLU(nn.Module):
     
 class BiasedReLU(nn.Module):
     """
-    ReLU with a learnable bias.
+    ReLU with a learnable bias per channel (if num_parameters > 1).
     """
-    def __init__(self):
+    def __init__(self, num_parameters=1):
         super().__init__()
-        self.bias = nn.Parameter(torch.empty(1))
+        self.bias = nn.Parameter(torch.empty(num_parameters))
         torch.nn.init.uniform_(self.bias, a=-0.1, b=0.1)
     def forward(self,x):
         return torch.relu(x - self.bias)
 
 class BiasedPReLU(nn.Module):
     """
-    Parametric ReLU with a learnable bias.
+    Parametric ReLU with a learnable bias per channel (if num_parameters > 1).
     """
-    def __init__(self, num_parameters, init=0.25):
+    def __init__(self, num_parameters=1, init=0.25):
         super().__init__()
-        self.bias = nn.Parameter(torch.empty(1))
+        self.bias = nn.Parameter(torch.empty(num_parameters))
         torch.nn.init.uniform_(self.bias, a=-0.1, b=0.1)
         self.prelu = nn.PReLU(num_parameters=num_parameters, init=init)
     def forward(self, x):

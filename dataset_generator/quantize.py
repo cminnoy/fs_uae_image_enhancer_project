@@ -74,6 +74,9 @@ def _apply_palette_dithering_numba(image_float: np.ndarray, diff_map_list: list,
                             image_float[ny, nx, 0] += error[0] * weight
                             image_float[ny, nx, 1] += error[1] * weight
                             image_float[ny, nx, 2] += error[2] * weight
+                            image_float[ny, nx, 0] = max(0.0, min(255.0, image_float[ny, nx, 0]))
+                            image_float[ny, nx, 1] = max(0.0, min(255.0, image_float[ny, nx, 1]))
+                            image_float[ny, nx, 2] = max(0.0, min(255.0, image_float[ny, nx, 2]))
 
 @nb.njit(cache=True)
 def _apply_checkerboard_dithering_numba_optimized(

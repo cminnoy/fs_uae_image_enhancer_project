@@ -614,18 +614,19 @@ class DatasetGenerator:
 
         # Load train image paths and sizes
         self.train_image_paths = []
-        for root, _, files in os.walk(self.train_images_dir):  # Recursively traverse train directory
-            for f in files:
-                if f.lower().endswith(".png"):
-                    img_path = os.path.join(root, f)
-                    self.train_image_paths.append(img_path)
-                    base_filename = os.path.splitext(os.path.basename(img_path))[0]
-                    self.base_filenames[img_path] = base_filename
-                    try:
-                        with Image.open(img_path) as img:
-                            self.image_sizes[img_path] = img.size  # Store (width, height)
-                    except Exception as e:
-                        warnings.warn(f"Failed to load image size for {img_path}: {e}")
+        if self.train_images_dir is not None:
+            for root, _, files in os.walk(self.train_images_dir):  # Recursively traverse train directory
+                for f in files:
+                    if f.lower().endswith(".png"):
+                        img_path = os.path.join(root, f)
+                        self.train_image_paths.append(img_path)
+                        base_filename = os.path.splitext(os.path.basename(img_path))[0]
+                        self.base_filenames[img_path] = base_filename
+                        try:
+                            with Image.open(img_path) as img:
+                                self.image_sizes[img_path] = img.size  # Store (width, height)
+                        except Exception as e:
+                            warnings.warn(f"Failed to load image size for {img_path}: {e}")
 
         if self.verbose >= 2:
             print(f"Loaded {len(self.train_image_paths)} train images.")
@@ -655,14 +656,14 @@ class DatasetGenerator:
 
     def _validate_args(self):
         # Encapsulate argument validation logic here
-        if not self.train_images_dir or not os.path.isdir(self.train_images_dir):
-            raise FileNotFoundError(f"Training images directory not found or not provided: {self.train_images_dir}")
+        if self.train_images_dir and not os.path.isdir(self.train_images_dir):
+            raise FileNotFoundError(f"Training images directory not found: {self.train_images_dir}")
         if self.test_images_dir and not os.path.isdir(self.test_images_dir):
             raise FileNotFoundError(f"Test images directory not found: {self.test_images_dir}")
         if self.crop_w <= 0 or self.crop_h <= 0:
             raise ValueError(f"Invalid crop size ({self.crop_w}, {self.crop_h}).")
-        if self.train_num_crops <= 0:
-            raise ValueError("--train_num_crops must be greater than 0.")
+        if self.train_num_crops < 0:
+            raise ValueError("--train_num_crops cannot be negative.")
         if self.test_num_crops < 0:
             raise ValueError("--test_num_crops cannot be negative.")
 
@@ -1643,11 +1644,11 @@ class DatasetGenerator:
 # --- Main Execution Block ---
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Generate a dataset of styled image crops.')
-    parser.add_argument("--train_images", type=str, required=True, help="Directory containing ground truth PNG images for train.")
+    parser.add_argument("--train_images", type=str, help="Directory containing ground truth PNG images for train (optional).")
     parser.add_argument("--test_images", type=str, help="Directory containing ground truth PNG images for test (optional).")
     parser.add_argument("--destination_dir", type=str, required=True, help="Directory to save the generated dataset.")
     parser.add_argument("--crop_size", type=int, nargs=2, default=[752, 576], metavar=('W', 'H'), help="Crop size as W H. Defaults to 752 576.")
-    parser.add_argument("--train_num_crops", type=int, required=True, help="Number of unique target crops for train.")
+    parser.add_argument("--train_num_crops", type=int, default=0, help="Number of unique target crops for train (optional, default 0).")
     parser.add_argument("--test_num_crops", type=int, default=0, help="Number of unique target crops for test (optional, default 0).")
     parser.add_argument("--model_path", type=str, help="Optional path to an inference model (TorchScript recommended).")
     parser.add_argument("--max_workers", type=int, default=4, help="Maximum number of worker processes. 0 means all CPU cores.")

@@ -1016,8 +1016,16 @@ class DatasetGenerator:
                 if self.verbose >= 1: print(f"Output directory for split '{split}' not found: {split_output_dir}. Skipping scan.")
                 continue
 
-            for root, _, files in os.walk(split_output_dir):
+            current_subdir_targets = set()
+            current_subdir_styles = set() 
+
+            for root, dirs, files in os.walk(split_output_dir):
                 if self.stop_requested: return
+
+                if root == split_output_dir:
+                    # If we are at the root of the split output directory, skip it
+                    continue
+
                 # The directory name is the original base filename without extension
                 original_base_filename_without_ext = os.path.basename(root)
 
@@ -1043,7 +1051,18 @@ class DatasetGenerator:
                 # For now, we'll still try to parse the filenames, but if the original image is truly gone,
                 # the corresponding specs won't be in the 'full_valid_output_specs'.
 
+                # Pre-scan for target filenames ---
+                found_target_filenames_in_subdir = set()
+                for f_name_pre_scan in files:
+                    p_params_pre_scan = parse_generated_filename(f_name_pre_scan) # Match your existing call (no self.verbose)
+                    if p_params_pre_scan and p_params_pre_scan['type'] == 'target':
+                        # We only need the filename itself for checking existence later.
+                        # Detailed image checks (size, openability) are handled in the main loop.
+                        found_target_filenames_in_subdir.add(f_name_pre_scan)
+
                 for filename in files:
+                    if self.stop_requested: return
+
                     parsed_params = parse_generated_filename(filename)
                     if parsed_params:                        
                         if original_img_path:
@@ -1072,12 +1091,31 @@ class DatasetGenerator:
                                     self.invalid_files[split_source].append(os.path.join(root, filename))
                                 else:
                                     self.existing_output_specs[split_source].add(style_spec)
+                                
+                                # Check for missing target for this style
+                                target_params_for_filename = {
+                                    'crop_x': parsed_params['crop_x'],
+                                    'crop_y': parsed_params['crop_y'],
+                                    'scale_perc': parsed_params['scale_perc'],
+                                    'rot_deg': parsed_params['rot_deg']
+                                }
+                                expected_target_filename = construct_filename(target_params_for_filename, is_target=True)
+                                
+                                if expected_target_filename not in found_target_filenames_in_subdir:
+                                    self.invalid_files[split_source].append(os.path.join(root, filename))
+                                    if self.verbose >= 2:
+                                        warnings.warn(f"Styled file {filename} in {root} has no corresponding target file '{expected_target_filename}'. Marked for deletion.")
+
                         else:
                             self.invalid_files[split].append(os.path.join(root, filename))
 
                     else:
                         self.invalid_files[split].append(os.path.join(root, filename))
                         if self.verbose >= 2: print(f"Found file in subdirectory with missing original image: {os.path.join(root, filename)}")
+
+            current_subdir_targets.clear()
+            current_subdir_styles.clear() 
+
 
         if self.verbose >= 1:
             print(f"Found {len(self.existing_target_specs['train'])} existing train target crops.")

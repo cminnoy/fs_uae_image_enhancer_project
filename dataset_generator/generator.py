@@ -14,6 +14,7 @@ import re
 from quantize import reduce_color_depth_and_dither, DIFFUSION_MAPS
 from cache import ScanCache, DEFAULT_TRAIN_CACHE_FILE, DEFAULT_TEST_CACHE_FILE
 import signal
+from crop_evaluator import CropEvaluator
 
 stop_processing = False
 
@@ -378,7 +379,7 @@ def parse_generated_filename(filename: str, verbose: int = 1) -> dict | None:
     return None
 
 # Worker Function for Generating and Saving Styled Output
-def generate_and_save_styled_worker(styled_spec, crop_w_worker, crop_h_worker, dest_dir_worker, split_source_worker, image_sizes_dict_worker, base_filenames_dict_worker, verbose_worker):
+def generate_and_save_styled_worker(styled_spec, crop_w_worker, crop_h_worker, dest_dir_worker, split_source_worker, image_sizes_dict_worker, base_filenames_dict_worker, palette_algorithm, verbose_worker):
     """Worker function to generate and save a single styled output file."""
     img_path, crop_x, crop_y, rot_deg, ds_perc, cs, pal, dm, res = styled_spec
     original_base_filename = base_filenames_dict_worker.get(img_path)
@@ -464,6 +465,7 @@ def generate_and_save_styled_worker(styled_spec, crop_w_worker, crop_h_worker, d
                     color_space=color_space_str, # Pass the color space string
                     target_palette_size=palette_size_param, # Pass the palette size (int or None)
                     dithering_method=dithering_method_param, # Pass the corrected dither method string ('None' or a DIFFUSION_MAPS key)
+                    palette_algorithm=palette_algorithm, # Pass the palette algorithm
                     verbose=verbose_worker >= 2 # Pass verbosity level
                 )
                 if verbose_worker >= 3: print_image_info(processed_quantized_np, "After reduce_color_depth_and_dither", spec_info_str)
@@ -1461,7 +1463,9 @@ class DatasetGenerator:
                             generate_and_save_styled_worker,
                             tuple(styled_spec),
                             self.crop_w, self.crop_h, self.dest_dir, split_source,
-                            self.image_sizes, self.base_filenames,
+                            self.image_sizes,
+                            self.base_filenames,
+                            self.args.palette_algorithm,
                             self.verbose
                         )
                         styled_futures.append(future)
@@ -1662,6 +1666,7 @@ if __name__ == '__main__':
     parser.add_argument("--train_cache_file", type=str, default=DEFAULT_TRAIN_CACHE_FILE, help="Cache file for train scan results.")
     parser.add_argument("--test_cache_file", type=str, default=DEFAULT_TEST_CACHE_FILE, help="Cache file for test scan results.")
     parser.add_argument("--keep_invalid_files", action='store_true', help="Keep invalid files in the output directory instead of deleting them.")
+    parser.add_argument("--palette_algorithm", type=str, default='kmeans', choices=['median_cut', 'kmeans', 'octree'], help="Algorithm to use for palette generation. Default: kmeans.")
 
     args = parser.parse_args()
 

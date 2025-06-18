@@ -4,6 +4,61 @@ from sklearn.cluster import KMeans
 import numba as nb
 import time # For timing the Numba parts
 
+# --- Median Cut Palette Generator ---
+def generate_palette_median_cut(image_np: np.ndarray, num_colors: int) -> np.ndarray:
+    pixels = image_np.reshape(-1, 3)
+
+    class ColorBox:
+        def __init__(self, pixels):
+            self.pixels = pixels
+            self.bounds = [
+                (np.min(pixels[:, i]), np.max(pixels[:, i])) for i in range(3)
+            ]
+
+        def longest_color_range_axis(self):
+            ranges = [hi - lo for lo, hi in self.bounds]
+            return int(np.argmax(ranges))
+
+        def split(self):
+            axis = self.longest_color_range_axis()
+            sorted_pixels = self.pixels[self.pixels[:, axis].argsort()]
+            median_idx = len(sorted_pixels) // 2
+            return ColorBox(sorted_pixels[:median_idx]), ColorBox(sorted_pixels[median_idx:])
+
+        def average_color(self):
+            return np.mean(self.pixels, axis=0)
+
+    boxes = [ColorBox(pixels)]
+    while len(boxes) < num_colors:
+        boxes.sort(key=lambda box: np.prod([hi - lo for lo, hi in box.bounds]), reverse=True)
+        largest_box = boxes.pop(0)
+        box1, box2 = largest_box.split()
+        boxes.extend([box1, box2])
+
+    palette = np.array([box.average_color() for box in boxes], dtype=np.uint8)
+    return palette
+
+# --- Octree Palette Generator (Simple Averaging Variant) ---
+def generate_palette_octree(image_np: np.ndarray, num_colors: int) -> np.ndarray:
+    from collections import defaultdict
+    pixels = image_np.reshape(-1, 3)
+    shift = 8 - int(np.log2(num_colors) / 3)
+    shift = max(0, min(6, shift))
+    quantized = (pixels >> shift) << shift
+
+    color_map = defaultdict(list)
+    for pix in quantized:
+        key = tuple(pix)
+        color_map[key].append(pix)
+
+    if len(color_map) > num_colors:
+        merged = sorted(color_map.items(), key=lambda item: -len(item[1]))[:num_colors]
+    else:
+        merged = color_map.items()
+
+    palette = np.array([np.mean(v, axis=0) for _, v in merged], dtype=np.uint8)
+    return palette
+
 # --- Numba Helper Functions ---
 
 @nb.njit(cache=True)
@@ -342,6 +397,7 @@ def reduce_color_depth_and_dither(
     color_space: str,
     target_palette_size: int = None,
     dithering_method: str = 'none',
+    palette_algorithm: str = 'kmeans',  # New parameter
     verbose: int = 1
 ) -> np.ndarray:
     """
@@ -378,20 +434,21 @@ def reduce_color_depth_and_dither(
     if dithering_method not in valid_methods:
         raise ValueError(f"dithering_method must be one of {valid_methods}.")
 
+    valid_palette_algorithms = ['kmeans', 'median_cut', 'octree']
+    if palette_algorithm not in valid_palette_algorithms:
+        raise ValueError(f"palette_algorithm must be one of {valid_palette_algorithms}.")
+
     if verbose:
-        print(f"Processing: color_space={color_space}, target_palette_size={target_palette_size}, dithering_method={dithering_method}")
+        print(f"Processing: color_space={color_space}, target_palette_size={target_palette_size}, dithering_method={dithering_method}, palette_algorithm={palette_algorithm}")
 
     # --- Determine the Target Palette ---
     target_palette_8bit = None
     palette_float = None
-    pixels_for_kmeans = None
 
     # Dithering methods (checkerboard, error diffusion, ordered) require a specific palette size
     if dithering_method != 'none' and target_palette_size is None:
         raise ValueError(f"Dithering method '{dithering_method}' requires 'target_palette_size' to be specified.")
 
-    # If a target palette size is specified, we calculate a palette using K-Means
-    # or use unique colors if the count is less than target_palette_size
     if target_palette_size is not None:
         if verbose > 1:
             print(f"Calculating {target_palette_size}-color palette...")
@@ -402,7 +459,7 @@ def reduce_color_depth_and_dither(
             pixels_for_kmeans = image_np.astype(np.float64).reshape(-1, 3)
             if verbose > 1: print("Calculating palette from full RGB888 image.")
         elif color_space in ['RGB444', 'RGB666', 'RGB555', 'RGB565']:
-            if verbose > 1: print(f"Calculating palette from {color_space} grid for K-Means input.")
+            if verbose > 1: print(f"Calculating palette from {color_space} grid input.")
             img_quantized_temp_np = image_np.astype(np.float64).copy()
             if color_space == 'RGB444':
                 img_quantized_temp_np = (np.floor(img_quantized_temp_np / 16) * 16)
@@ -416,26 +473,29 @@ def reduce_color_depth_and_dither(
                 img_quantized_temp_np = (np.floor(img_quantized_temp_np / 8) * 8)
             pixels_for_kmeans = img_quantized_temp_np.reshape(-1, 3)
         else:
-             raise ValueError(f"Invalid color_space '{color_space}' for palette calculation source.")
+            raise ValueError(f"Invalid color_space '{color_space}' for palette calculation source.")
 
         unique_colors = np.unique(pixels_for_kmeans, axis=0)
         n_clusters = min(target_palette_size, len(unique_colors))
 
-        if n_clusters == 0: # Should ideally not happen with real images
-             target_palette_8bit = np.zeros((1, 3), dtype=np.uint8) # Default to black
-             if verbose > 0: print("Image seems to have no discernible colors or is empty. Using a single black color palette.")
+        if n_clusters == 0:
+            target_palette_8bit = np.zeros((1, 3), dtype=np.uint8)
         elif n_clusters < target_palette_size:
-             target_palette_8bit = unique_colors.astype(np.uint8)
-             if verbose > 0:
-                print(f"Warning: Requested palette size {target_palette_size} > unique colors ({len(unique_colors)}) "
-                            f"from {color_space} pre-quantization. Using {n_clusters} unique colors.")
+            target_palette_8bit = unique_colors.astype(np.uint8)
         else:
-            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init='auto')
-            kmeans.fit(pixels_for_kmeans)
-            target_palette_8bit = kmeans.cluster_centers_.astype(np.uint8)
+            if palette_algorithm == 'kmeans':
+                kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init='auto')
+                kmeans.fit(pixels_for_kmeans)
+                target_palette_8bit = kmeans.cluster_centers_.astype(np.uint8)
+            elif palette_algorithm == 'median_cut':
+                target_palette_8bit = generate_palette_median_cut(image_np, num_colors=n_clusters)
+            elif palette_algorithm == 'octree':
+                target_palette_8bit = generate_palette_octree(image_np, num_colors=n_clusters)
 
         end_time = time.time()
-        if verbose > 1: print(f"Palette calculation took {end_time - start_time:.2f} seconds.")
+        if verbose > 1:
+            print(f"Palette calculation took {end_time - start_time:.2f} seconds.")
+
         palette_float = target_palette_8bit.astype(np.float64)
 
     # --- Apply Dithering or direct mapping ---

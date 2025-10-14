@@ -1,63 +1,85 @@
-import os
+#!/usr/bin/env python3
+
 import argparse
-from PIL import Image, ImageCms
-from concurrent.futures import ThreadPoolExecutor
+import io
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from PIL import Image, ImageCms, UnidentifiedImageError
 
-file_formats = [".jpg", ".jpeg", ".webp", ".png", ".gif", ".tiff"] 
-# target_width, target_height = 752, 576
+IMAGE_EXTS = {".jpg", ".jpeg", ".webp", ".png", ".gif", ".tif", ".tiff", ".bmp", ".avif"}
 
-def process_image(filename, input_dir, output_dir, max_crop_size):
-    if not os.path.isfile(os.path.join(input_dir, filename)):
-        return
-    
-    ext = os.path.splitext(filename)[1].lower()
-    if ext not in file_formats:
-        return
-    
+def process_image(src: Path, input_dir: Path, output_dir: Path, max_crop_size):
     try:
-        img = Image.open(os.path.join(input_dir, filename))
-        icc = img.info.get('icc_profile', None)
-        width, height = img.size        
+        with Image.open(src) as img:
+            # Convert color space to sRGB if ICC profile present
+            icc_bytes = img.info.get("icc_profile")
+            if icc_bytes:
+                try:
+                    src_profile = ImageCms.ImageCmsProfile(io.BytesIO(icc_bytes))
+                    dst_profile = ImageCms.createProfile("sRGB")
+                    img = ImageCms.profileToProfile(img, src_profile, dst_profile, outputMode="RGB")
+                    print(f"[ICC→sRGB] {src}")
+                except Exception as e:
+                    print(f"[ICC warn] {src} — could not apply ICC profile ({e}); falling back to RGB")
+                    if img.mode != "RGB":
+                        img = img.convert("RGB")
+            else:
+                if img.mode != "RGB":
+                    print(f"[RGB] {src} → RGB")
+                    img = img.convert("RGB")
 
-        if img.mode != 'RGB':
-            print(f"Converting {filename} to RGB")
-            img = img.convert('RGB')
+            # Optional resize (keeps aspect ratio)
+            if max_crop_size:
+                w, h = img.size
+                if w > max_crop_size[0] or h > max_crop_size[1]:
+                    img.thumbnail(max_crop_size, Image.LANCZOS)
 
-        if icc:
-            print(f"ERROR for file {input_dir}/{filename}; ICC profile found but not supported!")
+            # Mirror subdirectory structure, change extension to .png
+            rel = src.relative_to(input_dir)
+            dst = (output_dir / rel).with_suffix(".png")
+            dst.parent.mkdir(parents=True, exist_ok=True)
 
-        # Resize if max_crop_size is set and both dimensions exceed it
-        if max_crop_size and (width > max_crop_size[0] or height > max_crop_size[1]):
-            img.thumbnail(max_crop_size, Image.LANCZOS)
-            width, height = img.size
+            if dst.exists():
+                return f"SKIP (exists) {dst}"
 
-        output_path = os.path.join(output_dir, f"{os.path.splitext(filename)[0]}.png")
-        # if width < target_width or height < target_height:
-        #     bg = Image.new('RGB', (target_width, target_height), color=(0, 0, 0))
-        #     bg.paste(img)
-        #     bg.save(output_path, format='PNG')
-        # else:
-        img.save(output_path, format='PNG')
+            img.save(dst, format="PNG")
+            return f"OK {src} -> {dst}"
+    except UnidentifiedImageError:
+        return f"SKIP (unidentified image) {src}"
     except Exception as e:
-        print(f"Error processing {filename}: {e}")
+        return f"ERROR {src}: {e}"
 
 def main():
-    parser = argparse.ArgumentParser(description="Prepare groundtruth images.")
-    parser.add_argument("input_dir", type=str, help="Directory containing input images.")
-    parser.add_argument("output_dir", type=str, help="Directory to save processed images.")
-    parser.add_argument("--max_crop_size", type=int, nargs=2, metavar=('WIDTH', 'HEIGHT'),
-                        help="Maximum crop size (width height) for resizing images.")
+    parser = argparse.ArgumentParser(description="Prepare groundtruth images (recursive, ICC→sRGB, PNG out).")
+    parser.add_argument("input_dir", type=Path, help="Directory containing input images (may have subdirectories).")
+    parser.add_argument("output_dir", type=Path, help="Directory to save processed PNGs (subdirs mirrored).")
+    parser.add_argument("--max_crop_size", type=int, nargs=2, metavar=("WIDTH", "HEIGHT"),
+                        help="Maximum size (width height); images larger than this are downscaled proportionally.")
+    parser.add_argument("--workers", type=int, default=32, help="Number of worker threads (default: 32).")
     args = parser.parse_args()
 
-    input_dir = args.input_dir
-    output_dir = args.output_dir
+    input_dir: Path = args.input_dir
+    output_dir: Path = args.output_dir
     max_crop_size = tuple(args.max_crop_size) if args.max_crop_size else None
 
-    os.makedirs(output_dir, exist_ok=True)
+    if not input_dir.is_dir():
+        raise SystemExit(f"Input directory not found: {input_dir}")
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    files = os.listdir(input_dir)
-    with ThreadPoolExecutor(max_workers=32) as executor:
-        executor.map(lambda f: process_image(f, input_dir, output_dir, max_crop_size), files)
+    # Collect files recursively
+    src_files = [p for p in input_dir.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
+    if not src_files:
+        print("No images found in input_dir.")
+        return
+
+    print(f"Found {len(src_files)} images under {input_dir}. Processing...")
+
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        futures = [ex.submit(process_image, p, input_dir, output_dir, max_crop_size) for p in src_files]
+        for fut in as_completed(futures):
+            msg = fut.result()
+            if msg:
+                print(msg)
 
 if __name__ == "__main__":
     main()

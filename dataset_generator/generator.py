@@ -14,14 +14,13 @@ import re
 from quantize import reduce_color_depth_and_dither, DIFFUSION_MAPS
 from cache import ScanCache, DEFAULT_TRAIN_CACHE_FILE, DEFAULT_TEST_CACHE_FILE
 import signal
-from crop_evaluator import CropEvaluator
 
 stop_processing = False
 
 # Import utility functions and constants
 try:
     from util import (
-        is_pure_black_pil,
+        should_discard_by_black_ratio,
         get_crop_and_pad,
         apply_rotation,
         apply_downscaling,        
@@ -159,7 +158,7 @@ def get_output_path(dest_dir: str, split: str, original_base_filename_without_ex
     return os.path.join(img_subdir, filename)
 
 # --- Helper Functions (outside the class for multiprocessing workers) ---
-def _scan_image_params_task(image_path, crop_w, crop_h, rot_deg, ds_perc, is_pure_black_pil_func, image_sizes_dict, get_crop_and_pad_func, verbose):
+def _scan_image_params_task(image_path, crop_w, crop_h, rot_deg, ds_perc, discard_black_pil_func, image_sizes_dict, get_crop_and_pad_func, verbose):
     """
     Scans a single image file for valid crop locations with specific parameters.
     Optimized to skip unnecessary processing if the downscaled image is smaller than the crop size.
@@ -215,7 +214,7 @@ def _scan_image_params_task(image_path, crop_w, crop_h, rot_deg, ds_perc, is_pur
                     crop_pil = get_crop_and_pad_func(img_scaled_pil, crop_x, crop_y, crop_w, crop_h)
 
                     # Check if the crop is pure black
-                    if not is_pure_black_pil_func(crop_pil):
+                    if not discard_black_pil_func(crop_pil):
                         valid_coords_list.append((crop_x, crop_y))
                     elif verbose >= 2:
                         print(f"Invalid crop at ({crop_x}, {crop_y}): Pure black")
@@ -893,7 +892,7 @@ class DatasetGenerator:
                                 executor.submit(
                                     _scan_image_params_task,
                                     img_path, self.crop_w, self.crop_h, rot_deg, ds_perc,
-                                    is_pure_black_pil, self.image_sizes, get_crop_and_pad,
+                                    should_discard_by_black_ratio, self.image_sizes, get_crop_and_pad,
                                     self.args.verbose
                                 )
                             )

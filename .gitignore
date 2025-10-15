@@ -179,3 +179,6 @@ checkpoint_*.pt
 
 *.code-workspace
 
+.test_scan_cache/
+.train_scan_cache/
+

@@ -61,6 +61,47 @@ def is_pure_black_pil(img_pil: Image.Image) -> bool:
 
     return is_black
 
+def should_discard_by_black_ratio(img_pil: Image.Image, threshold: float = 0.75) -> bool:
+    """
+    Checks if an image should be discarded because its ratio of pure black pixels
+    (0, 0, 0) exceeds a given threshold.
+
+    Args:
+        img_pil: The Pillow image to check.
+        threshold: The ratio of black pixels above which the image is discarded.
+                   (e.g., 0.75 means discard if 75% or more is black).
+
+    Returns:
+        True if the image should be discarded, False otherwise.
+    """
+    # Convert the PIL image to a NumPy array for efficient computation
+    img_array = np.array(img_pil)
+
+    # For an RGB image, the array shape is (height, width, 3)
+    # For a grayscale image, the shape is (height, width)
+    if img_array.ndim == 3 and img_array.shape[2] == 3:
+        # Create a boolean mask where True indicates a pixel is pure black [0, 0, 0]
+        is_black_mask = np.all(img_array == [0, 0, 0], axis=2)
+    elif img_array.ndim == 2:
+        # For grayscale images, just check for pixels with value 0
+        is_black_mask = img_array == 0
+    else:
+        # Handle other modes like RGBA or CMYK if necessary, or raise an error
+        # For simplicity, we'll convert to RGB
+        return should_discard_by_black_ratio(img_pil.convert("RGB"), threshold)
+
+    # Count the number of black pixels by summing the True values in the mask
+    black_pixel_count = np.sum(is_black_mask)
+
+    # Calculate the total number of pixels
+    total_pixels = img_array.shape[0] * img_array.shape[1]
+
+    # Calculate the ratio of black pixels
+    black_ratio = black_pixel_count / total_pixels
+
+    # Return True if the ratio exceeds the threshold
+    return black_ratio >= threshold
+
 def get_crop_and_pad(image_pil: Image.Image, crop_x: int, crop_y: int, crop_w: int, crop_h: int) -> Image.Image:
     """
     Extracts a crop of size (crop_w, crop_h) from a PIL image starting at (crop_x, crop_y).

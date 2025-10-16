@@ -181,4 +181,5 @@ checkpoint_*.pt
 
 .test_scan_cache/
 .train_scan_cache/
-
+dataset_generator/dataset/
+dataset_generator/runs/

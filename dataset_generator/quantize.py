@@ -397,7 +397,7 @@ def reduce_color_depth_and_dither(
     color_space: str,
     target_palette_size: int = None,
     dithering_method: str = 'none',
-    palette_algorithm: str = 'kmeans',  # New parameter
+    palette_algorithm: str = 'kmeans',
     verbose: int = 1
 ) -> np.ndarray:
     """
@@ -409,7 +409,7 @@ def reduce_color_depth_and_dither(
         color_space: Target color space for initial grid quantization ('RGB888', 'RGB565', 'RGB444', 'RGB555' or 'RGB666').
                      If 'RGB888', no initial grid quantization is applied when generating palette.
                      This argument primarily affects palette generation if target_palette_size is set.
-        target_palette_size: Optional. The number of colors in the final palette (16, 32, 64, 128, 256, 512, 1024, 2048, 4096).
+        target_palette_size: Optional. The number of colors in the final palette (16, 24, 32, 64, 128, 256, 512, 1024, 2048, 4096).
                              If None, the palette is determined by the color_space grid (for 444/565/666 if dither='none')
                              or the full RGB888 space (if color_space is RGB888 and dither='none').
                              Note: Dithering (error diffusion, checkerboard, or ordered) requires target_palette_size to be specified.
@@ -426,7 +426,7 @@ def reduce_color_depth_and_dither(
     if color_space not in valid_color_spaces:
         raise ValueError(f"color_space must be one of {valid_color_spaces}.")
 
-    valid_palette_sizes = [None, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+    valid_palette_sizes = [None, 2, 4, 8, 16, 24, 32, 64, 128, 256, 512, 1024, 2048, 4096]
     if target_palette_size not in valid_palette_sizes:
         raise ValueError(f"target_palette_size must be one of {valid_palette_sizes}.")
 

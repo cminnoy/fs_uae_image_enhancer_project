@@ -702,7 +702,7 @@ class DatasetGenerator:
 
         # Define supported values based on your quantize.py
         supported_rgb_formats = [888, 555, 565, 444, 666] # As per your quantize.py code
-        supported_palette_sizes = [0, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096] # 0 means all colours
+        supported_palette_sizes = [0, 2, 4, 8, 16, 24, 32, 64, 128, 256, 512, 1024, 2048, 4096] # 0 means all colours
         # Get supported dither methods keys + 'None' from your quantize.py DIFFUSION_MAPS
         SUPPORTED_DITHER_METHODS_KEYS = list(DIFFUSION_MAPS.keys()) + ['None', 'checkerboard', 'bayer2x2', 'bayer4x4', 'bayer8x8']
 
@@ -1657,7 +1657,7 @@ if __name__ == '__main__':
     parser.add_argument("--max_workers", type=int, default=4, help="Maximum number of worker processes. 0 means all CPU cores.")
     parser.add_argument("--verbose", type=int, default=1, choices=[0, 1, 2, 3], help="Verbosity level: 0 (Quiet), 1 (Progress), 2 (Debug).")
     parser.add_argument("--rgb", type=int, nargs='*', default=None, metavar='INT', help="Generate outputs in these RGB formats (e.g., 888 565). Supported: 444, 555, 565, 666, 888.")
-    parser.add_argument("--palette", type=int, nargs='*', default=None, metavar='INT', help="Generate outputs with these palette sizes. Supported: 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096. 0 means all colours.")
+    parser.add_argument("--palette", type=int, nargs='*', default=None, metavar='INT', help="Generate outputs with these palette sizes. Supported: 2, 4, 8, 16, 24, 32, 64, 128, 256, 512, 1024, 2048, 4096. 0 means all colours.")
     parser.add_argument("--rotate", type=int, nargs='*', default=None, metavar='DEGREE', help="Rotate ground truth images by these angles in degrees before cropping (e.g., 0 90 180 270). 0 is default if none specified.")
     parser.add_argument("--downscale", type=int, nargs='*', default=None, metavar='PERCENT', help="Downscale ground truth images to these percentages of the original size before cropping (e.g., 50 75). Must be > 0 and < 100. 0%% is default if none specified.")
     parser.add_argument("--resolution", type=str, nargs='*', default=['lores'], metavar='STYLE', help=f"Generate outputs with these resolution styles. Supported: {SUPPORTED_RESOLUTION_STYLES}. Default: lores.")

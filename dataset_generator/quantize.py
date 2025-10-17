@@ -330,6 +330,126 @@ def _apply_ordered_dithering_numba_optimized(
             output_image_uint8[y_idx, x_idx, 1] = palette_uint8[chosen_idx, 1]
             output_image_uint8[y_idx, x_idx, 2] = palette_uint8[chosen_idx, 2]
 
+# This is the core, high-performance HAM6 processing loop.
+# By using Numba, this Python code is compiled to fast machine code.
+@nb.njit(cache=True)
+def _convert_to_ham6_numba(
+    quantized_img_12bit: np.ndarray,
+    palette_12bit: np.ndarray,
+    output_img_12bit: np.ndarray
+) -> np.ndarray:
+    """
+    Numba-accelerated function to apply HAM6 encoding to a 12-bit image.
+    Modifies and returns output_img_12bit.
+    """
+    height, width, _ = quantized_img_12bit.shape
+
+    for y in range(height):
+        # 1. Start each scanline with a SET operation from the base palette
+        target_pixel = quantized_img_12bit[y, 0]
+
+        # Find the closest color in the palette for the first pixel
+        min_dist_sq = np.inf
+        best_idx = 0
+        for i in range(palette_12bit.shape[0]):
+            dist_sq = np.sum((target_pixel - palette_12bit[i])**2)
+            if dist_sq < min_dist_sq:
+                min_dist_sq = dist_sq
+                best_idx = i
+
+        previous_color = palette_12bit[best_idx]
+        output_img_12bit[y, 0] = previous_color
+
+        # 2. Process the rest of the scanline
+        for x in range(1, width):
+            target_pixel = quantized_img_12bit[y, x]
+
+            # --- Option 1: SET operation ---
+            # Find the closest color in the base palette
+            min_dist_set_sq = np.inf
+            best_palette_color = palette_12bit[0]
+            for i in range(palette_12bit.shape[0]):
+                dist = np.sum((target_pixel - palette_12bit[i])**2)
+                if dist < min_dist_set_sq:
+                    min_dist_set_sq = dist
+                    best_palette_color = palette_12bit[i]
+
+            # --- Options 2-4: MODIFY operations ---
+            # Modify Red
+            mod_r_color = np.array([target_pixel[0], previous_color[1], previous_color[2]])
+            dist_mod_r_sq = np.sum((target_pixel - mod_r_color)**2)
+
+            # Modify Green
+            mod_g_color = np.array([previous_color[0], target_pixel[1], previous_color[2]])
+            dist_mod_g_sq = np.sum((target_pixel - mod_g_color)**2)
+
+            # Modify Blue
+            mod_b_color = np.array([previous_color[0], previous_color[1], target_pixel[2]])
+            dist_mod_b_sq = np.sum((target_pixel - mod_b_color)**2)
+
+            # --- Find the best operation (the one with the minimum color error) ---
+            costs = np.array([min_dist_set_sq, dist_mod_r_sq, dist_mod_g_sq, dist_mod_b_sq])
+            best_op_idx = np.argmin(costs)
+
+            # Apply the best operation and update the state for the next pixel
+            if best_op_idx == 0:
+                output_img_12bit[y, x] = best_palette_color
+            elif best_op_idx == 1:
+                output_img_12bit[y, x] = mod_r_color
+            elif best_op_idx == 2:
+                output_img_12bit[y, x] = mod_g_color
+            else: # best_op_idx == 3
+                output_img_12bit[y, x] = mod_b_color
+
+            previous_color = output_img_12bit[y, x]
+
+    return output_img_12bit
+
+def apply_ham6_conversion(
+    image_np: np.ndarray,
+    palette_generator_func,
+    verbose: int = 1
+) -> np.ndarray:
+    """
+    Main wrapper function to convert an 8-bit RGB image to HAM6.
+
+    Args:
+        image_np: The input image as a NumPy array (H, W, 3) of type uint8.
+        palette_generator_func: A function (e.g., generate_palette_median_cut)
+                                that takes an image and num_colors and returns a palette.
+        verbose: Verbosity level.
+
+    Returns:
+        The HAM6 converted image as a NumPy array (H, W, 3) of type uint8.
+    """
+    if verbose > 1:
+        print("Applying HAM6 conversion...")
+
+    # 1. Quantize image from 8-bit per channel (0-255) to 4-bit (0-15) for OCS Amiga
+    # This is a crucial step for emulating the 12-bit color space.
+    quantized_img_12bit = (image_np >> 4).astype(np.uint8)
+
+    # 2. Generate a 16-color base palette using the provided generator
+    # The palette is also generated from the 12-bit color space.
+    if verbose > 1:
+        print("Generating 16-color base palette for HAM6...")
+    palette_8bit = palette_generator_func(quantized_img_12bit, num_colors=16)
+    palette_12bit = (palette_8bit).astype(np.uint8) # Ensure palette is also 4-bit per channel
+
+    # 3. Prepare an output buffer and run the fast Numba conversion
+    output_img_12bit = np.zeros_like(quantized_img_12bit)
+
+    # The first run will compile the Numba function, subsequent runs will be faster.
+    ham_image_12bit = _convert_to_ham6_numba(
+        quantized_img_12bit, palette_12bit, output_img_12bit
+    )
+
+    # 4. De-quantize the 4-bit result back to 8-bit (0-255) for display/saving.
+    # We multiply by 17, which correctly maps the 4-bit range [0, 15] to the
+    # 8-bit range [0, 255] (since 15 * 17 = 255).
+    final_image_data_8bit = ham_image_12bit * 17
+
+    return final_image_data_8bit
 
 # --- Dither Matrices (Module-level constants) ---
 
@@ -396,7 +516,7 @@ def reduce_color_depth_and_dither(
     image_np: np.ndarray,
     color_space: str,
     target_palette_size: int = None,
-    dithering_method: str = 'none',
+    dithering_method: str = 'None',
     palette_algorithm: str = 'kmeans',
     verbose: int = 1
 ) -> np.ndarray:
@@ -413,7 +533,7 @@ def reduce_color_depth_and_dither(
                              If None, the palette is determined by the color_space grid (for 444/565/666 if dither='none')
                              or the full RGB888 space (if color_space is RGB888 and dither='none').
                              Note: Dithering (error diffusion, checkerboard, or ordered) requires target_palette_size to be specified.
-        dithering_method: The dithering method ('none', 'checkerboard', 'bayer2x2', 'bayer4x4', 'bayer8x8', 'floyd-steinberg', etc.).
+        dithering_method: The dithering method ('None', 'checkerboard', 'bayer2x2', 'bayer4x4', 'bayer8x8', 'floyd-steinberg', etc.).
 
     Returns:
         A NumPy array representing the processed image (height, width, 3)
@@ -430,7 +550,7 @@ def reduce_color_depth_and_dither(
     if target_palette_size not in valid_palette_sizes:
         raise ValueError(f"target_palette_size must be one of {valid_palette_sizes}.")
 
-    valid_methods = ['none', 'checkerboard', 'bayer2x2', 'bayer4x4', 'bayer8x8'] + list(DIFFUSION_MAPS.keys())
+    valid_methods = ['None', 'checkerboard', 'bayer2x2', 'bayer4x4', 'bayer8x8'] + list(DIFFUSION_MAPS.keys())
     if dithering_method not in valid_methods:
         raise ValueError(f"dithering_method must be one of {valid_methods}.")
 
@@ -501,7 +621,7 @@ def reduce_color_depth_and_dither(
     # --- Apply Dithering or direct mapping ---
     img_output_np = np.zeros_like(image_np) # Initialize output image
 
-    if dithering_method == 'none':
+    if dithering_method == 'None':
         if target_palette_size is None:
             if color_space == 'RGB888':
                  if verbose > 1: print("No color reduction, palette, or dithering. Returning original image.")

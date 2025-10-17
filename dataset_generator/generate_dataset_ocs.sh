@@ -1,13 +1,10 @@
 #!/bin/bash
 python generator.py \
     --train_images dataset/groundtruth_train \
-    --train_num_crops 10 \
+    --train_num_crops 100 \
     --destination_dir dataset/dataset_train_ocs \
     --max_workers 4 \
-    --resolution lores lores_laced \
-    --palette 0 24 32 \
-    --palette_algorithm median_cut \
-    --dither checkerboard floyd-steinberg atkinson sierra2 stucki burkes sierra3 bayer2x2 bayer4x4 bayer8x8 None \
+    --rgb 444 \
     --crop_size 376 288 \
     --rotate 0 1 2 3 4 5 6 7 8 9 10 \
              11 12 13 14 15 16 17 18 19 20 \
@@ -19,4 +16,9 @@ python generator.py \
              71 72 73 74 75 76 77 78 79 80 \
              81 82 83 84 85 86 87 88 89 90 \
     --downscale 90 80 70 60 50 40 \
+    --resolution lores \
+    --palette_algorithm median_cut \
+    --palette 16 24 32 \
+    --extra_mode ham6 \
+    --dither checkerboard floyd-steinberg atkinson sierra2 stucki burkes sierra3 bayer2x2 bayer4x4 bayer8x8 None \
     --verbose 1

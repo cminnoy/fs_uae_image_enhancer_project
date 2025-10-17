@@ -44,7 +44,6 @@ def construct_filename(params: dict, is_target: bool) -> str:
     if 'crop_x' not in params or 'crop_y' not in params or 'scale_perc' not in params or 'rot_deg' not in params:
          raise ValueError("Missing mandatory crop/pre-processing parameters for filename construction.")
 
-
     if is_target:
         # Target filename format: target_<X>_<Y>_s<scale>_r<rot>.png
         return f"target_{params['crop_x']}_{params['crop_y']}_s{params['scale_perc']}_r{params['rot_deg']}.png"
@@ -56,7 +55,7 @@ def construct_filename(params: dict, is_target: bool) -> str:
 
         # Format palette size and dither method for filename string
         pal_str = str(params['pal']) if params['pal'] is not None else 'None'
-        dither_str = str(params['dither']) # Assuming dither name doesn't need special encoding
+        dither_str = str(params['dither'])
 
         return (
             f"{params['resolution']}_{params['crop_x']}_{params['crop_y']}_s{params['scale_perc']}_r{params['rot_deg']}"
@@ -338,7 +337,12 @@ def parse_generated_filename(filename: str, verbose: int = 1) -> dict | None:
             dither_name = style_match.group('dither_name')
 
             # Convert palette string 'None' to actual None object
-            pal = int(pal_str) if pal_str.lower() != 'none' else None
+            if pal_str.lower() == 'none':
+                pal = None
+            elif pal_str.upper() == 'HAM6':
+                pal = 'HAM6'
+            else:
+                pal = int(pal_str)
             if dither_name == "none": dither_name = "None"
 
             # Perform basic validation on parsed values against supported constants
@@ -359,7 +363,7 @@ def parse_generated_filename(filename: str, verbose: int = 1) -> dict | None:
                 'rot_deg': rot_deg,     # Pre-processing rotation angle
                 'resolution': resolution, # Resolution style
                 'rgb': f"RGB{rgb_val}", # Color format value
-                'pal': pal,             # Palette size (int or None)
+                'pal': pal,             # Palette size (int, HAM6 or None)
                 'dither': dither_name,  # Dither method name
                 'full_filename': filename # Store the original filename
             }
@@ -411,7 +415,8 @@ def generate_and_save_styled_worker(styled_spec, crop_w_worker, crop_h_worker, d
             #       For maximum quality, we should combine the rotation and downscaling, so the downscale of the AA does the final downscale in one step.
 
             # Apply pre-processing (rotation, scaling, cropping) resulting in a PIL Image
-            if rot_deg != 0: rotated_img_pil = apply_rotation(img_pil_full, rot_deg, supersample_factor=2) # MAYBE SET TO 1 and USE Image.Resampling.NEAREST
+            # We disable AA here use NEAREST to get closer to real Amiga images in games
+            if rot_deg != 0: rotated_img_pil = apply_rotation(img_pil_full, rot_deg, supersample_factor=1, pil_filter=Image.Resampling.NEAREST)
             else: rotated_img_pil = img_pil_full.copy()
             # print_image_info(rotated_img_pil, "Rotation", spec_info_str) # Uncomment for verbosity
 
@@ -443,38 +448,41 @@ def generate_and_save_styled_worker(styled_spec, crop_w_worker, crop_h_worker, d
 
 
             # --- Apply quantization/palette/dither using the reduce_color_depth_and_dither function ---
-            # This function is designed to expect NumPy and return NumPy.
-            try:
-                # Arguments for reduce_color_depth_and_dither:
-                # image_np, color_space, target_palette_size=None, dithering_method='None', verbose=1
+            if str(pal) == 'HAM6':
+                # This is a HAM6 job. Call the dedicated HAM6 converter.
+                # The HAM6 function needs a palette generator function.
+                # You might need to import these at the top of generator.py
+                from quantize import apply_ham6_conversion, generate_palette_median_cut, generate_palette_octree
+                # (Assuming you also add a k-means wrapper in quantize.py as suggested before)
+                
+                if palette_algorithm == 'median_cut':
+                    palette_func = generate_palette_median_cut
+                elif palette_algorithm == 'octree':
+                    palette_func = generate_palette_octree
+                else: # Default to k-means logic
+                    from sklearn.cluster import KMeans
+                    def kmeans_palette_func(img, num_colors):
+                        pixels = img.reshape(-1, 3)
+                        kmeans = KMeans(n_clusters=num_colors, random_state=42, n_init='auto')
+                        kmeans.fit(pixels)
+                        return kmeans.cluster_centers_.astype(np.uint8)
+                    palette_func = kmeans_palette_func
 
-                color_space_str = cs # Already a string like 'RGB888', 'RGB444'
-                palette_size_param = pal # Already int or None
-
-                # --- Correctly map the dither parameter (dm) to the string 'None' if it's None ---
-                # The styled_spec might contain None object or the string 'None'.
-                # The reduce_color_depth_and_dither function expects a string like 'None'.
-                dithering_method_param = 'None' if (dm is None or (isinstance(dm, str) and dm.lower() == 'None')) else dm.lower()
-
-                if verbose_worker >= 3: print(f"DEBUG WORKER [{spec_info_str}]: Calling reduce_color_depth_and_dither with color_space='{color_space_str}', palette={palette_size_param}, dither='{dithering_method_param}'.")
-
-                # Call the function from quantize.py (ensure you have the import)
-                processed_quantized_np = reduce_color_depth_and_dither(
-                    image_np=processed_res_np, # Pass the NumPy array input
-                    color_space=color_space_str, # Pass the color space string
-                    target_palette_size=palette_size_param, # Pass the palette size (int or None)
-                    dithering_method=dithering_method_param, # Pass the corrected dither method string ('None' or a DIFFUSION_MAPS key)
-                    palette_algorithm=palette_algorithm, # Pass the palette algorithm
-                    verbose=verbose_worker >= 2 # Pass verbosity level
+                processed_quantized_np = apply_ham6_conversion(
+                    image_np=processed_res_np,
+                    palette_generator_func=palette_func,
+                    verbose=verbose_worker
                 )
-                if verbose_worker >= 3: print_image_info(processed_quantized_np, "After reduce_color_depth_and_dither", spec_info_str)
-
-            except Exception as e:
-                # This catches errors specifically from the reduce_color_depth_and_dither call.
-                # The 'mode' error is reported as happening here.
-                if verbose_worker >= 1: warnings.warn(f"Worker error during quantization/dither ({color_space_str}, {palette_size_param}, {dithering_method_param}) for {spec_info_str}: {e}", stacklevel=2)
-                return (styled_spec, False, f"Quantization/dither failed: {e}")
-
+            else:
+                # This is a standard palette/dither job. Call the original function.
+                processed_quantized_np = reduce_color_depth_and_dither(
+                    image_np=processed_res_np,
+                    color_space=cs,
+                    target_palette_size=pal,
+                    dithering_method=dm,
+                    palette_algorithm=palette_algorithm,
+                    verbose=verbose_worker >= 2
+                )
 
             # --- Convert NumPy array back to PIL Image for resolution styling ---
             try:
@@ -495,7 +503,8 @@ def generate_and_save_styled_worker(styled_spec, crop_w_worker, crop_h_worker, d
             # The object to save is final_output_obj. It should be a PIL Image at this point.
             styled_params_for_filename = {
                 'crop_x': crop_x, 'crop_y': crop_y, 'scale_perc': ds_perc, 'rot_deg': rot_deg,
-                'rgb': int(cs.replace('RGB', '')), 'pal': pal, 'dither': dm, 'resolution': res
+                'rgb': int(cs.replace('RGB', '')) if cs else None, 
+                'pal': pal, 'dither': dm, 'resolution': res            
             }
             styled_filename = construct_filename(styled_params_for_filename, is_target=False)
             output_path = get_output_path(dest_dir_worker, split_source_worker, original_base_filename, styled_filename)
@@ -696,6 +705,7 @@ class DatasetGenerator:
         # Sets self.active_style_characteristics and self.active_style_combinations
 
         if self.verbose >= 1: print("Determining active style combinations...")
+        from itertools import product
 
         # Assume SUPPORTED_RGB_FORMATS and SUPPORTED_DITHER_METHODS are accessible
         # from .quantize import SUPPORTED_DITHER_METHODS, SUPPORTED_RGB_FORMATS # Example if needed
@@ -708,7 +718,6 @@ class DatasetGenerator:
 
 
         # --- 1. Determine requested values from args, with validation and defaults ---
-
         requested_rgb_formats = []
         if self.args.rgb is not None: # Check if arg was provided
             for rgb_val in self.args.rgb:
@@ -721,7 +730,6 @@ class DatasetGenerator:
              if self.verbose >= 2: print("Debug: No valid RGB formats specified, defaulting to 888.")
              requested_rgb_formats = [888]
         requested_rgb_formats = sorted(list(set(requested_rgb_formats))) # Remove duplicates and sort
-
 
         requested_palette_sizes = []
         if self.args.palette is not None: # Check if arg was provided
@@ -775,11 +783,12 @@ class DatasetGenerator:
             raise ValueError(f"Unsupported resolution styles requested: {unsupported}. Supported: {SUPPORTED_RESOLUTION_STYLES}.")
         self.requested_resolutions = sorted(list(set(self.requested_resolutions)))
 
-
         # --- 2. Determine the set of active style characteristics (color_space, target_palette_size, dithering_method) ---
         self.active_style_characteristics = set() # Set of (cs, ps, dm) tuples
         from itertools import product # Need product for combinations
 
+        requested_extra_modes = self.args.extra_mode or []
+    
         # Case A: No palette size was requested (--palette was not used) # FIXME checkerboard should work both on palette as pure RGB
         if not requested_palette_sizes:
             if self.verbose >= 2: print("Debug: No palette sizes requested (--palette not used). Generating non-paletted outputs.")
@@ -789,9 +798,9 @@ class DatasetGenerator:
                 cs_name = f'RGB{rgb_val}'                
                 # For non-paletted outputs, only the 'None' dither method is valid.
                 if len(requested_dither_methods) == 0 or requested_dither_methods.count("None") == 1:
-                    self.active_style_characteristics.add((cs_name, None, 'None'))
+                    self.active_style_characteristics.add((cs_name, None, 'None', None))
                 elif 'checkerboard' in requested_dither_methods:
-                    self.active_style_characteristics.add((cs_name, None, 'checkerboard'))
+                    self.active_style_characteristics.add((cs_name, None, 'checkerboard', None))
 
         # Case B: Palette sizes *were* requested (--palette was used)
         else:
@@ -801,13 +810,14 @@ class DatasetGenerator:
             # Since requested_rgb_formats defaults to [888] if args.rgb is None, we can just use requested_rgb_formats
             rgb_formats_for_palette = requested_rgb_formats
 
-            # Combine RGB formats, requested palette sizes, AND requested dithering methods
+            # Combine RGB formats, requested palette sizes, requested dithering methods and extra modes
             # This is where the --dither argument controls which dither methods are included for paletted outputs
             for cs_val, pal_size, dither_method in product(rgb_formats_for_palette, requested_palette_sizes, requested_dither_methods):
                 cs_name = f'RGB{cs_val}'
                 if pal_size == None and dither_method == 'checkerboard':
-                    self.active_style_characteristics.add((cs_name, pal_size, 'None'))
-                    continue # FIXME checkerboard should also work on pure RGB
+                    dither_method = 'None'
+                    #self.active_style_characteristics.add((cs_name, pal_size, 'None', None))
+                    #continue # FIXME checkerboard should also work on pure RGB
                 # Add this characteristic combination. Filtering for invalid dither/palette will happen later.
                 self.active_style_characteristics.add((cs_name, pal_size, dither_method))
 
@@ -816,6 +826,13 @@ class DatasetGenerator:
 
         # --- 3. Determine the set of active style combinations including resolution style ---
         self.active_style_combinations = set() # Set of (res, cs, ps, dm) tuples
+
+        for res, mode in product(self.requested_resolutions, requested_extra_modes):
+            if mode.upper() == 'HAM6':
+                self.active_style_combinations.add((res, 'RGB444', 'HAM6', 'None'))
+            # Future modes like 'sham', 'ham8' can be added as 'elif' blocks here.
+            else:
+                warnings.warn(f"Unsupported extra_mode '{mode}' ignored.")
 
         # Combine requested resolutions with the determined style characteristics
         for res in self.requested_resolutions:
@@ -833,7 +850,6 @@ class DatasetGenerator:
 
         if not self.active_style_combinations:
              raise ValueError("No valid style combinations were generated after filtering.")
-
 
         # Print the total number of active style combinations generated
         if self.verbose >= 1:
@@ -948,7 +964,6 @@ class DatasetGenerator:
              print(f"Debug: Active style combinations count (from _determine_active_style_combinations): {len(self.active_style_combinations)}")
              if self.verbose >= 3:
                   print(f"Debug: Active style combinations: {self.active_style_combinations}")
-
 
         for split in ['train', 'test']:
              if self.verbose >= 2: print(f"Debug: Processing split: {split}")
@@ -1658,6 +1673,7 @@ if __name__ == '__main__':
     parser.add_argument("--verbose", type=int, default=1, choices=[0, 1, 2, 3], help="Verbosity level: 0 (Quiet), 1 (Progress), 2 (Debug).")
     parser.add_argument("--rgb", type=int, nargs='*', default=None, metavar='INT', help="Generate outputs in these RGB formats (e.g., 888 565). Supported: 444, 555, 565, 666, 888.")
     parser.add_argument("--palette", type=int, nargs='*', default=None, metavar='INT', help="Generate outputs with these palette sizes. Supported: 2, 4, 8, 16, 24, 32, 64, 128, 256, 512, 1024, 2048, 4096. 0 means all colours.")
+    parser.add_argument("--extra_mode", type=str, nargs='*', default=None, metavar='MODE', help="Apply special graphics modes. Supported: HAM6.")
     parser.add_argument("--rotate", type=int, nargs='*', default=None, metavar='DEGREE', help="Rotate ground truth images by these angles in degrees before cropping (e.g., 0 90 180 270). 0 is default if none specified.")
     parser.add_argument("--downscale", type=int, nargs='*', default=None, metavar='PERCENT', help="Downscale ground truth images to these percentages of the original size before cropping (e.g., 50 75). Must be > 0 and < 100. 0%% is default if none specified.")
     parser.add_argument("--resolution", type=str, nargs='*', default=['lores'], metavar='STYLE', help=f"Generate outputs with these resolution styles. Supported: {SUPPORTED_RESOLUTION_STYLES}. Default: lores.")

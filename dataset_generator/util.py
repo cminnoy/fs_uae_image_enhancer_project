@@ -21,7 +21,6 @@ except ImportError:
 #   dithering_method: String, 'None' or a key from DIFFUSION_MAPS.
 try:
     from quantize import DIFFUSION_MAPS, reduce_color_depth_and_dither
-    # Add 'None' as a valid dithering method string if your quantize doesn't handle it explicitly
     _all_dither_methods = ['None', 'checkerboard', 'bayer2x2', 'bayer4x4', 'bayer8x8'] + list(DIFFUSION_MAPS.keys())
 except ImportError:
     warnings.warn("Could not import quantization module (quantize.py). Quantization and dithering styles will not work.")
@@ -160,7 +159,7 @@ def get_crop_and_pad(image_pil: Image.Image, crop_x: int, crop_y: int, crop_w: i
 def apply_rotation(image_pil: Image.Image, angle_degrees: int, supersample_factor: int = 2, pil_filter=Image.Resampling.BICUBIC) -> Image.Image:
     """
     Rotates a PIL image by a specified angle in degrees.
-    Uses the LANCZOS resampling filter for quality.
+    Uses the NEAREST resampling filter for quality.
     Applies Anti-Aliasing using the super_sample factor.
     The canvas is expanded to include the entire rotated image without cropping.
     Returns a new PIL Image object.

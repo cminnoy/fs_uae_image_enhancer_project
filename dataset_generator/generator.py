@@ -14,6 +14,7 @@ import re
 from quantize import reduce_color_depth_and_dither, DIFFUSION_MAPS
 from cache import ScanCache, DEFAULT_TRAIN_CACHE_FILE, DEFAULT_TEST_CACHE_FILE
 import signal
+from sklearn.cluster import KMeans
 
 stop_processing = False
 
@@ -341,9 +342,14 @@ def parse_generated_filename(filename: str, verbose: int = 1) -> dict | None:
                 pal = None
             elif pal_str.upper() == 'HAM6':
                 pal = 'HAM6'
+            elif pal_str.upper() == 'EHB':
+                pal = 'EHB'
+            elif pal_str.upper() == 'SHAM':
+                pal = 'SHAM'
             else:
                 pal = int(pal_str)
-            if dither_name == "none": dither_name = "None"
+            if dither_name == "none":
+                dither_name = "None"
 
             # Perform basic validation on parsed values against supported constants
             if resolution not in SUPPORTED_RESOLUTION_STYLES:
@@ -363,7 +369,7 @@ def parse_generated_filename(filename: str, verbose: int = 1) -> dict | None:
                 'rot_deg': rot_deg,     # Pre-processing rotation angle
                 'resolution': resolution, # Resolution style
                 'rgb': f"RGB{rgb_val}", # Color format value
-                'pal': pal,             # Palette size (int, HAM6 or None)
+                'pal': pal,             # Palette size (int, HAM6, EHB, SHAM or None)
                 'dither': dither_name,  # Dither method name
                 'full_filename': filename # Store the original filename
             }
@@ -411,9 +417,6 @@ def generate_and_save_styled_worker(styled_spec, crop_w_worker, crop_h_worker, d
             img_pil_full = img_pil_full.convert("RGB") # Ensure RGB mode
             # print_image_info(img_pil_full, "Initial Load/Convert", spec_info_str) # Uncomment for verbosity
 
-            # NOTE: Amiga games have a mix of images which use Anti-Aliasing, not clear yet if styled images should use AA or not.
-            #       For maximum quality, we should combine the rotation and downscaling, so the downscale of the AA does the final downscale in one step.
-
             # Apply pre-processing (rotation, scaling, cropping) resulting in a PIL Image
             # We disable AA here use NEAREST to get closer to real Amiga images in games
             if rot_deg != 0: rotated_img_pil = apply_rotation(img_pil_full, rot_deg, supersample_factor=1, pil_filter=Image.Resampling.NEAREST)
@@ -446,29 +449,48 @@ def generate_and_save_styled_worker(styled_spec, crop_w_worker, crop_h_worker, d
                 if verbose_worker >= 1: warnings.warn(f"Worker error converting to NumPy before quantization for {spec_info_str}: {e}", stacklevel=2)
                 return (styled_spec, False, f"Failed conversion to NumPy: {e}")
 
-
             # --- Apply quantization/palette/dither using the reduce_color_depth_and_dither function ---
             if str(pal) == 'HAM6':
+                from quantize import apply_ham6_conversion, generate_palette_median_cut, generate_palette_octree
                 # This is a HAM6 job. Call the dedicated HAM6 converter.
                 # The HAM6 function needs a palette generator function.
-                # You might need to import these at the top of generator.py
-                from quantize import apply_ham6_conversion, generate_palette_median_cut, generate_palette_octree
-                # (Assuming you also add a k-means wrapper in quantize.py as suggested before)
-                
                 if palette_algorithm == 'median_cut':
                     palette_func = generate_palette_median_cut
                 elif palette_algorithm == 'octree':
                     palette_func = generate_palette_octree
                 else: # Default to k-means logic
-                    from sklearn.cluster import KMeans
                     def kmeans_palette_func(img, num_colors):
                         pixels = img.reshape(-1, 3)
                         kmeans = KMeans(n_clusters=num_colors, random_state=42, n_init='auto')
                         kmeans.fit(pixels)
                         return kmeans.cluster_centers_.astype(np.uint8)
                     palette_func = kmeans_palette_func
-
                 processed_quantized_np = apply_ham6_conversion(
+                    image_np=processed_res_np,
+                    palette_generator_func=palette_func,
+                    verbose=verbose_worker
+                )
+            elif str(pal) == 'EHB':
+                from quantize import apply_ehb_conversion
+                processed_quantized_np = apply_ehb_conversion(
+                    image_np=processed_res_np,
+                    verbose=verbose_worker
+                )
+            elif str(pal) == 'SHAM':
+                from quantize import apply_sham_conversion, generate_palette_median_cut, generate_palette_octree
+                # (Reusing the palette function selection from your ham6 logic)
+                if palette_algorithm == 'median_cut':
+                    palette_func = generate_palette_median_cut
+                elif palette_algorithm == 'octree':
+                    palette_func = generate_palette_octree
+                else: # Default to k-means logic
+                    def kmeans_palette_func(img, num_colors):
+                        pixels = img.reshape(-1, 3)
+                        kmeans = KMeans(n_clusters=num_colors, random_state=42, n_init='auto')
+                        kmeans.fit(pixels)
+                        return kmeans.cluster_centers_.astype(np.uint8)
+                    palette_func = kmeans_palette_func
+                processed_quantized_np = apply_sham_conversion(
                     image_np=processed_res_np,
                     palette_generator_func=palette_func,
                     verbose=verbose_worker
@@ -716,7 +738,6 @@ class DatasetGenerator:
         # Get supported dither methods keys + 'None' from your quantize.py DIFFUSION_MAPS
         SUPPORTED_DITHER_METHODS_KEYS = list(DIFFUSION_MAPS.keys()) + ['None', 'checkerboard', 'bayer2x2', 'bayer4x4', 'bayer8x8']
 
-
         # --- 1. Determine requested values from args, with validation and defaults ---
         requested_rgb_formats = []
         if self.args.rgb is not None: # Check if arg was provided
@@ -830,7 +851,10 @@ class DatasetGenerator:
         for res, mode in product(self.requested_resolutions, requested_extra_modes):
             if mode.upper() == 'HAM6':
                 self.active_style_combinations.add((res, 'RGB444', 'HAM6', 'None'))
-            # Future modes like 'sham', 'ham8' can be added as 'elif' blocks here.
+            elif mode.upper() == 'EHB':
+                self.active_style_combinations.add((res, 'RGB444', 'EHB', 'None'))
+            elif mode.upper() == 'SHAM':
+                self.active_style_combinations.add((res, 'RGB444', 'SHAM', 'None'))
             else:
                 warnings.warn(f"Unsupported extra_mode '{mode}' ignored.")
 
@@ -841,9 +865,14 @@ class DatasetGenerator:
                 # --- Final Filtering of invalid combinations before adding to final set ---
                 # Rule: Dithering (methods other than 'None') requires a specified palette size (ps is not None)
                 if dm != 'None' and dm != 'checkerboard' and ps is None:
-                     if self.verbose >= 2:
-                          print(f"Debug: Skipping invalid final style combination (dither method '{dm}' requires a palette): Resolution='{res}', ColorSpace='{cs}', PaletteSize={ps}, DitherMethod='{dm}'")
-                     continue # Skip this combination
+                    if self.verbose >= 2:
+                        print(f"Debug: Skipping invalid final style combination (dither method '{dm}' requires a palette): Resolution='{res}', ColorSpace='{cs}', PaletteSize={ps}, DitherMethod='{dm}'")
+                    continue
+                # Rule: HAM6 only in lores and lores laced mode
+                if ps in ['HAM6', 'EHB', 'SHAM'] and res not in ['lores', 'lores_laced']:
+                    if self.verbose >= 2:
+                        print(f"Debug: Skipping invalid final style combination ({ps} mode not support for this resolution): Resolution='{res}', ColorSpace='{cs}', PaletteSize={ps}, DitherMethod='{dm}'")
+                    continue
 
                 # Add the valid combination to the final set
                 self.active_style_combinations.add((res, cs, ps, dm)) # dm is already the correct string ('None' or a key)
@@ -1009,8 +1038,6 @@ class DatasetGenerator:
                  if self.verbose >= 3 and len(self.active_style_combinations) > 0:
                       if i < 5: # Print for first few targets
                            print(f"Debug: Finished adding styled specs for target operation {i+1} in {split}. Final styled specs count for this target iteration: {len(self.full_valid_output_specs[split])}")
-
-
 
         if self.verbose >= 1:
             print(f"Full valid train target specs: {len(self.full_valid_target_specs['train'])}")
@@ -1673,7 +1700,7 @@ if __name__ == '__main__':
     parser.add_argument("--verbose", type=int, default=1, choices=[0, 1, 2, 3], help="Verbosity level: 0 (Quiet), 1 (Progress), 2 (Debug).")
     parser.add_argument("--rgb", type=int, nargs='*', default=None, metavar='INT', help="Generate outputs in these RGB formats (e.g., 888 565). Supported: 444, 555, 565, 666, 888.")
     parser.add_argument("--palette", type=int, nargs='*', default=None, metavar='INT', help="Generate outputs with these palette sizes. Supported: 2, 4, 8, 16, 24, 32, 64, 128, 256, 512, 1024, 2048, 4096. 0 means all colours.")
-    parser.add_argument("--extra_mode", type=str, nargs='*', default=None, metavar='MODE', help="Apply special graphics modes. Supported: HAM6.")
+    parser.add_argument("--extra_mode", type=str, nargs='*', default=None, metavar='MODE', help="Apply special graphics modes. Supported: HAM6, EHB, SHAM.")
     parser.add_argument("--rotate", type=int, nargs='*', default=None, metavar='DEGREE', help="Rotate ground truth images by these angles in degrees before cropping (e.g., 0 90 180 270). 0 is default if none specified.")
     parser.add_argument("--downscale", type=int, nargs='*', default=None, metavar='PERCENT', help="Downscale ground truth images to these percentages of the original size before cropping (e.g., 50 75). Must be > 0 and < 100. 0%% is default if none specified.")
     parser.add_argument("--resolution", type=str, nargs='*', default=['lores'], metavar='STYLE', help=f"Generate outputs with these resolution styles. Supported: {SUPPORTED_RESOLUTION_STYLES}. Default: lores.")

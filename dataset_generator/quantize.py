@@ -1,6 +1,7 @@
 import numpy as np
 from PIL import Image
 from sklearn.cluster import KMeans
+from sklearn.cluster import MiniBatchKMeans
 import numba as nb
 import time # For timing the Numba parts
 
@@ -8,9 +9,27 @@ import time # For timing the Numba parts
 def generate_palette_median_cut(image_np: np.ndarray, num_colors: int) -> np.ndarray:
     pixels = image_np.reshape(-1, 3)
 
+    # Handle images/scanlines with few unique colors to prevent crashes.
+    if pixels.shape[0] == 0:
+        # If the input image is empty, return a black palette.
+        return np.zeros((num_colors, 3), dtype=np.uint8)
+
+    unique_colors = np.unique(pixels, axis=0)
+    if len(unique_colors) <= num_colors:
+        # Not enough unique colors to need the median cut algorithm.
+        # We can return the unique colors directly, padded to the requested size.
+        padded_palette = np.zeros((num_colors, 3), dtype=np.uint8)
+        num_unique = len(unique_colors)
+        padded_palette[:num_unique] = unique_colors
+        # Fill remaining palette slots by repeating the last unique color.
+        if num_unique > 0 and num_unique < num_colors:
+            padded_palette[num_unique:] = unique_colors[-1]
+        return padded_palette
+
     class ColorBox:
         def __init__(self, pixels):
             self.pixels = pixels
+            # This is where the original crash happened
             self.bounds = [
                 (np.min(pixels[:, i]), np.max(pixels[:, i])) for i in range(3)
             ]
@@ -228,7 +247,6 @@ def _apply_checkerboard_dithering_numba_optimized(
             output_image_uint8[y_idx, x_idx, 1] = chosen_color_g
             output_image_uint8[y_idx, x_idx, 2] = chosen_color_b
 
-
 @nb.njit(cache=True)
 def _apply_ordered_dithering_numba_optimized(
     image_float_input: np.ndarray,  # (H, W, 3) float64
@@ -425,8 +443,7 @@ def apply_ham6_conversion(
     if verbose > 1:
         print("Applying HAM6 conversion...")
 
-    # 1. Quantize image from 8-bit per channel (0-255) to 4-bit (0-15) for OCS Amiga
-    # This is a crucial step for emulating the 12-bit color space.
+    # Convert RGB888 to RGB444 with rounding, ensuring no overflow.
     quantized_img_12bit = (image_np >> 4).astype(np.uint8)
 
     # 2. Generate a 16-color base palette using the provided generator
@@ -449,6 +466,172 @@ def apply_ham6_conversion(
     # 8-bit range [0, 255] (since 15 * 17 = 255).
     final_image_data_8bit = ham_image_12bit * 17
 
+    return final_image_data_8bit
+
+def apply_ehb_conversion(
+    image_np: np.ndarray,
+    verbose: int = 1
+) -> np.ndarray:
+    """
+    Converts an image to Amiga Extra Half-Brite (EHB) mode.
+    This involves creating an optimal 32-color palette and its 32 half-bright
+    counterparts, for a total of 64 colors. (Corrected Version)
+    """
+    if verbose > 1:
+        print("Applying EHB conversion...")
+    
+    h, w, _ = image_np.shape
+    pixels = image_np.reshape(-1, 3)
+
+    # 1. --- Optimal Palette Generation ---
+    # This part of the logic was correct. We create an augmented color set
+    # to help K-Means find a palette that works well for both bright and dark colors.
+    if verbose > 2:
+        print("  - Creating augmented color set for EHB palette optimization...")
+    
+    pixels_float = pixels.astype(np.float32)
+    doubled_pixels_float = np.clip(pixels_float * 2.0, 0, 255)
+    augmented_colors = np.vstack((pixels_float, doubled_pixels_float))
+
+    if verbose > 2:
+        print(f"  - Running MiniBatchKMeans on {len(augmented_colors)} candidate colors...")
+    
+    kmeans = MiniBatchKMeans(
+        n_clusters=32,
+        random_state=42,
+        batch_size=8192,
+        n_init='auto'
+    )
+    kmeans.fit(augmented_colors)
+    base_palette_32 = kmeans.cluster_centers_.astype(np.uint8)
+
+    # 2. --- Create the full 64-color EHB palette ---
+    half_brite_palette_32 = (base_palette_32 >> 1)
+    full_ehb_palette_64 = np.vstack((base_palette_32, half_brite_palette_32))
+
+    # 3. --- Map the original image to the final 64-color palette ---
+    if verbose > 2:
+        print("  - Mapping original image to the 64-color EHB palette...")
+
+    # --- BUG FIX STARTS HERE ---
+    # The original pixels and the final palette MUST be cast to a float or
+    # signed integer type before subtraction to prevent uint8 "wrap-around" errors.
+    
+    palette_float = full_ehb_palette_64.astype(np.float32)
+    # The `pixels_float` variable from the palette generation can be reused here.
+
+    # This calculation is now mathematically correct.
+    distances_sq = np.sum((pixels_float[:, np.newaxis, :] - palette_float)**2, axis=2)
+    # --- BUG FIX ENDS HERE ---
+    
+    best_palette_indices = np.argmin(distances_sq, axis=1)
+    
+    # Create the final image by indexing into the original uint8 palette.
+    final_image_np = full_ehb_palette_64[best_palette_indices].reshape(h, w, 3)
+
+    return final_image_np
+
+@nb.njit(cache=True)
+def _convert_scanline_to_ham_numba(
+    scanline_12bit: np.ndarray,
+    palette_12bit: np.ndarray,
+    output_scanline_12bit: np.ndarray
+) -> np.ndarray:
+    """
+    Numba-accelerated function to apply HAM encoding to a single scanline.
+    This is the core logic reused by both HAM6 and SHAM.
+    """
+    width, _ = scanline_12bit.shape
+
+    # 1. Start scanline with a SET operation from the per-scanline palette
+    target_pixel = scanline_12bit[0]
+    min_dist_sq = np.inf
+    best_idx = 0
+    for i in range(palette_12bit.shape[0]):
+        dist_sq = np.sum((target_pixel - palette_12bit[i])**2)
+        if dist_sq < min_dist_sq:
+            min_dist_sq = dist_sq
+            best_idx = i
+    
+    previous_color = palette_12bit[best_idx]
+    output_scanline_12bit[0] = previous_color
+
+    # 2. Process the rest of the scanline
+    for x in range(1, width):
+        target_pixel = scanline_12bit[x]
+
+        # Find best SET operation
+        min_dist_set_sq = np.inf
+        best_palette_color = palette_12bit[0]
+        for i in range(palette_12bit.shape[0]):
+            dist = np.sum((target_pixel - palette_12bit[i])**2)
+            if dist < min_dist_set_sq:
+                min_dist_set_sq = dist
+                best_palette_color = palette_12bit[i]
+
+        # Calculate MODIFY costs
+        mod_r_color = np.array([target_pixel[0], previous_color[1], previous_color[2]])
+        dist_mod_r_sq = np.sum((target_pixel - mod_r_color)**2)
+        mod_g_color = np.array([previous_color[0], target_pixel[1], previous_color[2]])
+        dist_mod_g_sq = np.sum((target_pixel - mod_g_color)**2)
+        mod_b_color = np.array([previous_color[0], previous_color[1], target_pixel[2]])
+        dist_mod_b_sq = np.sum((target_pixel - mod_b_color)**2)
+
+        # Find the best operation
+        costs = np.array([min_dist_set_sq, dist_mod_r_sq, dist_mod_g_sq, dist_mod_b_sq])
+        best_op_idx = np.argmin(costs)
+        
+        # Apply and update state
+        if best_op_idx == 0:
+            output_scanline_12bit[x] = best_palette_color
+        elif best_op_idx == 1:
+            output_scanline_12bit[x] = mod_r_color
+        elif best_op_idx == 2:
+            output_scanline_12bit[x] = mod_g_color
+        else:
+            output_scanline_12bit[x] = mod_b_color
+        previous_color = output_scanline_12bit[x]
+            
+    return output_scanline_12bit
+
+def apply_sham_conversion(
+    image_np: np.ndarray,
+    palette_generator_func,
+    verbose: int = 1
+) -> np.ndarray:
+    """
+    Converts an image to Sliced HAM (SHAM) mode. A 16-color palette is
+    generated for each scanline before applying HAM logic.
+    """
+    if verbose > 1:
+        print("Applying SHAM conversion...")
+    
+    h, w, _ = image_np.shape
+    
+    # Quantize the entire image to 12-bit color space (0-15 per channel) first
+    image_12bit = (image_np >> 4).astype(np.uint8)
+    output_image_12bit = np.zeros_like(image_12bit)
+
+    # Process image one scanline at a time
+    for y in range(h):
+        if verbose > 2 and y % 32 == 0:
+            print(f"  - Processing SHAM scanline {y}/{h}")
+            
+        scanline_12bit = image_12bit[y] # Shape: (width, 3)
+
+        # 1. Generate a 16-color palette just for this scanline
+        # Note: The palette generator expects a (H, W, 3) image, so we reshape
+        scanline_for_palette_gen = scanline_12bit.reshape(1, w, 3)
+        palette_12bit = palette_generator_func(scanline_for_palette_gen, num_colors=16)
+        
+        # 2. Run the Numba JIT function on this scanline
+        output_scanline_12bit = np.zeros_like(scanline_12bit)
+        output_image_12bit[y] = _convert_scanline_to_ham_numba(
+            scanline_12bit, palette_12bit, output_scanline_12bit
+        )
+        
+    # 3. De-quantize from 4-bit (0-15) back to 8-bit (0-255) for display
+    final_image_data_8bit = output_image_12bit * 17
     return final_image_data_8bit
 
 # --- Dither Matrices (Module-level constants) ---

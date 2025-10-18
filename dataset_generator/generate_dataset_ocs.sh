@@ -1,7 +1,7 @@
 #!/bin/bash
 python generator.py \
     --train_images dataset/groundtruth_train \
-    --train_num_crops 100 \
+    --train_num_crops 10 \
     --destination_dir dataset/dataset_train_ocs \
     --max_workers 4 \
     --rgb 444 \
@@ -19,6 +19,6 @@ python generator.py \
     --resolution lores \
     --palette_algorithm median_cut \
     --palette 16 24 32 \
-    --extra_mode ham6 \
-    --dither checkerboard floyd-steinberg atkinson sierra2 stucki burkes sierra3 bayer2x2 bayer4x4 bayer8x8 None \
+    --extra_mode ham6 ehb sham \
+    --dither checkerboard floyd-steinberg atkinson sierra2 stucki burkes sierra3 bayer2x2 bayer4x4 bayer8x8 \
     --verbose 1

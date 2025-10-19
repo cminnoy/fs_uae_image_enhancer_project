@@ -1,7 +1,7 @@
 #!/bin/bash
 python generator.py \
     --train_images dataset/groundtruth_train \
-    --train_num_crops 10 \
+    --train_num_crops 15 \
     --destination_dir dataset/dataset_train_ocs \
     --max_workers 4 \
     --rgb 444 \

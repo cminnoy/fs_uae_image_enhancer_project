@@ -7,55 +7,81 @@ import time # For timing the Numba parts
 
 # --- Median Cut Palette Generator ---
 def generate_palette_median_cut(image_np: np.ndarray, num_colors: int) -> np.ndarray:
-    pixels = image_np.reshape(-1, 3)
+    """
+    Generates a color palette using a robust median cut algorithm.
+    This version correctly handles low-color and low-variance inputs.
+    """
+    pixels = image_np.reshape(-1, 3).astype(np.float32)
 
-    # Handle images/scanlines with few unique colors to prevent crashes.
+    # Handle edge case of an empty input image
     if pixels.shape[0] == 0:
-        # If the input image is empty, return a black palette.
         return np.zeros((num_colors, 3), dtype=np.uint8)
 
-    unique_colors = np.unique(pixels, axis=0)
-    if len(unique_colors) <= num_colors:
-        # Not enough unique colors to need the median cut algorithm.
-        # We can return the unique colors directly, padded to the requested size.
-        padded_palette = np.zeros((num_colors, 3), dtype=np.uint8)
-        num_unique = len(unique_colors)
-        padded_palette[:num_unique] = unique_colors
-        # Fill remaining palette slots by repeating the last unique color.
-        if num_unique > 0 and num_unique < num_colors:
-            padded_palette[num_unique:] = unique_colors[-1]
-        return padded_palette
+    # Start with a single "box" containing all pixels
+    boxes = [pixels]
 
-    class ColorBox:
-        def __init__(self, pixels):
-            self.pixels = pixels
-            # This is where the original crash happened
-            self.bounds = [
-                (np.min(pixels[:, i]), np.max(pixels[:, i])) for i in range(3)
-            ]
-
-        def longest_color_range_axis(self):
-            ranges = [hi - lo for lo, hi in self.bounds]
-            return int(np.argmax(ranges))
-
-        def split(self):
-            axis = self.longest_color_range_axis()
-            sorted_pixels = self.pixels[self.pixels[:, axis].argsort()]
-            median_idx = len(sorted_pixels) // 2
-            return ColorBox(sorted_pixels[:median_idx]), ColorBox(sorted_pixels[median_idx:])
-
-        def average_color(self):
-            return np.mean(self.pixels, axis=0)
-
-    boxes = [ColorBox(pixels)]
     while len(boxes) < num_colors:
-        boxes.sort(key=lambda box: np.prod([hi - lo for lo, hi in box.bounds]), reverse=True)
-        largest_box = boxes.pop(0)
-        box1, box2 = largest_box.split()
-        boxes.extend([box1, box2])
+        # Find the box with the greatest color range to split next
+        box_to_split_idx = -1
+        max_range = -1
 
-    palette = np.array([box.average_color() for box in boxes], dtype=np.uint8)
-    return palette
+        for i, box in enumerate(boxes):
+            # A box must have at least 2 pixels to be splittable
+            if box.shape[0] < 2:
+                continue
+
+            # Find the largest color channel range (R, G, or B) within this box
+            box_min = np.min(box, axis=0)
+            box_max = np.max(box, axis=0)
+            ranges = box_max - box_min
+            current_max_range = np.max(ranges)
+
+            if current_max_range > max_range:
+                max_range = current_max_range
+                box_to_split_idx = i
+        
+        # If no splittable boxes were found, we're done.
+        if box_to_split_idx == -1:
+            break
+
+        # Split the chosen box
+        box_to_split = boxes.pop(box_to_split_idx)
+        
+        # Find the channel (0=R, 1=G, 2=B) with the greatest range in this box
+        ranges = np.max(box_to_split, axis=0) - np.min(box_to_split, axis=0)
+        split_channel = np.argmax(ranges)
+        
+        # Sort the pixels in the box according to the split channel
+        box_to_split = box_to_split[box_to_split[:, split_channel].argsort()]
+        
+        # Split at the median index
+        median_index = box_to_split.shape[0] // 2
+        
+        # Add the two new boxes to our list
+        boxes.append(box_to_split[:median_index])
+        boxes.append(box_to_split[median_index:])
+
+    # --- Create the final palette ---
+    # Average the colors in each box to get the representative palette color.
+    # We must handle cases where a box might be empty after a split.
+    palette = []
+    for box in boxes:
+        if box.shape[0] > 0:
+            palette.append(np.mean(box, axis=0))
+
+    # If we couldn't generate enough colors, pad the palette
+    palette = np.array(palette, dtype=np.uint8)
+    num_generated = len(palette)
+    if num_generated < num_colors:
+        if num_generated == 0: # Handle case of 1-pixel image
+             return np.tile(pixels[0].astype(np.uint8), (num_colors, 1))
+
+        padded_palette = np.zeros((num_colors, 3), dtype=np.uint8)
+        padded_palette[:num_generated] = palette
+        padded_palette[num_generated:] = palette[-1] # Pad with the last available color
+        palette = padded_palette
+
+    return palette[:num_colors] # Ensure correct size
 
 # --- Octree Palette Generator (Simple Averaging Variant) ---
 def generate_palette_octree(image_np: np.ndarray, num_colors: int) -> np.ndarray:
@@ -607,30 +633,18 @@ def apply_sham_conversion(
         print("Applying SHAM conversion...")
     
     h, w, _ = image_np.shape
-    
-    # Quantize the entire image to 12-bit color space (0-15 per channel) first
     image_12bit = (image_np >> 4).astype(np.uint8)
     output_image_12bit = np.zeros_like(image_12bit)
 
-    # Process image one scanline at a time
     for y in range(h):
-        if verbose > 2 and y % 32 == 0:
-            print(f"  - Processing SHAM scanline {y}/{h}")
-            
-        scanline_12bit = image_12bit[y] # Shape: (width, 3)
-
-        # 1. Generate a 16-color palette just for this scanline
-        # Note: The palette generator expects a (H, W, 3) image, so we reshape
-        scanline_for_palette_gen = scanline_12bit.reshape(1, w, 3)
-        palette_12bit = palette_generator_func(scanline_for_palette_gen, num_colors=16)
-        
-        # 2. Run the Numba JIT function on this scanline
+        scanline_for_palette_gen = image_12bit[y].reshape(1, w, 3)
+        palette_12bit = palette_generator_func(scanline_for_palette_gen, num_colors=16)        
+        scanline_12bit = image_12bit[y]
         output_scanline_12bit = np.zeros_like(scanline_12bit)
         output_image_12bit[y] = _convert_scanline_to_ham_numba(
             scanline_12bit, palette_12bit, output_scanline_12bit
         )
         
-    # 3. De-quantize from 4-bit (0-15) back to 8-bit (0-255) for display
     final_image_data_8bit = output_image_12bit * 17
     return final_image_data_8bit
 
@@ -749,7 +763,7 @@ def reduce_color_depth_and_dither(
     palette_float = None
 
     # Dithering methods (checkerboard, error diffusion, ordered) require a specific palette size
-    if dithering_method != 'none' and target_palette_size is None:
+    if dithering_method != 'None' and target_palette_size is None:
         raise ValueError(f"Dithering method '{dithering_method}' requires 'target_palette_size' to be specified.")
 
     if target_palette_size is not None:

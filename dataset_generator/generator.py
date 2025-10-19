@@ -11,7 +11,15 @@ import warnings
 import concurrent.futures
 import math
 import re
-from quantize import reduce_color_depth_and_dither, DIFFUSION_MAPS
+from quantize import (
+    reduce_color_depth_and_dither,
+    generate_palette_median_cut,
+    generate_palette_octree,
+    apply_ham6_conversion,
+    apply_ehb_conversion,
+    apply_sham_conversion,
+    DIFFUSION_MAPS
+)
 from cache import ScanCache, DEFAULT_TRAIN_CACHE_FILE, DEFAULT_TEST_CACHE_FILE
 import signal
 from sklearn.cluster import KMeans
@@ -848,15 +856,17 @@ class DatasetGenerator:
         # --- 3. Determine the set of active style combinations including resolution style ---
         self.active_style_combinations = set() # Set of (res, cs, ps, dm) tuples
 
+        # Add style combinations for extra modes for specific resolutions
         for res, mode in product(self.requested_resolutions, requested_extra_modes):
-            if mode.upper() == 'HAM6':
-                self.active_style_combinations.add((res, 'RGB444', 'HAM6', 'None'))
-            elif mode.upper() == 'EHB':
-                self.active_style_combinations.add((res, 'RGB444', 'EHB', 'None'))
-            elif mode.upper() == 'SHAM':
-                self.active_style_combinations.add((res, 'RGB444', 'SHAM', 'None'))
-            else:
-                warnings.warn(f"Unsupported extra_mode '{mode}' ignored.")
+            if res in ['lores', 'lores_laced']:
+                if mode.upper() == 'HAM6':
+                    self.active_style_combinations.add((res, 'RGB444', 'HAM6', 'None'))
+                elif mode.upper() == 'EHB':
+                    self.active_style_combinations.add((res, 'RGB444', 'EHB', 'None'))
+                elif mode.upper() == 'SHAM':
+                    self.active_style_combinations.add((res, 'RGB444', 'SHAM', 'None'))
+                else:
+                    warnings.warn(f"Unsupported extra_mode '{mode}' ignored.")
 
         # Combine requested resolutions with the determined style characteristics
         for res in self.requested_resolutions:
@@ -867,11 +877,6 @@ class DatasetGenerator:
                 if dm != 'None' and dm != 'checkerboard' and ps is None:
                     if self.verbose >= 2:
                         print(f"Debug: Skipping invalid final style combination (dither method '{dm}' requires a palette): Resolution='{res}', ColorSpace='{cs}', PaletteSize={ps}, DitherMethod='{dm}'")
-                    continue
-                # Rule: HAM6 only in lores and lores laced mode
-                if ps in ['HAM6', 'EHB', 'SHAM'] and res not in ['lores', 'lores_laced']:
-                    if self.verbose >= 2:
-                        print(f"Debug: Skipping invalid final style combination ({ps} mode not support for this resolution): Resolution='{res}', ColorSpace='{cs}', PaletteSize={ps}, DitherMethod='{dm}'")
                     continue
 
                 # Add the valid combination to the final set

@@ -2,7 +2,7 @@
 python generator.py \
     --train_images dataset/groundtruth_train \
     --train_num_crops 15 \
-    --destination_dir dataset/dataset_train_ocs \
+    --destination_dir dataset/dataset_train_ocs_games \
     --max_workers 4 \
     --rgb 444 \
     --crop_size 376 288 \
@@ -16,9 +16,9 @@ python generator.py \
              71 72 73 74 75 76 77 78 79 80 \
              81 82 83 84 85 86 87 88 89 90 \
     --downscale 90 80 70 60 50 40 \
-    --resolution lores lores_laced hires hires_laced \
+    --resolution lores \
     --palette_algorithm median_cut \
     --palette 16 24 32 \
-    --extra_mode EHB HAM6 SHAM DynamicHires \
+    --extra_mode EHB \
     --dither checkerboard floyd-steinberg atkinson sierra2 stucki burkes sierra3 bayer2x2 bayer4x4 bayer8x8 None \
     --verbose 1

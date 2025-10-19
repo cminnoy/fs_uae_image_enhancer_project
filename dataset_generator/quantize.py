@@ -539,16 +539,13 @@ def apply_ehb_conversion(
     if verbose > 2:
         print("  - Mapping original image to the 64-color EHB palette...")
 
-    # --- BUG FIX STARTS HERE ---
     # The original pixels and the final palette MUST be cast to a float or
     # signed integer type before subtraction to prevent uint8 "wrap-around" errors.
-    
     palette_float = full_ehb_palette_64.astype(np.float32)
     # The `pixels_float` variable from the palette generation can be reused here.
 
     # This calculation is now mathematically correct.
     distances_sq = np.sum((pixels_float[:, np.newaxis, :] - palette_float)**2, axis=2)
-    # --- BUG FIX ENDS HERE ---
     
     best_palette_indices = np.argmin(distances_sq, axis=1)
     
@@ -645,6 +642,97 @@ def apply_sham_conversion(
             scanline_12bit, palette_12bit, output_scanline_12bit
         )
         
+    final_image_data_8bit = output_image_12bit * 17
+    return final_image_data_8bit
+
+# Insert this new Numba helper function right after _convert_scanline_to_ham_numba
+@nb.njit(cache=True)
+def _map_scanline_to_palette_numba(
+    scanline_12bit: np.ndarray,
+    palette_12bit: np.ndarray,
+    output_scanline_12bit: np.ndarray
+) -> np.ndarray:
+    """
+    Numba-accelerated function to map a single scanline's pixels to the
+    closest color in a small, per-scanline palette (Direct Color Mapping).
+    This is the core logic for the 'Dynamic Hires' mode.
+    """
+    width, _ = scanline_12bit.shape
+    num_palette_colors = palette_12bit.shape[0]
+
+    # Pre-calculate squared palette colors (since we're working in the 12-bit space)
+    # The palette is in the 12-bit space (0-15 per channel).
+    
+    for x in range(width):
+        target_pixel = scanline_12bit[x]
+        
+        min_dist_sq = np.inf
+        best_idx = 0
+        
+        # Find the closest color in the palette
+        for i in range(num_palette_colors):
+            # Calculate squared Euclidean distance in the 12-bit space
+            dist_sq = (target_pixel[0] - palette_12bit[i, 0])**2 + \
+                      (target_pixel[1] - palette_12bit[i, 1])**2 + \
+                      (target_pixel[2] - palette_12bit[i, 2])**2
+            
+            if dist_sq < min_dist_sq:
+                min_dist_sq = dist_sq
+                best_idx = i
+        
+        # Assign the best color (which is already in 12-bit format)
+        output_scanline_12bit[x] = palette_12bit[best_idx]
+            
+    return output_scanline_12bit
+
+
+# Insert this main conversion function right after apply_sham_conversion
+def apply_dynamic_hires_conversion(
+    image_np: np.ndarray,
+    palette_generator_func,
+    verbose: int = 1
+) -> np.ndarray:
+    """
+    Converts an image using the Dynamic Hires technique (NewTek-style).
+    A 16-color palette is generated for each scanline, and then the scanline
+    is directly mapped (quantized) to that palette.
+
+    Args:
+        image_np: The input image as a NumPy array (H, W, 3) of type uint8 (RGB888).
+        palette_generator_func: A function (e.g., generate_palette_median_cut)
+                                that takes an image and num_colors and returns a palette.
+        verbose: Verbosity level.
+
+    Returns:
+        The converted image as a NumPy array (H, W, 3) of type uint8 (RGB888).
+    """
+    if verbose > 1:
+        print("Applying Dynamic Hires conversion (Per-scanline 16-color direct map)...")
+    
+    h, w, _ = image_np.shape
+    # Convert RGB888 to the working 12-bit color space (RGB444) by right-shifting
+    image_12bit = (image_np >> 4).astype(np.uint8)
+    output_image_12bit = np.zeros_like(image_12bit)
+
+    for y in range(h):
+        # 1. Generate a 16-color base palette for the current scanline (4-bit per channel)
+        # Note: The generator function expects an (H, W, 3) image-like array, so we reshape.
+        scanline_for_palette_gen = image_12bit[y].reshape(1, w, 3)
+        # The palette generator returns an 8-bit array, which is correct for K-Means/etc.
+        # We ensure it's in the 12-bit *value range* [0-15] and type uint8 (as a convention).
+        palette_12bit = palette_generator_func(scanline_for_palette_gen, num_colors=16).astype(np.uint8)
+        
+        # 2. Map the current scanline to its per-line 16-color palette
+        scanline_12bit = image_12bit[y] # The target scanline data
+        output_scanline_12bit = np.zeros_like(scanline_12bit)
+        
+        output_image_12bit[y] = _map_scanline_to_palette_numba(
+            scanline_12bit, 
+            palette_12bit, 
+            output_scanline_12bit
+        )
+        
+    # 3. De-quantize the 4-bit result back to 8-bit (0-255) for display/saving.
     final_image_data_8bit = output_image_12bit * 17
     return final_image_data_8bit
 

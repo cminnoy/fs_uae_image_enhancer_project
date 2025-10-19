@@ -4,7 +4,7 @@ python generator.py \
     --train_num_crops 15 \
     --destination_dir dataset/dataset_train_aga \
     --max_workers 3 \
-    --rgb 444 888 \
+    --rgb 888 \
     --crop_size 376 288 \
     --rotate 0 1 2 3 4 5 6 7 8 9 10 \
              11 12 13 14 15 16 17 18 19 20 \
@@ -19,6 +19,5 @@ python generator.py \
     --resolution lores lores_laced hires hires_laced \
     --palette_algorithm median_cut \
     --palette 0 32 64 128 256 \
-    --extra_mode ham6 ehb sham \
     --dither checkerboard floyd-steinberg atkinson sierra2 stucki burkes sierra3 bayer2x2 bayer4x4 bayer8x8 \
     --verbose 1

@@ -354,6 +354,8 @@ def parse_generated_filename(filename: str, verbose: int = 1) -> dict | None:
                 pal = 'EHB'
             elif pal_str.upper() == 'SHAM':
                 pal = 'SHAM'
+            elif pal_str.upper() == 'DYNAMICHIRES':
+                pal = 'DynamicHires'
             else:
                 pal = int(pal_str)
             if dither_name == "none":
@@ -377,7 +379,7 @@ def parse_generated_filename(filename: str, verbose: int = 1) -> dict | None:
                 'rot_deg': rot_deg,     # Pre-processing rotation angle
                 'resolution': resolution, # Resolution style
                 'rgb': f"RGB{rgb_val}", # Color format value
-                'pal': pal,             # Palette size (int, HAM6, EHB, SHAM or None)
+                'pal': pal,             # Palette size (int, HAM6, EHB, SHAM, DynamicHires or None)
                 'dither': dither_name,  # Dither method name
                 'full_filename': filename # Store the original filename
             }
@@ -499,6 +501,24 @@ def generate_and_save_styled_worker(styled_spec, crop_w_worker, crop_h_worker, d
                         return kmeans.cluster_centers_.astype(np.uint8)
                     palette_func = kmeans_palette_func
                 processed_quantized_np = apply_sham_conversion(
+                    image_np=processed_res_np,
+                    palette_generator_func=palette_func,
+                    verbose=verbose_worker
+                )
+            elif str(pal) == 'DynamicHires':
+                from quantize import apply_dynamic_hires_conversion, generate_palette_median_cut, generate_palette_octree
+                if palette_algorithm == 'median_cut':
+                    palette_func = generate_palette_median_cut
+                elif palette_algorithm == 'octree':
+                    palette_func = generate_palette_octree
+                else: # Default to k-means logic
+                    def kmeans_palette_func(img, num_colors):
+                        pixels = img.reshape(-1, 3)
+                        kmeans = KMeans(n_clusters=num_colors, random_state=42, n_init='auto')
+                        kmeans.fit(pixels)
+                        return kmeans.cluster_centers_.astype(np.uint8)
+                    palette_func = kmeans_palette_func
+                processed_quantized_np = apply_dynamic_hires_conversion(
                     image_np=processed_res_np,
                     palette_generator_func=palette_func,
                     verbose=verbose_worker
@@ -865,8 +885,9 @@ class DatasetGenerator:
                     self.active_style_combinations.add((res, 'RGB444', 'EHB', 'None'))
                 elif mode.upper() == 'SHAM':
                     self.active_style_combinations.add((res, 'RGB444', 'SHAM', 'None'))
-                else:
-                    warnings.warn(f"Unsupported extra_mode '{mode}' ignored.")
+            if res in ['hires', 'hires_laced']:
+                if mode.upper() == 'DYNAMICHIRES':
+                    self.active_style_combinations.add((res, 'RGB444', 'DynamicHires', 'None'))
 
         # Combine requested resolutions with the determined style characteristics
         for res in self.requested_resolutions:
@@ -1705,7 +1726,7 @@ if __name__ == '__main__':
     parser.add_argument("--verbose", type=int, default=1, choices=[0, 1, 2, 3], help="Verbosity level: 0 (Quiet), 1 (Progress), 2 (Debug).")
     parser.add_argument("--rgb", type=int, nargs='*', default=None, metavar='INT', help="Generate outputs in these RGB formats (e.g., 888 565). Supported: 444, 555, 565, 666, 888.")
     parser.add_argument("--palette", type=int, nargs='*', default=None, metavar='INT', help="Generate outputs with these palette sizes. Supported: 2, 4, 8, 16, 24, 32, 64, 128, 256, 512, 1024, 2048, 4096. 0 means all colours.")
-    parser.add_argument("--extra_mode", type=str, nargs='*', default=None, metavar='MODE', help="Apply special graphics modes. Supported: HAM6, EHB, SHAM.")
+    parser.add_argument("--extra_mode", type=str, nargs='*', default=None, metavar='MODE', help="Apply special graphics modes. Supported: HAM6, EHB, SHAM, DynamicHires.")
     parser.add_argument("--rotate", type=int, nargs='*', default=None, metavar='DEGREE', help="Rotate ground truth images by these angles in degrees before cropping (e.g., 0 90 180 270). 0 is default if none specified.")
     parser.add_argument("--downscale", type=int, nargs='*', default=None, metavar='PERCENT', help="Downscale ground truth images to these percentages of the original size before cropping (e.g., 50 75). Must be > 0 and < 100. 0%% is default if none specified.")
     parser.add_argument("--resolution", type=str, nargs='*', default=['lores'], metavar='STYLE', help=f"Generate outputs with these resolution styles. Supported: {SUPPORTED_RESOLUTION_STYLES}. Default: lores.")

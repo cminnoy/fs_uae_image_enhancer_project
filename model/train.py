@@ -23,9 +23,6 @@ import numpy as np
 from srdataset import SRDataset, gather_all_samples_from_directory
 from gamma import srgb_to_linear_approx, linear_to_srgb_approx
 
-import model_conv3
-import model_conv5
-import model_pix_shuffle
 import model_residual_unet
 
 scaler = GradScaler(device='cuda')
@@ -307,8 +304,8 @@ def train_model(model, train_loader, val_loader,
 # Main Function: Prepare Data and Start Training
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train an image enhancement model.')
-    parser.add_argument('--model_type', type=str, required=True, choices=['conv3', 'conv3_heavy', 'conv5', 'conv5_heavy', 'pix_shuffle', 'pix_shuffle_heavy', 'residual_unet'],
-                        help='Type of model to train: "conv3, conv3_heavy, conv5, conv5_heavy, conv6".')
+    parser.add_argument('--model_type', type=str, required=True, choices=['residual_unet'],
+                        help='Type of model to train: "residual_unet".')
     parser.add_argument('--edge_checkpoint_path', type=str, default=None,
                         help='Path to the trained checkpoint (.pth) to load for combined training.')
     parser.add_argument('--epochs', type=int, default=10, help='Number of epochs to train')
@@ -333,25 +330,7 @@ if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"Selected model type for training: {args.model_type}")
-    if args.model_type == 'conv3':
-        model = model_conv3.get_model('lightweight')
-        print("Using Conv2D model with 3 layers; lightweight.")
-    elif args.model_type == 'conv3_heavy':
-        model = model_conv3.get_model('heavyweight')
-        print("Using Conv2D model with 3 layers; heavyweight.")
-    elif args.model_type == "conv5":
-        model = model_conv5.get_model('lightweight')
-        print("Using Conv2D model with 5 layers; lightweight.")
-    elif args.model_type == "conv5_heavy":
-        model = model_conv5.get_model('heavyweight')
-        print("Using Conv2D model with 5 layers; heavyweight.")
-    elif args.model_type == "pix_shuffle":
-        model = model_pix_shuffle.get_model('lightweight')
-        print("Based on CRN and ESPCN; lightweight.")
-    elif args.model_type == "pix_shuffle_heavy":
-        model = model_pix_shuffle.get_model('heavyweight')
-        print("Based on CRN and ESPCN; heavyweight.")
-    elif args.model_type == "residual_unet":
+    if args.model_type == "residual_unet":
         model = model_residual_unet.get_model('lightweight')
         print("Based on Unet, ResNet, CRN and ESPCN; lightweight.")
     else:
@@ -419,12 +398,12 @@ if __name__ == '__main__':
     # --- Create dataset instances using the split lists ---
     train_dataset = SRDataset(
         sample_pairs_list=train_pool_list,
-        expected_crop_size=expected_crop_size_tuple,
+        train_crop_size=expected_crop_size_tuple,
         num_samples=args.train_samples
     )
     val_dataset = SRDataset(
         sample_pairs_list=val_pool_list,
-        expected_crop_size=expected_crop_size_tuple,
+        train_crop_size=expected_crop_size_tuple,
         num_samples=args.val_samples
     )
 

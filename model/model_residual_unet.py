@@ -287,11 +287,17 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size for benchmarking')
     parser.add_argument('--no_compile', action='store_true', help='Disable torch.compile for debugging.')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose printing for debugging.')
+    parser.add_argument('--save_model', type=str, default=None, help='Path to save the model state_dict.')
 
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = get_model(args.model_type, verbose=args.verbose).to(device).half().eval()
+
+    if args.save_model:
+        print(f"Saving model state_dict to {args.save_model}")
+        torch.save(model, args.save_model)
+        print("Model saved successfully.")
 
     print("Attempting to compile model...")
     if not args.no_compile: # Conditional compilation

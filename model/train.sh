@@ -19,7 +19,7 @@ else
 fi
 
 echo "Stepping on the gras..."
-python train.py --model_type $1 --epochs 1 --batch_size $BATCH_SIZE --learning_rate 0.0004 --generator_train_dir ../dataset_generator/dataset --train_samples 100000 --val_samples 10000 --val_split_ratio 0.1 --crop_size 368 288 --checkpoint_dir $1 --identity_percentage 0.1
+python train.py --model_type $1 --epochs 1 --batch_size $BATCH_SIZE --learning_rate 0.0004 --generator_train_dir ../dataset_generator/dataset --train_samples 100000 --val_samples 10000 --val_split_ratio 0.1 --crop_size 376 288 --checkpoint_dir $1 #--identity_percentage 0.1
 
 ---
 
@@ -35,4 +35,4 @@ if [ $EPOCHS_DIGGING -gt 50 ]; then
 fi
 
 echo "Digging a hole in the landscape..."
-python train.py --model_type $1 --epochs $EPOCHS_DIGGING --batch_size $BATCH_SIZE --accumulation_steps $ACCUMULATION_STEPS --learning_rate 0.0004 --checkpoint_interval 1 --generator_train_dir ../dataset_generator/dataset --train_samples 100000 --val_samples 10000 --val_split_ratio 0.1 --crop_size 368 288 --checkpoint_dir $1 --early_stopping_patience 30 --identity_percentage 0.01
+python train.py --model_type $1 --epochs $EPOCHS_DIGGING --batch_size $BATCH_SIZE --accumulation_steps $ACCUMULATION_STEPS --learning_rate 0.0004 --checkpoint_interval 1 --generator_train_dir ../dataset_generator/dataset --train_samples 100000 --val_samples 10000 --val_split_ratio 0.1 --crop_size 376 288 --checkpoint_dir $1 --early_stopping_patience 30 #--identity_percentage 0.01

@@ -685,7 +685,6 @@ def _map_scanline_to_palette_numba(
             
     return output_scanline_12bit
 
-
 # Insert this main conversion function right after apply_sham_conversion
 def apply_dynamic_hires_conversion(
     image_np: np.ndarray,
@@ -694,20 +693,13 @@ def apply_dynamic_hires_conversion(
 ) -> np.ndarray:
     """
     Converts an image using the Dynamic Hires technique (NewTek-style).
-    A 16-color palette is generated for each scanline, and then the scanline
-    is directly mapped (quantized) to that palette.
-
-    Args:
-        image_np: The input image as a NumPy array (H, W, 3) of type uint8 (RGB888).
-        palette_generator_func: A function (e.g., generate_palette_median_cut)
-                                that takes an image and num_colors and returns a palette.
-        verbose: Verbosity level.
-
-    Returns:
-        The converted image as a NumPy array (H, W, 3) of type uint8 (RGB888).
+    A 16-color palette is generated for each scanline using stable K-Means,
+    and then the scanline is directly mapped (quantized) to that palette.
     """
+    from sklearn.cluster import MiniBatchKMeans
+    
     if verbose > 1:
-        print("Applying Dynamic Hires conversion (Per-scanline 16-color direct map)...")
+        print("Applying Dynamic Hires conversion (Per-scanline 16-color direct map) with stable K-Means...")
     
     h, w, _ = image_np.shape
     # Convert RGB888 to the working 12-bit color space (RGB444) by right-shifting
@@ -715,15 +707,32 @@ def apply_dynamic_hires_conversion(
     output_image_12bit = np.zeros_like(image_12bit)
 
     for y in range(h):
-        # 1. Generate a 16-color base palette for the current scanline (4-bit per channel)
-        # Note: The generator function expects an (H, W, 3) image-like array, so we reshape.
-        scanline_for_palette_gen = image_12bit[y].reshape(1, w, 3)
-        # The palette generator returns an 8-bit array, which is correct for K-Means/etc.
-        # We ensure it's in the 12-bit *value range* [0-15] and type uint8 (as a convention).
-        palette_12bit = palette_generator_func(scanline_for_palette_gen, num_colors=16).astype(np.uint8)
+        # 1. Use the full 8-bit color data of the scanline for stable palette generation.
+        scanline_for_palette_gen_8bit = image_np[y].reshape(-1, 3) # (W, 3)
+
+        # Force use of MiniBatchKMeans for stability and speed, which overrides 
+        # the potential instability of the passed-in palette_generator_func.
+        kmeans = MiniBatchKMeans(
+            n_clusters=16,
+            random_state=42, # Use a fixed seed for max stability and deterministic results
+            batch_size=min(w, 8192),
+            n_init='auto'
+        )
+        # Handle the case where the scanline has fewer than 16 unique colors
+        try:
+            kmeans.fit(scanline_for_palette_gen_8bit)
+            
+            # Quantize the resulting palette centers to the 4-bit per channel range [0-15]
+            palette_centers_8bit = kmeans.cluster_centers_.astype(np.uint8)
+            palette_12bit = (palette_centers_8bit >> 4).astype(np.uint8)
+        except ValueError:
+            # If K-Means fails (e.g., fewer than 16 samples), fall back to a simple palette
+            # This is likely the warning you saw. We fall back to Median Cut on the 12-bit data.
+            palette_12bit_full = palette_generator_func(image_12bit[y].reshape(1, w, 3), num_colors=16)
+            palette_12bit = (palette_12bit_full >> 4).astype(np.uint8) # Ensure it's 4-bit effective range
         
         # 2. Map the current scanline to its per-line 16-color palette
-        scanline_12bit = image_12bit[y] # The target scanline data
+        scanline_12bit = image_12bit[y]
         output_scanline_12bit = np.zeros_like(scanline_12bit)
         
         output_image_12bit[y] = _map_scanline_to_palette_numba(

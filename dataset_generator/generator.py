@@ -254,9 +254,9 @@ def save_single_target_worker(target_spec, crop_w, crop_h, dest_dir, split_sourc
         with Image.open(img_path) as img_pil_full:
             img_pil_full = img_pil_full.convert("RGB")
 
-            # Apply rotation (pre-processing)
+            # Apply rotation for target (pre-processing)
             if rot_deg != 0:
-                rotated_img_pil = apply_rotation(img_pil_full, rot_deg, supersample_factor=2)
+                rotated_img_pil = apply_rotation(img_pil_full, rot_deg, supersample_factor=4, pil_filter=Image.Resampling.BICUBIC)
             else:
                 rotated_img_pil = img_pil_full.copy() # Work on a copy if no rotation
 
@@ -443,7 +443,7 @@ def generate_and_save_styled_worker(styled_spec, crop_w_worker, crop_h_worker, d
             # Apply resolution style (expects PIL, assuming returns PIL)
             # Error 'mode' was previously reported here if the input was wrong.
             try:
-                processed_res_pil = pre_apply_resolution_style(crop_pil, res)
+                processed_res_pil = pre_apply_resolution_style(crop_pil, res, Image.Resampling.NEAREST)
                 if verbose_worker >= 3: print_image_info(processed_res_pil, "Resolution Styling", spec_info_str)
             except Exception as e:
                 # This is a likely spot for the 'mode' error if the input was wrong or the function returned NumPy
@@ -882,7 +882,8 @@ class DatasetGenerator:
                 if mode.upper() == 'HAM6':
                     self.active_style_combinations.add((res, 'RGB444', 'HAM6', 'None'))
                 elif mode.upper() == 'EHB':
-                    self.active_style_combinations.add((res, 'RGB444', 'EHB', 'None'))
+                    # Should check here for other RGB modes
+                    self.active_style_combinations.add((res, 'RGB888', 'EHB', 'None'))
                 elif mode.upper() == 'SHAM':
                     self.active_style_combinations.add((res, 'RGB444', 'SHAM', 'None'))
             if res in ['hires', 'hires_laced']:

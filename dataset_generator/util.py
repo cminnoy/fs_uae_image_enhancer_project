@@ -280,7 +280,7 @@ def apply_resolution_style(image_pil: Image.Image, style: str) -> Image.Image:
 
     return output_pil
 
-def pre_apply_resolution_style(image_pil: Image.Image, style: str) -> Image.Image:
+def pre_apply_resolution_style(image_pil: Image.Image, style: str, pil_filter=Image.Resampling.BICUBIC) -> Image.Image:
     """
     Applies resolution style effects (like pixel simulation or interlacing) to a PIL image.
     The input image is expected to be the size of the target crop (W x H).
@@ -300,15 +300,15 @@ def pre_apply_resolution_style(image_pil: Image.Image, style: str) -> Image.Imag
     if style == 'lores':
         # Simulate 2x2 source pixels mapping to 1 visual pixel (blocky 2x2 pixels).
         # Downscale by 2x2
-        output_pil = output_pil.resize((w // 2, h // 2), Image.Resampling.BICUBIC)
+        output_pil = output_pil.resize((w // 2, h // 2), pil_filter)
     elif style == 'lores_laced':
         # Simulate 2x1 source pixels mapping to 1 visual pixel width (blocky 2x1 pixels) + interlacing.
         # Downscale width by 2
-        output_pil = output_pil.resize((w // 2, h), Image.Resampling.BICUBIC)
+        output_pil = output_pil.resize((w // 2, h), pil_filter)
     elif style == 'hires':
         # Simulate 1x2 source pixels mapping to 1 visual pixel height (blocky 1x2 pixels) + interlacing.
         # Downscale height by 2
-        output_pil = output_pil.resize((w, h // 2), Image.Resampling.BICUBIC)
+        output_pil = output_pil.resize((w, h // 2), pil_filter)
     elif style == 'hires_laced':
         pass
 

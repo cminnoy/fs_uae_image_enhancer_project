@@ -13,12 +13,12 @@ import time
 
 # Importing ONNX symbolic helper and opset11 for custom symbolic functions
 import torch.onnx.symbolic_helper as sym_help
-import torch.onnx.symbolic_opset14 as sym_opset14
+import torch.onnx.symbolic_opset18 as sym_opset18
 from torch.onnx.symbolic_helper import parse_args, _unimplemented
 
 sys.path.append(os.getcwd()) # Ensure current directory is in path for model loading
 
-from model_residual_unet import ResidualUNet
+from model_residual_unet import get_model
 
 class ONNXConverter:
     """
@@ -26,11 +26,13 @@ class ONNXConverter:
     and then modifying the ONNX graph for chunky (HWC) RGBA input/output and
     optimized input data type handling.
     """
-    def __init__(self, pytorch_model_path, output_onnx_path, crop_width=True, use_fp16=True):
+    def __init__(self, pytorch_model_path, output_onnx_path, crop_width=True, use_fp16=True, insert_model=True, apply_gamma=True):
         self.pytorch_model_path = pytorch_model_path
         self.output_onnx_path = output_onnx_path
         self.crop_width = crop_width
         self.use_fp16 = use_fp16
+        self.insert_model = insert_model
+        self.apply_gamma = apply_gamma
         self.model = None
         self.device = None
         self.model_has_pixel_shuffle = False # Flag to detect PixelShuffle
@@ -42,7 +44,22 @@ class ONNXConverter:
         print(f"--- Step 1: Loading PyTorch Model ---")
         print(f"Loading PyTorch model from {self.pytorch_model_path}...")
         try:
-            self.model = torch.load(self.pytorch_model_path, weights_only=False)
+            # Load the full checkpoint dictionary
+            model_checkpoint = torch.load(self.pytorch_model_path, map_location='cpu')
+            
+            # Instantiate the model architecture
+            self.model = get_model("light", False)
+
+            # Check if the checkpoint contains the expected 'model_state_dict' key
+            if "model_state_dict" in model_checkpoint:
+                # Load the model weights from the specific key
+                state_dict_to_load = model_checkpoint["model_state_dict"]
+            else:
+                # If not a checkpoint, assume it's the raw state_dict
+                state_dict_to_load = model_checkpoint
+                
+            # Load the state dictionary into the model
+            self.model.load_state_dict(state_dict_to_load) # Line 38 (was line 37)
             print("PyTorch model loaded successfully.")
         except Exception as e:
             print(f"Error loading PyTorch model from {self.pytorch_model_path}: {e}")
@@ -107,7 +124,6 @@ class ONNXConverter:
         # Use generic names for input/output of the internal PyTorch model
         input_names = ["model_input_rgb_float_planar"]
         output_names = ["model_output_rgb_float_scaled"]
-        dynamic_axes = {}
 
         print("Exporting model to ONNX format in memory...")
         try:
@@ -118,8 +134,8 @@ class ONNXConverter:
                 f, # Export to in-memory buffer
                 input_names=input_names,
                 output_names=output_names,
-                dynamic_axes=dynamic_axes,
-                opset_version=14,
+                dynamo=False,
+                opset_version=18,
                 verbose=False
             )
             print("Model exported successfully to ONNX format in memory!")
@@ -173,20 +189,106 @@ class ONNXConverter:
             print(f"ONNX Output Shape: {onnx_outputs[0].shape}")
             print(f"ONNX Output Type: {onnx_outputs[0].type}")
 
-            print(f"\nRunning a dummy inference with ONNX Runtime on {model_type} model...")
+            print(f"\nRunning a deterministic color-check inference with ONNX Runtime on {model_type} model...")
             try:
-                # Dummy input for modified model (chunky UINT8 RGBA)
-                dummy_input_np = np.random.randint(0, 256, (1, 576, 752, 4), dtype=np.uint8)
+                # Build a deterministic test input depending on model type
+                input_shape = onnx_inputs[0].shape
+                input_type = onnx_inputs[0].type
 
-                ort_inputs = {onnx_inputs[0].name: dummy_input_np}
-                ort_outputs = ort_session.run(None, ort_inputs)
+                # If the model expects UINT8 chunky NHWC (modified model)
+                if onnx_inputs[0].type == 'tensor(uint8)' and len(input_shape) == 4 and input_shape[3] == 4:
+                    test_input_np = np.zeros((1, 576, 752, 4), dtype=np.uint8)
+                    # Place test pixels starting at column 20 to avoid being cropped out by left-crop (16 px)
+                    test_input_np[0, 0, 20] = [255, 0, 0, 255]    # Red
+                    test_input_np[0, 0, 21] = [128, 0, 128, 255]  # Purple
+                    test_input_np[0, 0, 22] = [255, 255, 255, 255]# White
+                    test_input_np[0, 0, 23] = [0, 0, 0, 255]      # Black
 
-                print(f"ONNX Runtime dummy inference successful on {model_type} model.")
-                print(f"ONNX Runtime output numpy array shape: {ort_outputs[0].shape}")
-                print(f"ONNX Runtime output numpy array dtype: {ort_outputs[0].dtype}")
+                else:
+                    # Assume initial model: Float planar NCHW e.g., [1,3,576,736/752]
+                    # Determine width from shape if provided, else default to 752
+                    batch = 1
+                    channels = 3
+                    height = 576
+                    width = 752
+                    try:
+                        if len(input_shape) == 4:
+                            # ONNX shape may contain dims as ints or strings
+                            if isinstance(input_shape[2], int):
+                                height = int(input_shape[2])
+                            if isinstance(input_shape[3], int):
+                                width = int(input_shape[3])
+                    except Exception:
+                        pass
+
+                    dtype_np = np.float16 if 'float16' in onnx_inputs[0].type else np.float32
+                    test_input_np = np.zeros((batch, channels, height, width), dtype=dtype_np)
+                    # Place test pixels at column 20 so cropping (left 16) won't remove them
+                    col = 20
+                    test_input_np[0, 0, 0, col] = 255.0 / 255.0  # R
+                    test_input_np[0, 1, 0, col] = 0.0
+                    test_input_np[0, 2, 0, col] = 0.0
+
+                ort_inputs = {onnx_inputs[0].name: test_input_np}
+
+                # Try to fetch intermediate tensors to locate where channel swap/zeroing happens.
+                intermediate_names = [
+                    'input_rgba_chunky_transposed_planar_uint8',
+                    'input_rgb_uint8_planar_sliced',
+                    'input_rgb_uint8_planar_cropped',
+                    'input_rgb_float_planar',
+                    'input_rgb_float_normalized',
+                    'input_rgb_float_linear'
+                ]
+
+                # Build a list of available fetches that the ONNX Runtime session actually exposes.
+                # ONNX Runtime only accepts names present in session.get_outputs().
+                available_fetches = []
+                try:
+                    session_output_names = set(o.name for o in ort_session.get_outputs())
+                    for name in intermediate_names:
+                        if name in session_output_names:
+                            available_fetches.append(name)
+                except Exception:
+                    available_fetches = []
+
+                # Always include final output
+                fetch_list = available_fetches + [onnx_outputs[0].name]
+
+                try:
+                    fetched = ort_session.run(fetch_list, ort_inputs)
+                    print(f"ONNX Runtime deterministic inference successful on {model_type} model.")
+                    # fetched is a list in the same order as fetch_list
+                    for n, arr in zip(fetch_list, fetched):
+                        try:
+                            print(f"Fetched '{n}': shape={arr.shape}, dtype={arr.dtype}")
+                            # If 4D and likely image-ish, show top-row cols 16..23
+                            if arr.ndim == 4:
+                                if arr.shape[-1] == 4: # NHWC
+                                    print(arr[0, 0, 16:24])
+                                elif arr.shape[1] == 4: # NCHW
+                                    print(np.transpose(arr, (0, 2, 3, 1))[0, 0, 16:24])
+                                elif arr.shape[1] == 3:
+                                    print(np.transpose(arr, (0, 2, 3, 1))[0, 0, 16:24])
+                        except Exception as e4:
+                            print(f"Could not pretty-print '{n}': {e4}")
+                except Exception as e_run:
+                    # Fall back to fetching only the final output
+                    print(f"Could not fetch intermediates: {e_run}. Fetching final output only.")
+                    ort_outputs = ort_session.run(None, ort_inputs)
+                    out = ort_outputs[0]
+                    print(f"Final output shape: {out.shape}, dtype: {out.dtype}")
+                    try:
+                        if out.ndim == 4 and out.shape[1] == 4:
+                            print(out[0, 0, 16:24])
+                        elif out.ndim == 4 and out.shape[1] == 3:
+                            out_nhwc = np.transpose(out, (0, 2, 3, 1))
+                            print(out_nhwc[0, 0, 16:24])
+                    except Exception as e5:
+                        print(f'Could not display final output pixels: {e5}')
 
             except Exception as e:
-                print(f"Error during ONNX Runtime dummy inference on {model_type} model: {e}")
+                print(f"Error during ONNX Runtime deterministic inference on {model_type} model: {e}")
 
         except ImportError:
             print("\nONNX Runtime not found. Install it (`pip install onnxruntime onnxruntime-rocm` for ROCm) to verify the ONNX model.")
@@ -203,6 +305,12 @@ class ONNXConverter:
         with optimizations for alpha channel handling and avoiding redundant resize.
         """
         graph = model.graph
+        # Capture original graph nodes & output name so we can optionally bypass the model
+        original_graph_nodes = list(graph.node)
+        if len(graph.output) >= 1:
+            original_model_output_name = graph.output[0].name
+        else:
+            original_model_output_name = None
         print("\n--- Step 3: Starting ONNX graph modification for chunky input/output ---")
 
         # --- STEP 3a: Modify the INPUT to accept chunky RGBA ([1, H, W, 4]) and preprocess ---
@@ -256,9 +364,67 @@ class ONNXConverter:
 
         # 2. Create a Transpose node: [N, H, W, C] (uint8) → [N, C, H, W] (uint8)
         transposed_input_name_uint8 = f"{new_external_input_name}_transposed_planar_uint8"
+        # If cropping is requested, perform the width crop on the chunky NHWC input
+        # before transposing. This avoids slicing width in NCHW and potential issues.
+        if self.crop_width:
+            cropped_chunky_input_name = f"{new_external_input_name}_chunky_cropped"
+
+            crop_chunky_starts_name = "crop_chunky_starts_constant"
+            crop_chunky_starts_node = onnx.helper.make_node(
+                "Constant",
+                inputs=[],
+                outputs=[crop_chunky_starts_name],
+                name="Constant_CropChunkyStarts",
+                value=onnx.helper.make_tensor(
+                    name="starts",
+                    data_type=onnx.TensorProto.DataType.INT64,
+                    dims=[1],
+                    vals=[16] # Crop 16 pixels from left (width axis in NHWC is axis=2)
+                )
+            )
+
+            crop_chunky_ends_name = "crop_chunky_ends_constant"
+            crop_chunky_ends_node = onnx.helper.make_node(
+                "Constant",
+                inputs=[],
+                outputs=[crop_chunky_ends_name],
+                name="Constant_CropChunkyEnds",
+                value=onnx.helper.make_tensor(
+                    name="ends",
+                    data_type=onnx.TensorProto.DataType.INT64,
+                    dims=[1],
+                    vals=[752]
+                )
+            )
+
+            crop_chunky_axes_name = "crop_chunky_axes_constant"
+            crop_chunky_axes_node = onnx.helper.make_node(
+                "Constant",
+                inputs=[],
+                outputs=[crop_chunky_axes_name],
+                name="Constant_CropChunkyAxes",
+                value=onnx.helper.make_tensor(
+                    name="axes",
+                    data_type=onnx.TensorProto.DataType.INT64,
+                    dims=[1],
+                    vals=[2] # Width axis in NHWC
+                )
+            )
+
+            crop_chunky_node = onnx.helper.make_node(
+                "Slice",
+                inputs=[new_external_input_name, crop_chunky_starts_name, crop_chunky_ends_name, crop_chunky_axes_name],
+                outputs=[cropped_chunky_input_name],
+                name="Slice_Crop_Chunky_Left_16_Pixels"
+            )
+
+            transpose_input_source = cropped_chunky_input_name
+        else:
+            transpose_input_source = new_external_input_name
+
         transpose_input_node = onnx.helper.make_node(
             "Transpose",
-            inputs=[new_external_input_name],
+            inputs=[transpose_input_source],
             outputs=[transposed_input_name_uint8],
             name="Transpose_Chunky_to_Planar_Uint8",
             perm=[0, 3, 1, 2] # Swaps last two dims with channel dim
@@ -319,67 +485,14 @@ class ONNXConverter:
             name="Slice_RGBA_to_RGB_Uint8"
         )
         
-        # Conditional Cropping Logic (Line 368)
+        # Conditional Cropping Logic: cropping is now performed pre-transpose on the chunky NHWC input
+        # to avoid slicing width in NCHW which caused tensor name mismatches. Keep the current
+        # NCHW RGB input name as the sliced result, but set cropped width for downstream shapes.
         current_rgb_input_name_uint8 = sliced_rgb_input_name_uint8
-        if self.crop_width: # Line 370
-            # Slice 16 pixels from the left of the image (width dimension)
-            cropped_width = 736 # Target width for the model: 736
-
-            crop_starts_constant_name = "crop_starts_constant"
-            crop_starts_node = onnx.helper.make_node(
-                "Constant",
-                inputs=[],
-                outputs=[crop_starts_constant_name],
-                name="Constant_CropStarts",
-                value=onnx.helper.make_tensor(
-                    name="starts",
-                    data_type=onnx.TensorProto.DataType.INT64,
-                    dims=[1],
-                    vals=[16] # Start cropping from x=16
-                )
-            )
-
-            crop_ends_constant_name = "crop_ends_constant"
-            crop_ends_node = onnx.helper.make_node(
-                "Constant",
-                inputs=[],
-                outputs=[crop_ends_constant_name],
-                name="Constant_CropEnds",
-                value=onnx.helper.make_tensor(
-                    name="ends",
-                    data_type=onnx.TensorProto.DataType.INT64,
-                    dims=[1],
-                    vals=[752] # End cropping at x=752 (exclusive, effectively takes up to 751)
-                )
-            )
-
-            crop_axes_constant_name = "crop_axes_constant"
-            crop_axes_node = onnx.helper.make_node(
-                "Constant",
-                inputs=[],
-                outputs=[crop_axes_constant_name],
-                name="Constant_CropAxes",
-                value=onnx.helper.make_tensor(
-                    name="axes",
-                    data_type=onnx.TensorProto.DataType.INT64,
-                    dims=[1],
-                    vals=[3] # Width dimension in NCHW
-                )
-            )
-
-            cropped_rgb_input_name_uint8 = "input_rgb_uint8_planar_cropped"
-            crop_node = onnx.helper.make_node(
-                "Slice",
-                inputs=[sliced_rgb_input_name_uint8, # Input is 3-channel UINT8 from previous slice
-                        crop_starts_constant_name,
-                        crop_ends_constant_name,
-                        crop_axes_constant_name],
-                outputs=[cropped_rgb_input_name_uint8], # Output is 3-channel UINT8 with width 736
-                name="Slice_Crop_Left_16_Pixels"
-            )
-            print(f"Added Slice node to crop 16 pixels from the left of the input image (width from 752 to {cropped_width}).")
-            current_rgb_input_name_uint8 = cropped_rgb_input_name_uint8 # Update name
-        else: # Line 425
+        if self.crop_width:
+            cropped_width = 736 # Target width for the model: 736 (pre-transpose crop handled earlier)
+            print(f"Input will be cropped before transpose; using cropped width {cropped_width}.")
+        else:
             print("Skipping input cropping as requested. Input width remains 752.")
             cropped_width = 752 # If no crop, width is original 752
 
@@ -417,27 +530,31 @@ class ONNXConverter:
         )
         
         # 6. sRGB to Linear Gamma Correction (Pow(x, 2.2), operates on 3 channels, potentially cropped width)
-        gamma_srgb_to_linear_exp_name = "gamma_srgb_to_linear_exponent"
-        gamma_srgb_to_linear_exp_node = onnx.helper.make_node(
-            "Constant",
-            inputs=[],
-            outputs=[gamma_srgb_to_linear_exp_name],
-            name="Constant_GammaSRGBtoLinearExp",
-            value=onnx.helper.make_tensor(
-                name="gamma_exp",
-                data_type=internal_data_type, # Use determined internal data type
-                dims=[],
-                vals=[np_internal_data_type(2.2).item()] # sRGB to Linear exponent
+        if self.apply_gamma:
+            gamma_srgb_to_linear_exp_name = "gamma_srgb_to_linear_exponent_in"
+            gamma_srgb_to_linear_exp_node = onnx.helper.make_node(
+                "Constant",
+                inputs=[],
+                outputs=[gamma_srgb_to_linear_exp_name],
+                name="Constant_GammaSRGBtoLinearExp_in",
+                value=onnx.helper.make_tensor(
+                    name="gamma_exp_in",
+                    data_type=internal_data_type, # Use determined internal data type
+                    dims=[],
+                    vals=[np_internal_data_type(2.2).item()] # sRGB to Linear exponent
+                )
             )
-        )
-        
-        linear_rgb_input_name = "input_rgb_float_linear"
-        srgb_to_linear_node = onnx.helper.make_node(
-            "Pow",
-            inputs=[normalized_rgb_input_name, gamma_srgb_to_linear_exp_name], # Input is 3-channel FloatX, potentially cropped
-            outputs=[linear_rgb_input_name], # Output is 3-channel FloatX, potentially cropped
-            name="SRGB_to_Linear_Gamma"
-        )
+
+            linear_rgb_input_name = "input_rgb_float_linear"
+            srgb_to_linear_node = onnx.helper.make_node(
+                "Pow",
+                inputs=[normalized_rgb_input_name, gamma_srgb_to_linear_exp_name], # Input is 3-channel FloatX, potentially cropped
+                outputs=[linear_rgb_input_name], # Output is 3-channel FloatX, potentially cropped
+                name="SRGB_to_Linear_Gamma_in"
+            )
+        else:
+            # Skip gamma conversion: use normalized values as 'linear' directly
+            linear_rgb_input_name = normalized_rgb_input_name
 
         # IMPORTANT CHANGE: Iterate through all nodes to redirect any reference to the original input.
         # This handles skip connections where the original input might be used later in the graph.
@@ -478,13 +595,19 @@ class ONNXConverter:
         # 7. Pow
         
         insert_idx = 0
+        if self.crop_width:
+            graph.node.insert(insert_idx, crop_chunky_starts_node); insert_idx += 1
+            graph.node.insert(insert_idx, crop_chunky_ends_node); insert_idx += 1
+            graph.node.insert(insert_idx, crop_chunky_axes_node); insert_idx += 1
+            graph.node.insert(insert_idx, crop_chunky_node); insert_idx += 1
         graph.node.insert(insert_idx, transpose_input_node); insert_idx += 1
         graph.node.insert(insert_idx, slice_starts_node); insert_idx += 1
         graph.node.insert(insert_idx, slice_ends_node); insert_idx += 1
         graph.node.insert(insert_idx, slice_axes_node); insert_idx += 1
         graph.node.insert(insert_idx, slice_rgb_node); insert_idx += 1
 
-        if self.crop_width:
+        # If crop was handled pre-transpose, don't insert the older post-transpose crop nodes
+        if self.crop_width and False:
             graph.node.insert(insert_idx, crop_starts_node); insert_idx += 1
             graph.node.insert(insert_idx, crop_ends_node); insert_idx += 1
             graph.node.insert(insert_idx, crop_axes_node); insert_idx += 1
@@ -493,26 +616,45 @@ class ONNXConverter:
         graph.node.insert(insert_idx, cast_to_float_node); insert_idx += 1
         graph.node.insert(insert_idx, div_by_255_constant_node); insert_idx += 1
         graph.node.insert(insert_idx, div_node); insert_idx += 1
-        graph.node.insert(insert_idx, gamma_srgb_to_linear_exp_node); insert_idx += 1
-        graph.node.insert(insert_idx, srgb_to_linear_node); insert_idx += 1
+        if self.apply_gamma:
+            # Insert gamma constant BEFORE the Pow node so the Pow's input
+            # comes from an existing node output (topological order).
+            graph.node.insert(insert_idx, gamma_srgb_to_linear_exp_node); insert_idx += 1
+            graph.node.insert(insert_idx, srgb_to_linear_node); insert_idx += 1
+        else:
+            # No gamma nodes to insert
+            pass
+
+        # If requested, bypass inserting the original model: remove original model nodes
+        # and insert an Identity node that maps `linear_rgb_input_name` -> original model output name.
+        if not self.insert_model:
+            # Remove original model nodes to avoid executing them
+            for n in original_graph_nodes:
+                try:
+                    graph.node.remove(n)
+                except ValueError:
+                    pass
+
+            bypass_output_name = original_model_output_name or 'model_output_rgb_float_scaled'
+            identity_node = onnx.helper.make_node(
+                "Identity",
+                inputs=[linear_rgb_input_name],
+                outputs=[bypass_output_name],
+                name="Bypass_Model_Identity"
+            )
+            graph.node.insert(insert_idx, identity_node); insert_idx += 1
 
         # Add ValueInfo for the intermediate tensors (for graph validation/inspection)
         graph.value_info.append(onnx.helper.make_tensor_value_info(
             transposed_input_name_uint8,
             onnx.TensorProto.DataType.UINT8,
-            [batch_dim, 4, height_dim, 752] # 4 channels, original width
+            [batch_dim, 4, height_dim, cropped_width] # 4 channels, width depends on cropping
         ))
         graph.value_info.append(onnx.helper.make_tensor_value_info(
             sliced_rgb_input_name_uint8, 
             onnx.TensorProto.DataType.UINT8,
-            [batch_dim, 3, height_dim, 752] # Sliced to 3 channels (UINT8), original width
+            [batch_dim, 3, height_dim, cropped_width] # Sliced to 3 channels (UINT8), width depends on cropping
         ))
-        if self.crop_width:
-            graph.value_info.append(onnx.helper.make_tensor_value_info(
-                cropped_rgb_input_name_uint8, 
-                onnx.TensorProto.DataType.UINT8,
-                [batch_dim, 3, height_dim, cropped_width] # Cropped to 736 width
-            ))
         graph.value_info.append(onnx.helper.make_tensor_value_info(
             cast_to_float_input_name,
             internal_data_type,
@@ -566,27 +708,31 @@ class ONNXConverter:
         graph.output.remove(orig_output)
 
         # 1. Linear to sRGB Gamma Correction (Pow(x, 1/2.2), operates on 3 channels, potentially cropped width)
-        gamma_linear_to_srgb_exp_name = "gamma_linear_to_srgb_exponent"
-        gamma_linear_to_srgb_exp_node = onnx.helper.make_node(
-            "Constant",
-            inputs=[],
-            outputs=[gamma_linear_to_srgb_exp_name],
-            name="Constant_GammaLinearToSRGBExp",
-            value=onnx.helper.make_tensor(
-                name="gamma_exp",
-                data_type=internal_data_type,
-                dims=[],
-                vals=[np_internal_data_type(1.0/2.2).item()] # Linear to sRGB exponent
+        if self.apply_gamma:
+            gamma_linear_to_srgb_exp_name = "gamma_linear_to_srgb_exponent"
+            gamma_linear_to_srgb_exp_node = onnx.helper.make_node(
+                "Constant",
+                inputs=[],
+                outputs=[gamma_linear_to_srgb_exp_name],
+                name="Constant_GammaLinearToSRGBExp",
+                value=onnx.helper.make_tensor(
+                    name="gamma_exp",
+                    data_type=internal_data_type,
+                    dims=[],
+                    vals=[np_internal_data_type(1.0/2.2).item()] # Linear to sRGB exponent
+                )
             )
-        )
 
-        srgb_output_name_float = "output_rgb_float_srgb" # Still RGB, potentially cropped width
-        linear_to_srgb_node = onnx.helper.make_node(
-            "Pow",
-            inputs=[orig_output_name, gamma_linear_to_srgb_exp_name], # Orig output is linear [0,1], potentially cropped width
-            outputs=[srgb_output_name_float],
-            name="Linear_to_SRGB_Gamma"
-        )
+            srgb_output_name_float = "output_rgb_float_srgb" # Still RGB, potentially cropped width
+            linear_to_srgb_node = onnx.helper.make_node(
+                "Pow",
+                inputs=[orig_output_name, gamma_linear_to_srgb_exp_name], # Orig output is linear [0,1], potentially cropped width
+                outputs=[srgb_output_name_float],
+                name="Linear_to_SRGB_Gamma"
+            )
+        else:
+            # Skip gamma: interpret model output as already sRGB
+            srgb_output_name_float = orig_output_name
 
         # 2. Denormalization (Mul by 255.0, operates on 3 channels, potentially cropped width)
         denorm_255_constant_name = "denormalization_255_constant"
@@ -670,16 +816,34 @@ class ONNXConverter:
 
         # Constant Alpha Channel: [N, A, H, W] = [1, 1, 576, W] filled with 255 (UINT8)
         alpha_channel_constant_name = "alpha_channel_constant"
-        alpha_channel_node = onnx.helper.make_node(
+
+        # Shape: [N, 1, H, W]
+        alpha_shape_name = "alpha_channel_shape"
+        alpha_shape_node = onnx.helper.make_node(
             "Constant",
             inputs=[],
-            outputs=[alpha_channel_constant_name],
-            name="Constant_AlphaChannel_255",
+            outputs=[alpha_shape_name],
+            name="Constant_AlphaShape",
             value=onnx.helper.make_tensor(
-                name="alpha_channel_value",
+                name="alpha_shape",
+                data_type=onnx.TensorProto.DataType.INT64,
+                dims=[4],
+                vals=[batch_o, 1, height_o, cropped_width]
+            )
+        )
+
+        # Create an alpha channel filled with 255 (opaque) using ConstantOfShape
+        # This avoids creating zeros then multiplying by 255 (which yields zeros).
+        alpha_channel_constant_node = onnx.helper.make_node(
+            "ConstantOfShape",
+            inputs=[alpha_shape_name],
+            outputs=[alpha_channel_constant_name],
+            name="ConstantOfShape_Alpha255",
+            value=onnx.helper.make_tensor(
+                name="alpha_fill_value",
                 data_type=onnx.TensorProto.DataType.UINT8,
-                dims=[batch_o, 1, height_o, cropped_width], # Use the model's actual output width (736 or 752)
-                vals=[255] * (batch_o * 1 * height_o * cropped_width)
+                dims=[1],
+                vals=[255]
             )
         )
 
@@ -697,7 +861,11 @@ class ONNXConverter:
         # --- 2. Width Padding (Left 16 black pixels) using Concat (Axis=3) ---
         
         current_output_name_for_transpose = rgba_output_name_unpadded_width # Default if no width padding
-        new_output_nodes_after_cast = [alpha_channel_node, concat_rgba_node]
+        new_output_nodes_after_cast = [
+            alpha_shape_node,
+            alpha_channel_constant_node,
+            concat_rgba_node
+        ]
         
         if self.crop_width:
             # Constant Black Pad: [N, C, H, W] = [1, 4, 576, 16] filled with [0,0,0,255]
@@ -750,16 +918,12 @@ class ONNXConverter:
             perm=[0, 2, 3, 1]
         )
 
-        graph.node.extend([
-            gamma_linear_to_srgb_exp_node,
-            linear_to_srgb_node,          
-            denorm_255_constant_node,     
-            denormalize_node,             
-            clip_min_node,
-            clip_max_node,
-            clip_node,
-            cast_node
-        ])
+        # Append output conversion nodes; include gamma nodes only if enabled
+        out_nodes = []
+        if self.apply_gamma:
+            out_nodes.extend([gamma_linear_to_srgb_exp_node, linear_to_srgb_node])
+        out_nodes.extend([denorm_255_constant_node, denormalize_node, clip_min_node, clip_max_node, clip_node, cast_node])
+        graph.node.extend(out_nodes)
         
         # Insert the new Concat-based padding nodes
         graph.node.extend(new_output_nodes_after_cast) 
@@ -849,6 +1013,18 @@ def main():
         default=True,
         help="Whether to convert the model to FP16 precision during export and use FP16 for internal graph operations. Default: True"
     )
+    parser.add_argument(
+        "--insert_model",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether to include the actual model nodes in the exported ONNX graph. Set --no-insert-model to bypass model execution and use identity passthrough. Default: True"
+    )
+    parser.add_argument(
+        "--apply_gamma",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether to apply sRGB<->linear gamma conversion in the ONNX preprocessing/postprocessing. Default: True"
+    )
 
     args = parser.parse_args()
 
@@ -856,7 +1032,9 @@ def main():
         pytorch_model_path=args.pytorch_path,
         output_onnx_path=args.onnx_path,
         crop_width=args.crop_width,
-        use_fp16=args.use_fp16
+        use_fp16=args.use_fp16,
+        insert_model=args.insert_model,
+        apply_gamma=args.apply_gamma
     )
 
     # Step 1: Load PyTorch model and export to initial ONNX in memory

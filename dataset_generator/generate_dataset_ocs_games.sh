@@ -1,9 +1,9 @@
 #!/bin/bash
 python generator.py \
     --train_images dataset/groundtruth_train \
-    --train_num_crops 20 \
+    --train_num_crops 10000 \
     --destination_dir dataset/dataset_train_ocs_games \
-    --max_workers 24 \
+    --max_workers 16 \
     --rgb 444 \
     --crop_size 376 288 \
     --rotate 0 1 2 3 4 5 6 7 8 9 10 \

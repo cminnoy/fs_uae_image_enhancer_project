@@ -7,32 +7,48 @@ if [ -z "$1" ]; then
     exit 1
 fi
 
-EPOCHS_DIGGING=${2:-16}
+MODEL_TYPE="$1"
+EPOCHS_DIGGING="${2:-16}"
 
-# 2. Set initial batch size and accumulation steps based on model type
-if [ "$1" = "large" ]; then
-    BATCH_SIZE=16
-    ACCUMULATION_STEPS=4
+# 2. Set initial batch size based on model type
+if [ "$MODEL_TYPE" = "light" ]; then
+    BATCH_SIZE=48
 else
-    BATCH_SIZE=30
-    ACCUMULATION_STEPS=2
+    BATCH_SIZE=64
 fi
 
-echo "Stepping on the gras..."
-python train.py --model_type $1 --epochs 1 --batch_size $BATCH_SIZE --learning_rate 0.0004 --generator_train_dir ../dataset_generator/dataset --train_samples 100000 --val_samples 10000 --val_split_ratio 0.1 --crop_size 376 288 --checkpoint_dir $1 #--identity_percentage 0.1
+DATASET="../dataset_generator/dataset/dataset_train_ocs_games"
+CHECKPOINT="$MODEL_TYPE/best_model.pth"
 
----
-
-# 3. Apply new rule for "Digging" phase
-# If epochs is more than 50, set accumulation to 1 and keep batchsize to 30.
-if [ $EPOCHS_DIGGING -gt 50 ]; then
-    # When this condition is met, BATCH_SIZE must be 30 and ACCUMULATION_STEPS must be 1.
-    # The 'else' branch of the initial check already sets BATCH_SIZE=30, 
-    # but we must ensure it's 30 and override ACCUMULATION_STEPS.
-    BATCH_SIZE=30 
-    ACCUMULATION_STEPS=1
-    echo "INFO: Epochs ($EPOCHS_DIGGING) > 50. Overriding BATCH_SIZE to $BATCH_SIZE and ACCUMULATION_STEPS to $ACCUMULATION_STEPS for 'Digging' phase."
+# --------------------------------------------------
+# Step 1: "Stepping on the grass" (ONLY if no checkpoint exists)
+# --------------------------------------------------
+if [[ ! -f "$CHECKPOINT" ]]; then
+    echo "No existing checkpoint found. Performing initial training step..."
+    torchrun --nproc_per_node 1 train.py \
+        --model_type "$MODEL_TYPE" \
+        --epochs 1 \
+        --batch_size "$BATCH_SIZE" \
+        --learning_rate 0.0004 \
+        --data_dir "$DATASET" \
+        --samples_per_epoch 5000 \
+        --checkpoint_dir "$MODEL_TYPE" \
+        --num_workers 8
+else
+    echo "Checkpoint exists ($CHECKPOINT). Skipping initial training step."
 fi
 
-echo "Digging a hole in the landscape..."
-python train.py --model_type $1 --epochs $EPOCHS_DIGGING --batch_size $BATCH_SIZE --accumulation_steps $ACCUMULATION_STEPS --learning_rate 0.0004 --checkpoint_interval 1 --generator_train_dir ../dataset_generator/dataset --train_samples 100000 --val_samples 10000 --val_split_ratio 0.1 --crop_size 376 288 --checkpoint_dir $1 --early_stopping_patience 30 #--identity_percentage 0.01
+# --------------------------------------------------
+# Step 2: "Digging a hole in the landscape" (always runs)
+# --------------------------------------------------
+torchrun --nproc_per_node 2 train.py \
+    --load_checkpoint "$CHECKPOINT" \
+    --model_type "$MODEL_TYPE" \
+    --epochs "$EPOCHS_DIGGING" \
+    --batch_size "$BATCH_SIZE" \
+    --learning_rate 0.0004 \
+    --data_dir "$DATASET" \
+    --samples_per_epoch 20000 \
+    --checkpoint_dir "$MODEL_TYPE" \
+    --num_workers 8
+echo "Training completed."

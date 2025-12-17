@@ -26,13 +26,14 @@ class ONNXConverter:
     and then modifying the ONNX graph for chunky (HWC) RGBA input/output and
     optimized input data type handling.
     """
-    def __init__(self, pytorch_model_path, output_onnx_path, crop_width=True, use_fp16=True, insert_model=True, apply_gamma=True):
+    def __init__(self, pytorch_model_path, output_onnx_path, model_type, crop_width=True, use_fp16=True, insert_model=True, apply_gamma=True):
         self.pytorch_model_path = pytorch_model_path
         self.output_onnx_path = output_onnx_path
         self.crop_width = crop_width
         self.use_fp16 = use_fp16
         self.insert_model = insert_model
         self.apply_gamma = apply_gamma
+        self.model_type = model_type
         self.model = None
         self.device = None
         self.model_has_pixel_shuffle = False # Flag to detect PixelShuffle
@@ -48,7 +49,7 @@ class ONNXConverter:
             model_checkpoint = torch.load(self.pytorch_model_path, map_location='cpu')
             
             # Instantiate the model architecture
-            self.model = get_model("light", False)
+            self.model = get_model(self.model_type, False)
 
             # Check if the checkpoint contains the expected 'model_state_dict' key
             if "model_state_dict" in model_checkpoint:
@@ -1025,62 +1026,34 @@ def main():
         default=True,
         help="Whether to apply sRGB<->linear gamma conversion in the ONNX preprocessing/postprocessing. Default: True"
     )
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        default="light",
+        choices=["light", "heavy"],
+        help="Type of the model architecture (e.g., 'light', 'heavy')."
+    )
 
     args = parser.parse_args()
 
     converter = ONNXConverter(
         pytorch_model_path=args.pytorch_path,
         output_onnx_path=args.onnx_path,
+        model_type=args.model_type,
         crop_width=args.crop_width,
         use_fp16=args.use_fp16,
         insert_model=args.insert_model,
         apply_gamma=args.apply_gamma
     )
 
-    # Step 1: Load PyTorch model and export to initial ONNX in memory
+    # Load PyTorch model and export to initial ONNX in memory
     converter.load_pytorch_model()
     intermediate_onnx_model = converter.export_to_onnx_in_memory()
 
-    # Step 2: Modify the ONNX graph for chunky input/output (in memory)
+    # Modify the ONNX graph for chunky input/output (in memory)
     modified_onnx_model = converter.modify_onnx_graph_for_chunky(intermediate_onnx_model)
 
-    # Step 3: Adapt Resize node for bilinear downsampling
-    # print("\n--- Step 3: Adapting Resize node for bilinear downsampling ---")
-    # for node in modified_onnx_model.graph.node:
-    #     if node.op_type == "Resize":
-    #         new_attributes = []
-    #         found_coordinate_transformation_mode = False
-
-    #         for attr in node.attribute:
-    #             if attr.name == "coordinate_transformation_mode":
-    #                 current_mode = attr.s.decode('utf-8')
-    #                 if current_mode == "half_pixel":
-    #                     # Create a new attribute with the desired value "asymmetric"
-    #                     new_attributes.append(onnx.helper.make_attribute("coordinate_transformation_mode", "asymmetric"))
-    #                     print(f"  Changed coordinate_transformation_mode from '{current_mode}' to 'asymmetric' for Resize node: {node.name}")
-    #                 else:
-    #                     # Keep other coordinate_transformation_mode values as is
-    #                     new_attributes.append(attr)
-    #                 found_coordinate_transformation_mode = True
-    #             elif attr.name == "cubic_coeff_a" or attr.name == "nearest_mode":
-    #                 # These are irrelevant for 'linear' mode, so skip them
-    #                 print(f"  Removing irrelevant attribute '{attr.name}' from Resize node: {node.name}")
-    #             else:
-    #                 # Keep all other attributes
-    #                 new_attributes.append(attr)
-
-    #         if not found_coordinate_transformation_mode:
-    #             # If coordinate_transformation_mode was not found (unlikely for Resize in opset 13), add 'asymmetric' as default
-    #             new_attributes.append(onnx.helper.make_attribute("coordinate_transformation_mode", "asymmetric"))
-    #             print(f"  Added coordinate_transformation_mode 'asymmetric' to Resize node: {node.name} (was not explicitly set before).")
-
-    #         # Replace the node's attributes with the new list
-    #         # This is the crucial part to avoid TypeError: does not support assignment
-    #         del node.attribute[:] # Clear all existing attributes
-    #         node.attribute.extend(new_attributes) # Add the new list of attributes
-    #         print(f"  Finished attribute modification for Resize node: {node.name}")
-
-    # Step 4: Simplify the ONNX model (including constant folding)
+    # Simplify the ONNX model (including constant folding)
     print("\nAttempting to simplify the ONNX model (including constant folding) ---\n")
     try:
         import onnxsim

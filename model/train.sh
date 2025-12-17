@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# 1. Input Check
+# Input Check
 if [ -z "$1" ]; then
     echo "Error: No model type specified."
     echo "Usage: $0 <model_type> [epochs_for_digging]"
@@ -10,18 +10,20 @@ fi
 MODEL_TYPE="$1"
 EPOCHS_DIGGING="${2:-16}"
 
-# 2. Set initial batch size based on model type
+# Set initial batch size based on model type
 if [ "$MODEL_TYPE" = "light" ]; then
-    BATCH_SIZE=48
+    BATCH_SIZE=64
+    echo "Using LIGHT model with batch size $BATCH_SIZE"
 else
-    BATCH_SIZE=32
+    BATCH_SIZE=48
+    echo "Using FULL model with batch size $BATCH_SIZE"
 fi
 
 DATASET="../dataset_generator/dataset/dataset_train_ocs_games"
 CHECKPOINT="$MODEL_TYPE/best_model.pth"
 
 # --------------------------------------------------
-# Step 1: "Stepping on the grass" (ONLY if no checkpoint exists)
+# Phase 1: "Stepping on the grass" (ONLY if no checkpoint exists)
 # --------------------------------------------------
 if [[ ! -f "$CHECKPOINT" ]]; then
     echo "No existing checkpoint found. Performing initial training step..."
@@ -34,13 +36,14 @@ if [[ ! -f "$CHECKPOINT" ]]; then
         --shuffle_data \
         --samples_per_epoch 5000 \
         --checkpoint_dir "$MODEL_TYPE" \
-        --num_workers 8
+        --num_workers 8 \
+        --use_amp
 else
     echo "Checkpoint exists ($CHECKPOINT). Skipping initial training step."
 fi
 
 # --------------------------------------------------
-# Step 2: "Digging a hole in the landscape" (always runs)
+# Phase 2: "Digging a hole in the landscape" (always runs)
 # --------------------------------------------------
 torchrun --nproc_per_node 2 train.py \
     --load_checkpoint "$CHECKPOINT" \
@@ -52,5 +55,5 @@ torchrun --nproc_per_node 2 train.py \
     --samples_per_epoch 20000 \
     --checkpoint_dir "$MODEL_TYPE" \
     --num_workers 8 \
-    --print_model_layers
+    --use_amp
 

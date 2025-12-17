@@ -152,10 +152,10 @@ class Trainer:
         )
         self.val_dataloader = DataLoader(
             self.val_dataset,
-            batch_size=self.args.batch_size,
+            batch_size=16,  # Fixed smaller batch size for validation
             shuffle=False,
             num_workers=self.args.num_workers,
-            pin_memory=True,
+            pin_memory=False,
             drop_last=False,
             sampler=self.val_sampler
         )
@@ -167,7 +167,7 @@ class Trainer:
         if self.is_master and self.args.print_model_layers:
             print(self.model)
         
-        self.optimizer = optim.Adam(
+        self.optimizer = optim.Adam(  # TODO change to AdamW
             self.model.parameters(), 
             lr=self.args.learning_rate, 
             betas=(self.args.adam_beta1, self.args.adam_beta2)

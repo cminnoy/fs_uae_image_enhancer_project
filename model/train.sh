@@ -12,10 +12,10 @@ EPOCHS_DIGGING="${2:-16}"
 
 # Set initial batch size based on model type
 if [ "$MODEL_TYPE" = "light" ]; then
-    BATCH_SIZE=64
+    BATCH_SIZE=128
     echo "Using LIGHT model with batch size $BATCH_SIZE"
 else
-    BATCH_SIZE=48
+    BATCH_SIZE=64
     echo "Using FULL model with batch size $BATCH_SIZE"
 fi
 
@@ -34,7 +34,7 @@ if [[ ! -f "$CHECKPOINT" ]]; then
         --learning_rate 0.0004 \
         --data_dir "$DATASET" \
         --shuffle_data \
-        --samples_per_epoch 5000 \
+        --samples_per_epoch 3300 \
         --checkpoint_dir "$MODEL_TYPE" \
         --num_workers 8 \
         --use_amp
@@ -52,8 +52,8 @@ torchrun --nproc_per_node 2 train.py \
     --batch_size "$BATCH_SIZE" \
     --learning_rate 0.0004 \
     --data_dir "$DATASET" \
-    --samples_per_epoch 20000 \
+    --samples_per_epoch 33000 \
     --checkpoint_dir "$MODEL_TYPE" \
-    --num_workers 8 \
+    --num_workers 12 \
     --use_amp
 

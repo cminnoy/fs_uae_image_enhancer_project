@@ -4,9 +4,7 @@ import argparse
 import torch
 from torch import nn
 import torch.nn.functional as F
-from residual_feature_block import ResidualFeatureBlock
-from activations import get_activation
-from loss_vgg import PerceptualLoss, charbonnier_loss
+from loss_vgg import PerceptualLoss
 
 # Residual U-Net with Multi-Path Residual Feature Blocks
 #
@@ -58,13 +56,13 @@ from loss_vgg import PerceptualLoss, charbonnier_loss
 # - DynamicHires (16 color palette per scanline) for Amiga hires and hires interlace
 
 class SqueezeExcite(nn.Module):
-    def __init__(self, channels, reduction=16):
+    def __init__(self, channels, reduction=8):
         super().__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Sequential(
-            nn.Linear(channels, channels // reduction, bias=False),
-            nn.ReLU(inplace=False),
-            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Linear(channels, max(channels // reduction, 4), bias=False),
+            nn.ReLU(inplace=True), # Optimized: ReLU is faster
+            nn.Linear(max(channels // reduction, 4), channels, bias=False),
             nn.Sigmoid()
         )
 
@@ -74,11 +72,41 @@ class SqueezeExcite(nn.Module):
         y = self.fc(y).view(b, c, 1, 1)
         return x * y.expand_as(x)
 
+class ResidualBlock(nn.Module):
+    """
+    Standard Residual Block (Conv-ReLU-Conv).
+    Lightweight replacement for SEResidualBlock to boost FPS.
+    """
+    def __init__(self, in_channels, mid_channels, out_channels, kernel_size=3):
+        super().__init__()
+        
+        self.conv1 = nn.Conv2d(in_channels, mid_channels, kernel_size, padding=kernel_size//2, bias=True)
+        self.act1 = nn.ReLU(inplace=True) 
+        self.conv2 = nn.Conv2d(mid_channels, out_channels, kernel_size, padding=kernel_size//2, bias=True)
+        self.act2 = nn.ReLU(inplace=True) # Activation after addition is standard, but here we do it inside
+        
+        self.skip_proj = None
+        if in_channels != out_channels:
+            self.skip_proj = nn.Conv2d(in_channels, out_channels, 1, bias=False)
+
+    def forward(self, x):
+        residual = x
+        
+        x = self.conv1(x)
+        x = self.act1(x)
+        x = self.conv2(x)
+        
+        if self.skip_proj:
+            residual = self.skip_proj(residual)
+            
+        x = x + residual
+        x = self.act2(x) # Post-addition activation
+        return x
 
 class kPathResidualFeatureBlock(nn.Module):
     def __init__(self, in_channels, mid_channels, out_channels,
                  k_paths=3, with_skip_connection=True,
-                 use_concatenation=True, use_attention=True):
+                 use_concatenation=True, use_attention=False):
         super().__init__()
 
         self.k_paths = k_paths
@@ -90,9 +118,9 @@ class kPathResidualFeatureBlock(nn.Module):
         self.paths = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=True),
-                nn.ReLU(inplace=False),
+                nn.ReLU(inplace=True),
                 nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=True),
-                nn.ReLU(inplace=False)
+                nn.ReLU(inplace=True)
             )
             for _ in range(k_paths)
         ])
@@ -102,14 +130,13 @@ class kPathResidualFeatureBlock(nn.Module):
 
         self.merge_conv = nn.Sequential(
             nn.Conv2d(combined_channels, out_channels, kernel_size=1, bias=True),
-            nn.ReLU(inplace=False)
+            nn.ReLU(inplace=True)
         )
 
         # Optional attention
         if use_attention:
             self.attention = SqueezeExcite(out_channels)
     
-        # Optional skip projection (if dimensions differ)
         self.skip_proj = None
         if with_skip_connection and in_channels != out_channels:
             self.skip_proj = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
@@ -124,8 +151,9 @@ class kPathResidualFeatureBlock(nn.Module):
         else:
             combined = sum(path_outputs) / self.k_paths
 
-        # Merge & attention
+        # Merge
         fused = self.merge_conv(combined)
+        
         if self.use_attention:
             fused = self.attention(fused)
 
@@ -133,8 +161,7 @@ class kPathResidualFeatureBlock(nn.Module):
         if self.with_skip_connection:
             skip = self.skip_proj(x) if self.skip_proj else x
             fused = fused + skip
-            fused = F.elu(fused, inplace=False)
-
+            
         return fused
 
 class HeadProcessing(nn.Module):
@@ -145,45 +172,30 @@ class HeadProcessing(nn.Module):
         self.max_pool = nn.MaxPool2d(2, stride=2)
         self.min_pool = nn.MaxPool2d(2, stride=2)
         
-        # New convolution layer
         self.conv_2x2_path = nn.Conv2d(
             in_channels=input_channels,
-            out_channels=input_channels, # Adjust if needed
+            out_channels=input_channels,
             kernel_size=2,
             stride=2
         )
         
-        # We've added a new path, so we need to adjust the `in_channels` for `conv_expand`
-        # `input_channels * 4` (unshuffle) + `input_channels` (conv_2x2_path)
-        # However, the input to conv_expand is just the unshuffled tensor, so its in_channels remains the same.
-        # But we need to adjust the `out_channels` to make space for the new path in the final concatenation
+        # Calculate input channels for expansion
+        # Unshuffle (C*4) + Avg + Max + Contrast + Conv2x2
+        expanded_in = (input_channels * 4) + (input_channels * 4) 
+        
         self.conv_expand = nn.Conv2d(
             in_channels=input_channels * 4,
-            out_channels=base_channels - 3 * input_channels - input_channels, # Adjusted output channels
+            out_channels=base_channels - 3 * input_channels - input_channels,
             kernel_size=1,
             padding=0,
             stride=1
         )
         
         self.conv_stack = nn.Sequential(
-            nn.Conv2d(
-                in_channels=base_channels,
-                out_channels=base_channels,
-                kernel_size=1,
-                padding=0,
-                stride=1,
-                bias=True
-            ),
-            nn.ReLU(inplace=False),
-            nn.Conv2d(
-                in_channels=base_channels,
-                out_channels=base_channels,
-                kernel_size=3,
-                padding=1,
-                stride=1,
-                bias=True
-            ),
-            nn.ReLU(inplace=False),
+            nn.Conv2d(base_channels, base_channels, 1, padding=0, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels, base_channels, 3, padding=1, bias=True),
+            nn.ReLU(inplace=True),
             kPathResidualFeatureBlock(
                 in_channels=base_channels,
                 mid_channels=int(base_channels / 1.5),
@@ -191,30 +203,29 @@ class HeadProcessing(nn.Module):
                 k_paths=k_paths,
                 with_skip_connection=False,
                 use_concatenation=True,
-                use_attention=False
+                use_attention=False # Disabled SE in head for speed
             )
         )
 
     def forward(self, x):
-        unshuffled = self.pixel_unshuffle(x)   # shape: (B, C*4, H/2, W/2)
+        unshuffled = self.pixel_unshuffle(x)
         unshuffled_expanded = self.conv_expand(unshuffled)
         
-        avg_pool = self.avg_pool(x)            # shape: (B, C,   H/2, W/2)
-        max_pool = self.max_pool(x)            # shape: (B, C,   H/2, W/2)
-        min_pool = self.min_pool(-x)           # shape: (B, C,   H/2, W/2)
-        contrast = max_pool - min_pool         # shape: (B, C,   H/2, W/2)
+        avg_pool = self.avg_pool(x)
+        max_pool = self.max_pool(x)
+        min_pool = self.min_pool(-x)
+        contrast = max_pool - min_pool
         
-        conv_2x2 = self.conv_2x2_path(x)       # New path, shape: (B, C, H/2, W/2)
+        conv_2x2 = self.conv_2x2_path(x)
         
-        # Concatenate all tensors
         concat = torch.cat([unshuffled_expanded, avg_pool, max_pool, contrast, conv_2x2], dim=1)
         
         return self.conv_stack(concat)
 
 class ResidualUNet(nn.Module):
     def __init__(self, input_channels=3, output_channels=3,
-                 base_channels=48, unet_depth=3, blocks_per_level=2,
-                 k_paths=3, internal_block_channels_ratio=1.25, verbose=False):
+                 base_channels=48, max_channels=256, unet_depth=3, blocks_per_level=2,
+                 k_paths=3, internal_block_channels_ratio=1.0, verbose=False):
         super().__init__()
         self.verbose = verbose
         self.unet_depth = unet_depth
@@ -245,15 +256,25 @@ class ResidualUNet(nn.Module):
         # --- Encoder ---
         self.encoder_blocks = nn.ModuleList()
         in_ch = base_channels
-        for d in range(unet_depth):
-            out_ch = base_channels * (2 ** d)
-            
-            # Account for PixelUnshuffle expansion (x4) for levels d > 0
-            block_in_ch = in_ch * 4 if d > 0 else in_ch
+        
+        # Helper to cap channels
+        def get_ch(depth_idx):
+            ch = base_channels * (2 ** depth_idx)
+            return min(ch, max_channels)
 
-            blocks = [ResidualFeatureBlock(block_in_ch if i == 0 else out_ch,
-                                           int(out_ch * internal_block_channels_ratio),
-                                           out_ch, 3)
+        for d in range(unet_depth):
+            out_ch = get_ch(d)
+            
+            # Account for PixelUnshuffle expansion (x4) for levels d > 0 input logic
+            # Logic: Input to Level 0 is base_channels.
+            # Input to Level 1 is Level 0 out (base) * 4 (due to unshuffle downsample)
+            prev_ch = get_ch(d-1) if d > 0 else base_channels
+            block_in_ch = prev_ch * 4 if d > 0 else in_ch
+
+            # Optimized: Use Standard ResidualBlock
+            blocks = [ResidualBlock(block_in_ch if i == 0 else out_ch,
+                                    int(out_ch * internal_block_channels_ratio),
+                                    out_ch, kernel_size=3)
                       for i in range(blocks_per_level)]
             self.encoder_blocks.append(nn.Sequential(*blocks))
             in_ch = out_ch
@@ -261,13 +282,13 @@ class ResidualUNet(nn.Module):
         self.downs = nn.ModuleList([nn.PixelUnshuffle(2) for _ in range(unet_depth - 1)])
 
         # --- Bottleneck ---
-        bottleneck_ch = base_channels * (2 ** (unet_depth - 1))
+        bottleneck_ch = get_ch(unet_depth - 1)
+        # Optimized bottleneck: kPath block (rich features) + 1 Standard ResBlock
         self.bottleneck = nn.Sequential(
             kPathResidualFeatureBlock(bottleneck_ch, bottleneck_ch // 2, bottleneck_ch,
                                       k_paths=k_paths, with_skip_connection=True,
-                                      use_concatenation=True, use_attention=True),
-            ResidualFeatureBlock(bottleneck_ch, bottleneck_ch // 2, bottleneck_ch, 3),
-            SqueezeExcite(bottleneck_ch)
+                                      use_concatenation=True, use_attention=False), # SE disabled for speed
+            ResidualBlock(bottleneck_ch, bottleneck_ch // 2, bottleneck_ch, kernel_size=3)
         )
 
         # --- Decoder ---
@@ -277,28 +298,27 @@ class ResidualUNet(nn.Module):
         prev_out_ch = bottleneck_ch
 
         for d in reversed(range(unet_depth)):
+            current_level_ch = get_ch(d)
+            
             if d == 0:
-                # Final Stage:
-                # Logic Fix: This stage has NO Upsampling (PixelShuffle) because d=0.
-                # So we simply take prev_out_ch directly.
-                upsampled_ch = prev_out_ch # No division by 4
-                skip_ch = base_channels
-                in_ch = upsampled_ch + skip_ch
-                
+                # Final Stage (No Upsampling)
+                in_ch = prev_out_ch + base_channels # Skip connection from head
                 self.decoder_blocks.append(
                     nn.Conv2d(in_ch, output_channels, 1)
                 )
             else:
-                out_ch = base_channels * (2 ** d)
-                
-                # Intermediate Stage (Upsampling happens):
+                # Intermediate Stage (Upsampling via PixelShuffle happens before this block)
+                # Input is: (Prev // 4) + Skip
                 upsampled_ch = prev_out_ch // 4
-                skip_ch = base_channels * (2 ** (d - 1))
-                in_ch = upsampled_ch + skip_ch
                 
-                blocks = [ResidualFeatureBlock(in_ch if i == 0 else out_ch,
-                                               int(out_ch * internal_block_channels_ratio),
-                                               out_ch, 3)
+                skip_ch = get_ch(d - 1)
+                
+                in_ch = upsampled_ch + skip_ch
+                out_ch = current_level_ch
+                
+                blocks = [ResidualBlock(in_ch if i == 0 else out_ch,
+                                        int(out_ch * internal_block_channels_ratio),
+                                        out_ch, kernel_size=3)
                           for i in range(blocks_per_level)]
                 self.decoder_blocks.append(nn.Sequential(*blocks))
                 
@@ -306,15 +326,12 @@ class ResidualUNet(nn.Module):
 
         # --- Refinement ---
         self.refine = nn.Sequential(
-                    # Expand channels x4 to prepare for PixelShuffle
-                    nn.Conv2d(output_channels, output_channels * 4, 3, padding=1),
-                    # Upsample: (B, 12, H/2, W/2) -> (B, 3, H, W)
-                    nn.PixelShuffle(2)
-                )
+            nn.Conv2d(output_channels, output_channels * 4, 3, padding=1),
+            nn.PixelShuffle(2)
+        )
 
     def forward(self, x):
         x_in = x
-
         x_head = self.head(x)
 
         if self.verbose:
@@ -345,6 +362,7 @@ class ResidualUNet(nn.Module):
             
             skip = x_head if d_val == 0 else encoder_features[d_val - 1]
             
+            # Pad if necessary
             if x_up.shape[2:] != skip.shape[2:]:
                 diffY = skip.size(2) - x_up.size(2)
                 diffX = skip.size(3) - x_up.size(3)
@@ -353,18 +371,14 @@ class ResidualUNet(nn.Module):
             x = torch.cat([x_up, skip], dim=1)
             x = block(x)
 
-        x = F.relu(x)
+        x = F.relu(x, inplace=True)
         x = self.refine(x)
         x = x + self.skip_alpha * self.global_skip(x_in)
-        x = F.elu(x, inplace=False)
         return x
     
-    # === Criterion ===
     def criterion(self, output, target):
-       # return nn.L1Loss()(output, target)
         return self.perceptual_criterion(output, target)
 
-    # === Benchmark ===
     def benchmark(self, input_tensor, warmup_iters=20, test_duration=20.0):
         self.eval()
         device = next(self.parameters()).device
@@ -394,24 +408,25 @@ class ResidualUNet(nn.Module):
 def get_model(name: str = 'lightweight', verbose: bool = False):
     """
     Returns a selected model configuration.
-    Supported: 'lightweight', 'heavyweight', 'advanced_light', 'advanced_heavy'
     """
-
     if name == 'light':
         return ResidualUNet(
-            unet_depth=1,
-            blocks_per_level=2,
-            base_channels=36,
-            k_paths=5,
-            internal_block_channels_ratio=1.50,
+            unet_depth=3,           # Target: Depth 3
+            blocks_per_level=1,     # Reduced blocks per level to keep FPS high with increased depth
+            base_channels=24,       # Reduced base channels slightly for speed
+            max_channels=128,       # Cap channels
+            k_paths=2,              # Reduced paths in head/bottleneck
+            internal_block_channels_ratio=1.0,
             verbose=verbose
         )
     elif name == 'heavy':
         return ResidualUNet(
-            unet_depth=3,
+            unet_depth=3,           # Target: Depth 3
             blocks_per_level=3,
-            base_channels=72,
-            internal_block_channels_ratio=1.50,
+            base_channels=32,       # Start moderate
+            max_channels=256,       # Hard cap to prevent channel explosion
+            k_paths=5,
+            internal_block_channels_ratio=1.0,
             verbose=verbose
         )
     else:
@@ -436,7 +451,7 @@ if __name__ == "__main__":
         print("Model saved successfully.")
 
     print("Attempting to compile model...")
-    if not args.no_compile: # Conditional compilation
+    if not args.no_compile:
         try:
             model = torch.compile(model, mode="default", fullgraph=True)
             print("Model compiled successfully.")
@@ -446,7 +461,7 @@ if __name__ == "__main__":
             model = model.to(device)
     else:
         print("torch.compile disabled for debugging.")
-        model = model.to(device) # Ensure model is on device even if not compiled
+        model = model.to(device)
 
     dummy_input = torch.rand((args.batch_size, 3, 576, 736), dtype=torch.float16).to(device)
     results = model.benchmark(dummy_input)

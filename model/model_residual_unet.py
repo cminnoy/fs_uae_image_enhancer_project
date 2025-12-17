@@ -8,6 +8,55 @@ from residual_feature_block import ResidualFeatureBlock
 from activations import get_activation
 from loss_vgg import PerceptualLoss, charbonnier_loss
 
+# Residual U-Net with Multi-Path Residual Feature Blocks
+#
+# This model is designed specifically for image enhancement of the FS-UAE Amiga emulator.
+# FS-UAE uses a single frame buffer with 32-bit RGBA format, where each color channel is in sRGB space.
+# The model is trained on linear space images, so input images are converted from sRGB to linear space.
+# An sRGB to linear conversion and normalisation is done after the model is trained by the ONNX export script.
+# 
+# The FS-UAE framebuffer has a fixed size of 752x576 pixels.
+# Amiga lores mode uses 4 raw pixels for every displayed pixel, in a 2x2 grid, resulting in a 376x288 effective resolution.
+# Amiga hires mode uses 2 raw pixels for every displayed pixel, in a 1x2 grid, resulting in a 752x288 effective resolution.
+# Amiga lores interlace mode uses 2 raw pixels for every displayed pixel, in a 2x1 grid, resulting in a 376x576 effective resolution.
+# Amiga hires interlace mode uses 1 raw pixel for every displayed pixel, in a 1x1 grid, resulting in a 752x576 effective resolution.
+# 
+# Amiga superresolution modes (e.g., Super HiRes) are not supported by FS-UAE and thus not considered here.
+#
+# The model uses a Residual U-Net architecture with multi-path residual feature blocks.
+# The input is processed through a head module that combines pixel unshuffling, pooling, and
+# a new convolutional path to extract rich features before entering the U-Net.
+# The U-Net consists of an encoder-decoder structure with skip connections and a bottleneck.
+# The output is refined and combined with a global skip connection from the input.
+# The model is trained using a perceptual loss that combines pixel-wise loss,
+# VGG-based perceptual loss, and high-frequency loss.
+# 
+# Amiga games are mostly handdrawn pixel art with sharp edges and limited color palettes.
+# Often artists used dithering to simulate more colors and gradients, but not always in a consistent way.
+# The model is trained on a dataset of high resolution images in full colour with there corresponding lores counterparts.
+# 
+# Dithering patterns applied to lores images in the training dataset include:
+# - Floyd-Steinberg dithering
+# - Bayer ordered dithering '2x2', '4x4', '8x8'
+# - Atkinson dithering
+# - Sierra dithering '2', '3'
+# - Stucki dithering
+# - Burkes dithering
+# - Checkerboard dithering 
+# - No dithering
+#
+# Colour modes in the training dataset include:
+# - 16 color palette
+# - 24 color palette 
+# - 32 color palette
+# - 64 color paletted extra half-brite
+# - 128 color palette
+# - 256 color palette
+# - 512 color palette
+# - HAM6 for Amiga lores and lores interlace
+# - SHAM (Split HAM6) for Amiga lores and lores interlace
+# - DynamicHires (16 color palette per scanline) for Amiga hires and hires interlace
+
 class SqueezeExcite(nn.Module):
     def __init__(self, channels, reduction=16):
         super().__init__()

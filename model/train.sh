@@ -14,7 +14,7 @@ EPOCHS_DIGGING="${2:-16}"
 if [ "$MODEL_TYPE" = "light" ]; then
     BATCH_SIZE=48
 else
-    BATCH_SIZE=64
+    BATCH_SIZE=32
 fi
 
 DATASET="../dataset_generator/dataset/dataset_train_ocs_games"
@@ -31,6 +31,7 @@ if [[ ! -f "$CHECKPOINT" ]]; then
         --batch_size "$BATCH_SIZE" \
         --learning_rate 0.0004 \
         --data_dir "$DATASET" \
+        --shuffle_data \
         --samples_per_epoch 5000 \
         --checkpoint_dir "$MODEL_TYPE" \
         --num_workers 8
@@ -50,5 +51,6 @@ torchrun --nproc_per_node 2 train.py \
     --data_dir "$DATASET" \
     --samples_per_epoch 20000 \
     --checkpoint_dir "$MODEL_TYPE" \
-    --num_workers 8
-echo "Training completed."
+    --num_workers 8 \
+    --print_model_layers
+

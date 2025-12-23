@@ -167,7 +167,7 @@ class Trainer:
         if self.is_master and self.args.print_model_layers:
             print(self.model)
         
-        self.optimizer = optim.Adam(  # TODO change to AdamW
+        self.optimizer = optim.AdamW(
             self.model.parameters(), 
             lr=self.args.learning_rate, 
             betas=(self.args.adam_beta1, self.args.adam_beta2)
@@ -178,7 +178,7 @@ class Trainer:
             self.load_checkpoint(self.args.load_checkpoint)
             
         # Wrap the model with DDP
-        self.model = DDP(self.model, device_ids=[self.local_rank])
+        self.model = DDP(self.model, device_ids=[self.local_rank], find_unused_parameters=True)
 
     @torch.no_grad()
     def validate(self):

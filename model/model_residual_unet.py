@@ -75,7 +75,6 @@ class SqueezeExcite(nn.Module):
 class ResidualBlock(nn.Module):
     """
     Standard Residual Block (Conv-ReLU-Conv).
-    Lightweight replacement for SEResidualBlock to boost FPS.
     """
     def __init__(self, in_channels, mid_channels, out_channels, kernel_size=3):
         super().__init__()
@@ -84,7 +83,8 @@ class ResidualBlock(nn.Module):
         self.act1 = nn.ReLU(inplace=True) 
         self.conv2 = nn.Conv2d(mid_channels, out_channels, kernel_size, padding=kernel_size//2, bias=True)
         self.act2 = nn.ReLU(inplace=True) # Activation after addition is standard, but here we do it inside
-        
+        self.skip_alpha = nn.Parameter(torch.tensor(0.5), requires_grad=True)
+
         self.skip_proj = None
         if in_channels != out_channels:
             self.skip_proj = nn.Conv2d(in_channels, out_channels, 1, bias=False)
@@ -98,6 +98,8 @@ class ResidualBlock(nn.Module):
         
         if self.skip_proj:
             residual = self.skip_proj(residual)
+        else:
+            residual = self.skip_alpha * residual
             
         x = x + residual
         x = self.act2(x) # Post-addition activation
@@ -138,8 +140,13 @@ class kPathResidualFeatureBlock(nn.Module):
             self.attention = SqueezeExcite(combined_channels)
     
         self.skip_proj = None
-        if with_skip_connection and in_channels != out_channels:
-            self.skip_proj = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+        if with_skip_connection:
+            if in_channels != out_channels:
+                self.skip_proj = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+                self.skip_alpha = None
+            else:
+                self.skip_proj = None
+                self.skip_alpha = nn.Parameter(torch.tensor(0.5), requires_grad=True).float()
 
     def forward(self, x):
         # Parallel paths
@@ -161,6 +168,8 @@ class kPathResidualFeatureBlock(nn.Module):
         # Residual
         if self.with_skip_connection:
             skip = self.skip_proj(x) if self.skip_proj else x
+            if self.skip_alpha is not None:
+                skip = skip * self.skip_alpha
             fused = fused + skip
             
         return fused
@@ -247,13 +256,14 @@ class ResidualUNet(nn.Module):
                 if input_channels == output_channels
                 else nn.Conv2d(input_channels, output_channels, 1, bias=False)
         )
-        self.skip_alpha = nn.Parameter(torch.tensor(1.0))
+        self.skip_alpha = nn.Parameter(torch.tensor(0.5), requires_grad=True).float()
     
         # --- Head ---
         self.head = HeadProcessing(input_channels, base_channels, k_paths_head, onebyone_expansion=3.0, twobytwo_expansion=4.0)
 
         # --- Encoder ---
         self.encoder_blocks = nn.ModuleList()
+        self.skip_alphas = nn.ParameterList([nn.Parameter(torch.tensor(0.5).float(), requires_grad=True) for _ in range(unet_depth)])
         in_ch = base_channels
         
         # Helper to cap channels
@@ -353,20 +363,24 @@ class ResidualUNet(nn.Module):
         # Decoder path
         for i, block in enumerate(self.decoder_blocks):
             d_val = self.unet_depth - 1 - i
-            
+
             if i < len(self.ups):
                 x_up = self.ups[i](x)
             else:
-                x_up = x 
-            
+                x_up = x
+
             skip = x_head if d_val == 0 else encoder_features[d_val - 1]
-            
+
+            # Apply corresponding skip alpha (match dtype/device to avoid upcast issues)
+            alpha = self.skip_alphas[d_val]
+            skip = skip * alpha
+
             # Pad if necessary
             if x_up.shape[2:] != skip.shape[2:]:
                 diffY = skip.size(2) - x_up.size(2)
                 diffX = skip.size(3) - x_up.size(3)
                 x_up = F.pad(x_up, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
-            
+
             x = torch.cat([x_up, skip], dim=1)
             x = block(x)
 

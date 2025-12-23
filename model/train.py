@@ -155,7 +155,7 @@ class Trainer:
             batch_size=16,  # Fixed smaller batch size for validation
             shuffle=False,
             num_workers=self.args.num_workers,
-            pin_memory=False,
+            pin_memory=True,
             drop_last=False,
             sampler=self.val_sampler
         )

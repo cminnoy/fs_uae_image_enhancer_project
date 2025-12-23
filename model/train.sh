@@ -12,7 +12,7 @@ EPOCHS_DIGGING="${2:-16}"
 
 # Set initial batch size based on model type
 if [ "$MODEL_TYPE" = "light" ]; then
-    BATCH_SIZE=128
+    BATCH_SIZE=96
     echo "Using LIGHT model with batch size $BATCH_SIZE"
 else
     BATCH_SIZE=64
@@ -31,7 +31,7 @@ if [[ ! -f "$CHECKPOINT" ]]; then
         --model_type "$MODEL_TYPE" \
         --epochs 1 \
         --batch_size "$BATCH_SIZE" \
-        --learning_rate 0.0004 \
+        --learning_rate 0.001 \
         --data_dir "$DATASET" \
         --shuffle_data \
         --samples_per_epoch 3300 \

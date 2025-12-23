@@ -135,7 +135,7 @@ class kPathResidualFeatureBlock(nn.Module):
 
         # Optional attention
         if use_attention:
-            self.attention = SqueezeExcite(out_channels)
+            self.attention = SqueezeExcite(combined_channels)
     
         self.skip_proj = None
         if with_skip_connection and in_channels != out_channels:
@@ -151,11 +151,12 @@ class kPathResidualFeatureBlock(nn.Module):
         else:
             combined = sum(path_outputs) / self.k_paths
 
+        # Optional attention        
+        if self.use_attention:
+            combined = self.attention(combined)
+
         # Merge
         fused = self.merge_conv(combined)
-        
-        if self.use_attention:
-            fused = self.attention(fused)
 
         # Residual
         if self.with_skip_connection:
@@ -165,7 +166,7 @@ class kPathResidualFeatureBlock(nn.Module):
         return fused
 
 class HeadProcessing(nn.Module):
-    def __init__(self, input_channels, base_channels, k_paths):
+    def __init__(self, input_channels, base_channels, k_paths, onebyone_expansion=2.0, twobytwo_expansion=2.0):
         super().__init__()
         self.pixel_unshuffle = nn.PixelUnshuffle(2)
         self.avg_pool = nn.AvgPool2d(2, stride=2)
@@ -174,25 +175,23 @@ class HeadProcessing(nn.Module):
         
         self.conv_2x2_path = nn.Conv2d(
             in_channels=input_channels,
-            out_channels=input_channels,
+            out_channels=int(input_channels * twobytwo_expansion),
             kernel_size=2,
             stride=2
         )
-        
-        # Calculate input channels for expansion
-        # Unshuffle (C*4) + Avg + Max + Contrast + Conv2x2
-        expanded_in = (input_channels * 4) + (input_channels * 4) 
-        
+          
         self.conv_expand = nn.Conv2d(
             in_channels=input_channels * 4,
-            out_channels=base_channels - 3 * input_channels - input_channels,
+            out_channels=int(input_channels * 4 * onebyone_expansion),
             kernel_size=1,
             padding=0,
             stride=1
         )
+
+        concat_input_channels=int(input_channels * 4 * onebyone_expansion) + 3 * input_channels + int(input_channels * twobytwo_expansion)
         
         self.conv_stack = nn.Sequential(
-            nn.Conv2d(base_channels, base_channels, 1, padding=0, bias=True),
+            nn.Conv2d(concat_input_channels, base_channels, 1, padding=0, bias=True),
             nn.ReLU(inplace=True),
             nn.Conv2d(base_channels, base_channels, 3, padding=1, bias=True),
             nn.ReLU(inplace=True),
@@ -203,7 +202,7 @@ class HeadProcessing(nn.Module):
                 k_paths=k_paths,
                 with_skip_connection=False,
                 use_concatenation=True,
-                use_attention=False # Disabled SE in head for speed
+                use_attention=False
             )
         )
 
@@ -225,7 +224,7 @@ class HeadProcessing(nn.Module):
 class ResidualUNet(nn.Module):
     def __init__(self, input_channels=3, output_channels=3,
                  base_channels=48, max_channels=256, unet_depth=3, blocks_per_level=2,
-                 k_paths=3, internal_block_channels_ratio=1.0, verbose=False):
+                 k_paths_head=3, k_paths_bottleneck=3, internal_block_channels_ratio=1.0, verbose=False):
         super().__init__()
         self.verbose = verbose
         self.unet_depth = unet_depth
@@ -251,7 +250,7 @@ class ResidualUNet(nn.Module):
         self.skip_alpha = nn.Parameter(torch.tensor(1.0))
     
         # --- Head ---
-        self.head = HeadProcessing(input_channels, base_channels, k_paths)
+        self.head = HeadProcessing(input_channels, base_channels, k_paths_head, onebyone_expansion=3.0, twobytwo_expansion=4.0)
 
         # --- Encoder ---
         self.encoder_blocks = nn.ModuleList()
@@ -286,8 +285,8 @@ class ResidualUNet(nn.Module):
         # Optimized bottleneck: kPath block (rich features) + 1 Standard ResBlock
         self.bottleneck = nn.Sequential(
             kPathResidualFeatureBlock(bottleneck_ch, bottleneck_ch // 2, bottleneck_ch,
-                                      k_paths=k_paths, with_skip_connection=True,
-                                      use_concatenation=True, use_attention=False), # SE disabled for speed
+                                      k_paths=k_paths_bottleneck, with_skip_connection=True,
+                                      use_concatenation=True, use_attention=True),
             ResidualBlock(bottleneck_ch, bottleneck_ch // 2, bottleneck_ch, kernel_size=3)
         )
 
@@ -405,7 +404,7 @@ class ResidualUNet(nn.Module):
             'output_shape': self(input_tensor).shape
         }
 
-def get_model(name: str = 'lightweight', verbose: bool = False):
+def get_model(name: str = 'light', verbose: bool = False):
     """
     Returns a selected model configuration.
     """
@@ -413,19 +412,21 @@ def get_model(name: str = 'lightweight', verbose: bool = False):
         return ResidualUNet(
             unet_depth=3,           # Target: Depth 3
             blocks_per_level=1,     # Reduced blocks per level to keep FPS high with increased depth
-            base_channels=24,       # Reduced base channels slightly for speed
+            base_channels=24,
             max_channels=128,       # Cap channels
-            k_paths=2,              # Reduced paths in head/bottleneck
+            k_paths_head=2,
+            k_paths_bottleneck=3,
             internal_block_channels_ratio=1.0,
             verbose=verbose
         )
     elif name == 'heavy':
         return ResidualUNet(
-            unet_depth=3,           # Target: Depth 3
+            unet_depth=4,           # Target: Depth 3
             blocks_per_level=3,
-            base_channels=32,       # Start moderate
-            max_channels=256,       # Hard cap to prevent channel explosion
-            k_paths=5,
+            base_channels=48,
+            max_channels=256,       # Cap channels
+            k_paths_head=4,
+            k_paths_bottleneck=5,
             internal_block_channels_ratio=1.0,
             verbose=verbose
         )
@@ -443,12 +444,14 @@ if __name__ == "__main__":
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = get_model(args.model_type, verbose=args.verbose).to(device).half().eval()
+    model = get_model(args.model_type, verbose=args.verbose).to(device)
 
     if args.save_model:
         print(f"Saving model state_dict to {args.save_model}")
         torch.save(model.state_dict(), args.save_model)
         print("Model saved successfully.")
+
+    model = model.half().eval()
 
     print("Attempting to compile model...")
     if not args.no_compile:

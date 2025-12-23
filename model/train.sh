@@ -20,12 +20,22 @@ else
 fi
 
 DATASET="../dataset_generator/dataset/dataset_train_ocs_games"
-CHECKPOINT="$MODEL_TYPE/best_model.pth"
+MODEL_DIR="$MODEL_TYPE"
+
+# Prefer the latest epoch checkpoint (highest epoch number). If none, fall back to best_model.pth.
+LATEST_EPOCH_CHECKPOINT=$(ls -1 "${MODEL_DIR}"/epoch_*.pth 2>/dev/null | sort -V | tail -n 1)
+if [ -n "$LATEST_EPOCH_CHECKPOINT" ]; then
+    CHECKPOINT="$LATEST_EPOCH_CHECKPOINT"
+elif [ -f "${MODEL_DIR}/best_model.pth" ]; then
+    CHECKPOINT="${MODEL_DIR}/best_model.pth"
+else
+    CHECKPOINT=""
+fi
 
 # --------------------------------------------------
 # Phase 1: "Stepping on the grass" (ONLY if no checkpoint exists)
 # --------------------------------------------------
-if [[ ! -f "$CHECKPOINT" ]]; then
+if [ -z "$CHECKPOINT" ] || [[ ! -f "$CHECKPOINT" ]]; then
     echo "No existing checkpoint found. Performing initial training step..."
     torchrun --nproc_per_node 1 train.py \
         --model_type "$MODEL_TYPE" \
@@ -34,26 +44,51 @@ if [[ ! -f "$CHECKPOINT" ]]; then
         --learning_rate 0.001 \
         --data_dir "$DATASET" \
         --shuffle_data \
-        --samples_per_epoch 3300 \
+        --samples_per_epoch 33000 \
         --checkpoint_dir "$MODEL_TYPE" \
         --num_workers 8 \
         --use_amp
 else
-    echo "Checkpoint exists ($CHECKPOINT). Skipping initial training step."
+    echo "Found checkpoint ($CHECKPOINT). Skipping initial training step."
+fi
+
+# Recompute latest checkpoint after Phase 1 in case Phase 1 created new checkpoints
+LATEST_EPOCH_CHECKPOINT=$(ls -1 "${MODEL_DIR}"/epoch_*.pth 2>/dev/null | sort -V | tail -n 1)
+if [ -n "$LATEST_EPOCH_CHECKPOINT" ]; then
+    CHECKPOINT="$LATEST_EPOCH_CHECKPOINT"
+elif [ -f "${MODEL_DIR}/best_model.pth" ]; then
+    CHECKPOINT="${MODEL_DIR}/best_model.pth"
+else
+    CHECKPOINT=""
 fi
 
 # --------------------------------------------------
 # Phase 2: "Digging a hole in the landscape" (always runs)
 # --------------------------------------------------
-torchrun --nproc_per_node 2 train.py \
-    --load_checkpoint "$CHECKPOINT" \
-    --model_type "$MODEL_TYPE" \
-    --epochs "$EPOCHS_DIGGING" \
-    --batch_size "$BATCH_SIZE" \
-    --learning_rate 0.0004 \
-    --data_dir "$DATASET" \
-    --samples_per_epoch 33000 \
-    --checkpoint_dir "$MODEL_TYPE" \
-    --num_workers 12 \
-    --use_amp
+if [ -n "$CHECKPOINT" ] && [[ -f "$CHECKPOINT" ]]; then
+    echo "Resuming Phase 2 from checkpoint: $CHECKPOINT"
+    torchrun --nproc_per_node 2 train.py \
+        --load_checkpoint "$CHECKPOINT" \
+        --model_type "$MODEL_TYPE" \
+        --epochs "$EPOCHS_DIGGING" \
+        --batch_size "$BATCH_SIZE" \
+        --learning_rate 0.0004 \
+        --data_dir "$DATASET" \
+        --samples_per_epoch 33000 \
+        --checkpoint_dir "$MODEL_TYPE" \
+        --num_workers 12 \
+        --use_amp
+else
+    echo "No checkpoint to load for Phase 2 — starting without --load_checkpoint"
+    torchrun --nproc_per_node 2 train.py \
+        --model_type "$MODEL_TYPE" \
+        --epochs "$EPOCHS_DIGGING" \
+        --batch_size "$BATCH_SIZE" \
+        --learning_rate 0.0004 \
+        --data_dir "$DATASET" \
+        --samples_per_epoch 33000 \
+        --checkpoint_dir "$MODEL_TYPE" \
+        --num_workers 12 \
+        --use_amp
+fi
 

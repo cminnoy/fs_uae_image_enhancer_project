@@ -137,6 +137,7 @@ class ONNXConverter:
                 output_names=output_names,
                 dynamo=False,
                 opset_version=18,
+                export_params=True,
                 verbose=False
             )
             print("Model exported successfully to ONNX format in memory!")

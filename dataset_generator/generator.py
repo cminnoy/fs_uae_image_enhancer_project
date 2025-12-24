@@ -282,9 +282,11 @@ def save_single_target_worker(target_spec, crop_w, crop_h, dest_dir, split_sourc
             # Save the target file
             # Use a high quality PNG save
             crop_pil.save(output_path, format='PNG', quality=100)
+            mtime = os.path.getmtime(output_path)
+            size = crop_pil.size  # (width, height)
 
             # Return success status and the original target spec
-            return (target_spec, True, "")
+            return (target_spec, True, "", (mtime, size, output_path))
 
     except Exception as e:
         # Return failure status, original target spec, and error message
@@ -578,13 +580,14 @@ def generate_and_save_styled_worker(styled_spec, crop_w_worker, crop_h_worker, d
             # Error 'mode' could also originate from inside save() if it receives wrong type
             try:
                 final_output_pil_for_save.save(output_path, format='PNG', quality=100)
+                mtime = os.path.getmtime(output_path)
+                size = final_output_pil_for_save.size
                 if verbose_worker >= 3: print(f"DEBUG WORKER [{spec_info_str}]: Successfully saved {output_path}")
             except Exception as e:
                  if verbose_worker >= 1: warnings.warn(f"Worker error saving styled output {output_path} for {spec_info_str}: {e}", stacklevel=2)
-                 return (styled_spec, False, f"Save failed: {e}")
+                 return (styled_spec, False, f"Save failed: {e}", (0, 0, output_path))
 
-
-            return (styled_spec, True, "") # Success result tuple
+            return (styled_spec, True, "", (mtime, size, output_path)) # Success result tuple
 
     except Exception as e:
         # This is the general exception catcher for any unhandled errors in the try block.
@@ -1512,9 +1515,12 @@ class DatasetGenerator:
                 for future in concurrent.futures.as_completed(target_futures):
                     if self.stop_requested: return
                     try:
-                        target_spec, success, message = future.result()
+                        target_spec, success, message, meta = future.result()
                         if success:
                             saved_target_count += 1
+                            mtime, size, full_path = meta
+                            rel_path = os.path.relpath(full_path, self.dest_dir)
+                            self.output_cache.update_image_cache(rel_path, {'mtime': mtime, 'size': size})
                             if self.verbose >= 1:
                                 print(f"Saved target ({saved_target_count}/{targets_to_save_count}): {os.path.basename(target_spec[0])} ({target_spec[1]},{target_spec[2]}) rot {target_spec[3]} scale {target_spec[4]}%")
                         else:
@@ -1553,9 +1559,12 @@ class DatasetGenerator:
                 for future_index, future in enumerate(concurrent.futures.as_completed(styled_futures), start=1):
                     if self.stop_requested: return
                     try:
-                        styled_spec, success, message = future.result()
+                        styled_spec, success, message, meta = future.result()
                         if success:
                             generated_styled_count += 1
+                            mtime, size, full_path = meta
+                            rel_path = os.path.relpath(full_path, self.dest_dir)
+                            self.output_cache.update_image_cache(rel_path, {'mtime': mtime, 'size': size})
                             elapsed_time = time.time() - start_time
                             avg_time_per_item = elapsed_time / future_index
                             remaining_items = styled_to_generate_count - future_index
@@ -1566,9 +1575,9 @@ class DatasetGenerator:
                                 res, sx, sy, s_perc, r_deg, rgb, pal, dm, res_name = styled_spec[8], styled_spec[1], styled_spec[2], styled_spec[4], styled_spec[3], styled_spec[5], styled_spec[6], styled_spec[7], styled_spec[8]
                                 pal_str = str(pal) if pal is not None else 'None'
                                 print(f"Generated styled output ({generated_styled_count}/{styled_to_generate_count}): "
-                                      f" ETA: {eta_formatted} | "
-                                      f"Resolution={res_name}, Crop=({sx:03d},{sy:03d}), Scale={s_perc}%, Rotation={r_deg}°, "
-                                      f"ColorSpace={rgb}, Palette={pal_str}, Dither={dm}")
+                                      f"ETA: {eta_formatted} | "
+                                      f"Resolution={res_name}, Crop=({sx:4d},{sy:4d}), Scale={s_perc:2d}%, Rotation={r_deg:2d}°, "
+                                      f"ColorSpace={rgb}, Palette={pal_str:>5s}, Dither={dm}")
                         else:
                             warnings.warn(f"Failed to generate styled output {styled_spec[8]}_{styled_spec[1]}_{styled_spec[2]}...: {message}")
                         completed_futures.add(future)

@@ -1,0 +1,5 @@
+.test_scan_cache/
+.train_scan_cache/
+.output_scan_cache/
+dataset/
+__pycache__/

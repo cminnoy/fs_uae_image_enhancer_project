@@ -178,8 +178,7 @@ checkpoint_*.pth
 checkpoint_*.pt
 
 *.code-workspace
-
-.test_scan_cache/
-.train_scan_cache/
-dataset_generator/dataset/
-dataset_generator/runs/
+runs
+light/*.pth
+heavy/*.pth
+__pycache__/

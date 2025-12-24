@@ -20,7 +20,7 @@ from quantize import (
     apply_sham_conversion,
     DIFFUSION_MAPS
 )
-from cache import ScanCache, DEFAULT_TRAIN_CACHE_FILE, DEFAULT_TEST_CACHE_FILE
+from cache import ScanCache, DEFAULT_TRAIN_CACHE_FILE, DEFAULT_TEST_CACHE_FILE, DEFAULT_OUTPUT_CACHE_FILE
 import signal
 from sklearn.cluster import KMeans
 
@@ -625,6 +625,7 @@ class DatasetGenerator:
         # We instantiate the ScanCache even if the path is None; the class handles it.
         self.train_cache = ScanCache(cache_path=train_cache_path, verbose=self.verbose)
         self.test_cache = ScanCache(cache_path=test_cache_path, verbose=self.verbose)
+        self.output_cache = ScanCache(cache_path=os.path.join(self.dest_dir, DEFAULT_OUTPUT_CACHE_FILE), verbose=self.verbose)
 
         # --- Internal State (populated by methods) ---
         self.train_image_paths = []
@@ -1073,128 +1074,136 @@ class DatasetGenerator:
             print(f"Full valid test output specs (styled): {len(self.full_valid_output_specs['test'])}")
         if self.verbose >= 2: print(f"Debug: Exiting _build_full_valid_specs")
 
+    def _resolve_source_path(self, folder_name, split):
+        """
+        Resolves the original image path from a folder name (base filename).
+        Uses a reverse lookup of self.base_filenames for O(1) performance.
+        """
+        # Create reverse mapping once if it doesn't exist
+        if not hasattr(self, '_reverse_base_filenames'):
+            self._reverse_base_filenames = {v: k for k, v in self.base_filenames.items()}
+        
+        return self._reverse_base_filenames.get(folder_name)
+
+    def _print_mismatch_reason(self, filename, spec, split):
+        """Diagnoses why a parsed file doesn't match the current config."""
+        path, x, y, r, s, cs, pal, dit, res = spec
+        
+        # Check if the crop/rotation is in the plan
+        is_requested_crop = any(s_val[:5] == spec[:5] for s_val in self.full_valid_output_specs[split])
+        
+        if not is_requested_crop:
+            print(f"  [Invalid] {filename}: Crop ({x},{y}, s{s}, r{r}) is not in current target list.")
+        else:
+            # If the crop is valid, it's a parameter mismatch (RGB, Palette, Dither, or Res)
+            print(f"  [Invalid] {filename}: Parameter mismatch for valid crop.")
+            print(f"    - Found: Res={res}, CS={cs}, Pal={pal}, Dither={dit}")
+
     def _scan_output_directory(self):
-        # Implements Step 4 logic: Scan Output Directory and Identify Existing/Invalid Files
-
-        if self.verbose >= 1: print(f"Scanning output directory {self.dest_dir} for existing files...")
-
-        # Need access to train_image_paths and test_image_paths to determine the split source for existing files
-        # These are instance attributes
+        """
+        Scans output directory. Verifies dimensions and validity.
+        Uses self.output_cache to avoid redundant PIL opens.
+        """
+        if self.verbose >= 1:
+            print(f"Scanning output directory for existing files: {self.dest_dir}")
 
         for split in ['train', 'test']:
-            split_output_dir = os.path.join(self.dest_dir, split)
-            if not os.path.isdir(split_output_dir):
-                if self.verbose >= 1: print(f"Output directory for split '{split}' not found: {split_output_dir}. Skipping scan.")
-                continue
+            split_dir = os.path.join(self.dest_dir, split)
+            if not os.path.isdir(split_dir): continue
 
-            current_subdir_targets = set()
-            current_subdir_styles = set() 
-
-            for root, dirs, files in os.walk(split_output_dir):
-                if self.stop_requested: return
-
-                if root == split_output_dir:
-                    # If we are at the root of the split output directory, skip it
-                    continue
-
-                # The directory name is the original base filename without extension
-                original_base_filename_without_ext = os.path.basename(root)
-
-                original_img_path = None
-                split_source = None # Determine the split this directory corresponds to
-
-                # Find the original image path corresponding to this base filename
-                # Check in train images first (using instance attribute)
-                train_match = [p for p in self.train_image_paths if os.path.splitext(os.path.basename(p))[0] == original_base_filename_without_ext]
-                if train_match:
-                     original_img_path = train_match[0]
-                     split_source = 'train'
-                else:
-                     # Check in test images if not found in train (using instance attributes)
-                     if self.test_images_dir:
-                          test_match = [p for p in self.test_image_paths if os.path.splitext(os.path.basename(p))[0] == original_base_filename_without_ext]
-                          if test_match:
-                               original_img_path = test_match[0]
-                               split_source = 'test'
-
-                # If original_img_path is still None, the original image is missing or not from the specified input dirs.
-                # Files in this directory might be considered invalid or from a previous run with different inputs.
-                # For now, we'll still try to parse the filenames, but if the original image is truly gone,
-                # the corresponding specs won't be in the 'full_valid_output_specs'.
-
-                # Pre-scan for target filenames ---
-                found_target_filenames_in_subdir = set()
-                for f_name_pre_scan in files:
-                    p_params_pre_scan = parse_generated_filename(f_name_pre_scan) # Match your existing call (no self.verbose)
-                    if p_params_pre_scan and p_params_pre_scan['type'] == 'target':
-                        # We only need the filename itself for checking existence later.
-                        # Detailed image checks (size, openability) are handled in the main loop.
-                        found_target_filenames_in_subdir.add(f_name_pre_scan)
+            for root, _, files in os.walk(split_dir):
+                if root == split_dir: continue # Skip root split dir
+                
+                folder_name = os.path.basename(root)
+                original_img_path = self._resolve_source_path(folder_name, split)
+                
+                # Pre-scan for targets in this subdir (dependency check)
+                found_targets = {f for f in files if f.startswith("target_")}
 
                 for filename in files:
                     if self.stop_requested: return
+                    full_path = os.path.join(root, filename)
+                    
+                    # 1. Parse Filename
+                    parsed = parse_generated_filename(filename, verbose=self.verbose)
+                    if not parsed or not original_img_path:
+                        self.invalid_files[split].append(full_path)
+                        continue
 
-                    parsed_params = parse_generated_filename(filename)
-                    if parsed_params:                        
-                        if original_img_path:
-                            try:
-                                with Image.open(os.path.join(root, filename)) as img:
-                                    size = img.size
-                                    width, height = size
-                                if width != self.crop_w or height != self.crop_h:
-                                    self.invalid_files[split].append(os.path.join(root, filename))
-                                    if self.verbose >= 2: print(f"Found file with incorrect size in subdirectory: {os.path.join(root, filename)}")
-                                    continue
-                            except Exception as e:
-                                self.invalid_files[split].append(os.path.join(root, filename))
-                                if self.verbose >= 2: print(f"Error opening image file {os.path.join(root, filename)}: {e}")
-                                continue
-                            if parsed_params['type'] == 'target':
-                                target_spec = (original_img_path, parsed_params['crop_x'], parsed_params['crop_y'], parsed_params['rot_deg'], parsed_params['scale_perc'])
-                                if target_spec not in self.full_valid_target_specs[split_source]:
-                                    self.invalid_files[split_source].append(os.path.join(root, filename))
-                                else:
-                                    self.existing_target_specs[split_source].add(target_spec)
+                    # 2. Verify Dimensions (with Cache)
+                    if not self._verify_file_dimensions(full_path):
+                        if self.verbose >= 2:
+                            print(f"  [Invalid] {filename}: Dimension mismatch (expected {self.crop_w}x{self.crop_h})")
+                        self.invalid_files[split].append(full_path)
+                        continue
 
-                            elif parsed_params['type'] == 'style':
-                                style_spec = (original_img_path, parsed_params['crop_x'], parsed_params['crop_y'], parsed_params['rot_deg'], parsed_params['scale_perc'], parsed_params['rgb'], parsed_params['pal'], parsed_params['dither'], parsed_params['resolution'])
-                                if style_spec not in self.full_valid_output_specs[split_source]:
-                                    self.invalid_files[split_source].append(os.path.join(root, filename))
-                                else:
-                                    self.existing_output_specs[split_source].add(style_spec)
-                                
-                                # Check for missing target for this style
-                                target_params_for_filename = {
-                                    'crop_x': parsed_params['crop_x'],
-                                    'crop_y': parsed_params['crop_y'],
-                                    'scale_perc': parsed_params['scale_perc'],
-                                    'rot_deg': parsed_params['rot_deg']
-                                }
-                                expected_target_filename = construct_filename(target_params_for_filename, is_target=True)
-                                
-                                if expected_target_filename not in found_target_filenames_in_subdir:
-                                    self.invalid_files[split_source].append(os.path.join(root, filename))
-                                    if self.verbose >= 2:
-                                        warnings.warn(f"Styled file {filename} in {root} has no corresponding target file '{expected_target_filename}'. Marked for deletion.")
-
+                    # 3. Validate against current plan/specs
+                    if parsed['type'] == 'target':
+                        spec = (original_img_path, parsed['crop_x'], parsed['crop_y'], 
+                                parsed['rot_deg'], parsed['scale_perc'])
+                        
+                        if spec in self.full_valid_target_specs[split]:
+                            self.existing_target_specs[split].add(spec)
                         else:
-                            self.invalid_files[split].append(os.path.join(root, filename))
+                            self.invalid_files[split].append(full_path)
+                    
+                    elif parsed['type'] == 'style':
+                        cs_str = parsed['rgb'] # FIX: 'rgb' already contains "RGB" prefix
+                        spec = (original_img_path, parsed['crop_x'], parsed['crop_y'], 
+                                parsed['rot_deg'], parsed['scale_perc'], cs_str, 
+                                parsed['pal'], parsed['dither'], parsed['resolution'])
+                        
+                        # Dependency check: Target must exist
+                        target_fn = f"target_{parsed['crop_x']}_{parsed['crop_y']}_s{parsed['scale_perc']}_r{parsed['rot_deg']}.png"
+                        
+                        if target_fn not in found_targets:
+                            if self.verbose >= 2:
+                                print(f"  [Invalid] Style {filename} missing required target file.")
+                            self.invalid_files[split].append(full_path)
+                        elif spec in self.full_valid_output_specs[split]:
+                            self.existing_output_specs[split].add(spec)
+                        else:
+                            if self.verbose >= 2:
+                                self._print_mismatch_reason(filename, spec, split)
+                            self.invalid_files[split].append(full_path)
 
-                    else:
-                        self.invalid_files[split].append(os.path.join(root, filename))
-                        if self.verbose >= 2: print(f"Found file in subdirectory with missing original image: {os.path.join(root, filename)}")
+    def _verify_file_dimensions(self, file_path):
+        """
+        Checks if the file at file_path matches (self.crop_w, self.crop_h).
+        Uses self.output_cache (diskcache) to store/retrieve size by mtime.
+        """
+        try:
+            mtime = os.path.getmtime(file_path)
+            # Cache key is the relative path (to keep cache portable/clean)
+            rel_path = os.path.relpath(file_path, self.dest_dir)
+            
+            cached = self.output_cache.get_image_cache(rel_path)
+            if cached and cached.get('mtime') == mtime:
+                w, h = cached['size']
+            else:
+                # Cache miss or file changed: Open with PIL (Lazy read of header)
+                with Image.open(file_path) as img:
+                    w, h = img.size
+                self.output_cache.update_image_cache(rel_path, {'mtime': mtime, 'size': (w, h)})
 
-            current_subdir_targets.clear()
-            current_subdir_styles.clear() 
+            return w == self.crop_w and h == self.crop_h
+        except Exception:
+            return False
 
-
-        if self.verbose >= 1:
-            print(f"Found {len(self.existing_target_specs['train'])} existing train target crops.")
-            print(f"Found {len(self.existing_output_specs['train'])} existing train styled outputs.")
-            print(f"Found {len(self.existing_target_specs['test'])} existing test target crops.")
-            print(f"Found {len(self.existing_output_specs['test'])} existing test styled outputs.")
-            print(f"Found {len(self.invalid_files['train'])} invalid files in train output.")
-            print(f"Found {len(self.invalid_files['test'])} invalid files in test output.")
+    def _print_mismatch_reason(self, filename, spec, split):
+        """Helper to diagnose why a parsed file doesn't match the current config."""
+        # Find if the target exists but the style parameters are different
+        path, x, y, r, s, cs, pal, dit, res = spec
+        
+        # Check if this specific crop/rotation is even requested
+        is_requested_crop = any(s[:5] == spec[:5] for s in self.full_valid_output_specs[split])
+        
+        if not is_requested_crop:
+            print(f"  [Invalid] {filename}: Crop/Scale/Rotation ({x},{y}, s{s}, r{r}) is not in current plan.")
+        else:
+            print(f"  [Invalid] {filename}: Parameter mismatch for valid crop.")
+            print(f"    - Found: Res={res}, CS={cs}, Pal={pal}, Dither={dit}")
+            # Optional: find the closest match in config to show the difference
 
     def _cleanup_invalid_files(self):
         # Implements Step 5 logic: Clean up Invalid Files (Optional)
@@ -1557,8 +1566,9 @@ class DatasetGenerator:
                                 res, sx, sy, s_perc, r_deg, rgb, pal, dm, res_name = styled_spec[8], styled_spec[1], styled_spec[2], styled_spec[4], styled_spec[3], styled_spec[5], styled_spec[6], styled_spec[7], styled_spec[8]
                                 pal_str = str(pal) if pal is not None else 'None'
                                 print(f"Generated styled output ({generated_styled_count}/{styled_to_generate_count}): "
-                                      f"Resolution={res_name}, Crop=({sx},{sy}), Scale={s_perc}%, Rotation={r_deg}°, "
-                                      f"ColorSpace={rgb}, Palette={pal_str}, Dither={dm} | ETA: {eta_formatted}")
+                                      f" ETA: {eta_formatted} | "
+                                      f"Resolution={res_name}, Crop=({sx:03d},{sy:03d}), Scale={s_perc}%, Rotation={r_deg}°, "
+                                      f"ColorSpace={rgb}, Palette={pal_str}, Dither={dm}")
                         else:
                             warnings.warn(f"Failed to generate styled output {styled_spec[8]}_{styled_spec[1]}_{styled_spec[2]}...: {message}")
                         completed_futures.add(future)

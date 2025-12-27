@@ -114,10 +114,17 @@ def parse_generated_filename(filename: str, verbose: int = 1) -> dict | None:
                 rgb_val = int(rgb_val_str)
 
                 # Convert palette string 'None' to actual None object
-                pal = int(pal_str) if pal_str.lower() != 'none' else None
+                pal_upper = pal_str.upper()
+                if pal_upper in ['EHB', 'HAM6', 'SHAM', 'DYNAMICHIRES']:
+                    pal = pal_upper
+                elif pal_str.lower() == 'none':
+                    pal = None
+                else:
+                    pal = int(pal_str)
 
                 # Dither method name (lowercase for consistency)
                 dither_method_lower = dither_name.lower()
+                dither_val = dither_method_lower if dither_method_lower != 'none' else None
 
                 # Return a dictionary representing the parsed styled file parameters
                 if verbose >= 3: print(f"DEBUG PARSE: Successfully parsed styled: {filename}")
@@ -132,7 +139,7 @@ def parse_generated_filename(filename: str, verbose: int = 1) -> dict | None:
                     # Extract specific style parameters for easier access
                     'rgb': f"RGB{rgb_val}", # Store as 'RGBxxx' string
                     'pal': pal,             # Palette size (int or None)
-                    'dither': dither_method_lower,  # Dither method name (lowercase string)
+                    'dither': dither_val,  # Dither method name (lowercase string)
                     'filename': filename, # Store original filename
                     # Include components needed for location key construction later (in gather function)
                     'scale_part': f's{scale_perc}',
@@ -243,7 +250,6 @@ def gather_all_samples_from_directory(directory_path: str, expected_crop_size: t
     if verbose >= 2: print(f"Debug Gather: Grouped files by location count: {len(grouped_files_by_location)}")
     if verbose >= 2 and styles_to_include is not None: print(f"Debug Gather: Styles to include filter: {styles_to_include}")
 
-
     # List to hold all available (styled_input_path, target_path) pairs across all locations
     available_samples_pool: list[tuple[str, str]] = []
 
@@ -295,14 +301,12 @@ def gather_all_samples_from_directory(directory_path: str, expected_crop_size: t
                  warnings.warn(f"Could not read target image {target_path} for size validation: {e}. Skipping all samples for this crop location.")
                  continue
 
-
             for styled_file_info in styled_files_info:
                 styled_path = styled_file_info['full_path']
                 # Add the (styled_input_path, target_path) pair to the pool of available samples
                 available_samples_pool.append((styled_path, target_path))
                 if verbose >= 3:
                      print(f"DEBUG GATHER: Added pair: ({os.path.basename(styled_path)}, {os.path.basename(target_path)})")
-
 
     if verbose >= 1: print(f"Sample gathering complete. Found {len(available_samples_pool)} total sample pairs matching criteria.")
 

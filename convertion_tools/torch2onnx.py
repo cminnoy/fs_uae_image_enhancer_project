@@ -26,7 +26,7 @@ class ONNXConverter:
     and then modifying the ONNX graph for chunky (HWC) RGBA input/output and
     optimized input data type handling.
     """
-    def __init__(self, pytorch_model_path, output_onnx_path, model_type, crop_width=True, use_fp16=True, insert_model=True, apply_gamma=True):
+    def __init__(self, pytorch_model_path, output_onnx_path, model_type, crop_width=True, use_fp16=True, insert_model=True, apply_gamma=True, args=None):
         self.pytorch_model_path = pytorch_model_path
         self.output_onnx_path = output_onnx_path
         self.crop_width = crop_width
@@ -37,6 +37,7 @@ class ONNXConverter:
         self.model = None
         self.device = None
         self.model_has_pixel_shuffle = False # Flag to detect PixelShuffle
+        self.args = args
 
     def load_pytorch_model(self):
         """
@@ -49,7 +50,7 @@ class ONNXConverter:
             model_checkpoint = torch.load(self.pytorch_model_path, map_location='cpu')
             
             # Instantiate the model architecture
-            self.model = get_model(self.model_type, False)
+            self.model = get_model(self.model_type, self.args.lores_only, False)
 
             # Check if the checkpoint contains the expected 'model_state_dict' key
             if "model_state_dict" in model_checkpoint:
@@ -1034,6 +1035,7 @@ def main():
         choices=["light", "heavy"],
         help="Type of the model architecture (e.g., 'light', 'heavy')."
     )
+    parser.add_argument('--lores_only', action='store_true', help='Use lores 2x2 subsampling')
 
     args = parser.parse_args()
 
@@ -1044,7 +1046,8 @@ def main():
         crop_width=args.crop_width,
         use_fp16=args.use_fp16,
         insert_model=args.insert_model,
-        apply_gamma=args.apply_gamma
+        apply_gamma=args.apply_gamma,
+        args=args
     )
 
     # Load PyTorch model and export to initial ONNX in memory

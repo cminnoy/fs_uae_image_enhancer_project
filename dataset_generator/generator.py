@@ -940,7 +940,7 @@ class DatasetGenerator:
         }
         
         # Prepare a ThreadPoolExecutor for parallel scanning
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers * 2) as executor: # Double of max-workers for I/O bound
             futures = []
 
             for split, image_paths in all_image_paths.items():
@@ -950,10 +950,10 @@ class DatasetGenerator:
                     for rot_deg in self.valid_rotations:
                         for ds_perc in self.valid_downscales:
                             if self.stop_requested: return
-                            cache_key = f"{img_path}_rot{rot_deg}_ds{ds_perc}"
+                            cache_key = f"{img_path}_w{self.crop_w}_h{self.crop_h}_rot{rot_deg}_ds{ds_perc}"
                             cached_data = cache.get_image_cache(cache_key)
                             if self.verbose >= 2:
-                                print(f"Cached data for {img_path} (rot: {rot_deg}°, scale: {ds_perc}%) : {cached_data}")
+                                print(f"Cached data for {img_path} ({self.crop_w}x{self.crop_h}, rot: {rot_deg}°, scale: {ds_perc}%) : {cached_data}")
 
                             # If cache is valid, skip scanning
                             if cached_data and cached_data['mtime'] == os.path.getmtime(img_path):
@@ -978,7 +978,7 @@ class DatasetGenerator:
                 if self.stop_requested: return
                 try:
                     img_path, crop_w, crop_h, rot_deg, ds_perc, valid_coords, total_coords = future.result()
-                    cache_key = f"{img_path}_rot{rot_deg}_ds{ds_perc}"
+                    cache_key = f"{img_path}_w{crop_w}_h{crop_h}_rot{rot_deg}_ds{ds_perc}"
 
                     # Determine the split (train/test) based on the image path
                     split = 'train' if img_path in self.train_image_paths else 'test'

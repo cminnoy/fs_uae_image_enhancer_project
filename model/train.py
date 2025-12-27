@@ -104,7 +104,7 @@ class Trainer:
             directory_path=self.args.data_dir,
             expected_crop_size=self.args.generator_crop_size,
             styles_to_include=None, # Include all styles for training
-            verbose=1 if self.is_master else 0
+            verbose=2 if self.is_master else 0
         )
         
         # Determine training crop size from arguments (must be a tuple)
@@ -163,7 +163,7 @@ class Trainer:
     def setup_model_and_optimizer(self):
         if self.is_master:
             print(f"Initializing model: {self.args.model_type}")
-        self.model = get_model(self.args.model_type, verbose=self.args.verbose).to(self.device)
+        self.model = get_model(self.args.model_type, lores_only=self.args.lores_only, verbose=self.args.verbose).to(self.device)
         if self.is_master and self.args.print_model_layers:
             print(self.model)
         
@@ -178,7 +178,7 @@ class Trainer:
             self.load_checkpoint(self.args.load_checkpoint)
             
         # Wrap the model with DDP
-        self.model = DDP(self.model, device_ids=[self.local_rank], find_unused_parameters=True)
+        self.model = DDP(self.model, device_ids=[self.local_rank], find_unused_parameters=self.args.find_unused_parameters)
 
     @torch.no_grad()
     def validate(self):
@@ -272,6 +272,9 @@ class Trainer:
                 # Restore Early Stopping State
                 if 'early_stopping_state' in checkpoint:
                     self.early_stopper.load_state_dict(checkpoint['early_stopping_state'])
+                    self.early_stopper.patience = self.args.early_stop_patience
+                    self.early_stopper.min_delta = self.args.early_stop_delta
+                    self.early_stopper.should_stop = False
                 else:
                     # Backward compatibility for older checkpoints
                     old_best = checkpoint.get('best_loss')
@@ -329,7 +332,7 @@ class Trainer:
             avg_epoch_loss = epoch_loss / len(self.train_dataloader)
             loss_tensor = torch.tensor([avg_epoch_loss]).to(self.device)
             dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-            global_train_loss = loss_tensor.item() / dist.get_world_size() 
+            global_train_loss = loss_tensor.item() / dist.get_world_size()
 
             # --- Validation & Early Stopping ---
             # Run validation (collects global average)
@@ -351,6 +354,8 @@ class Trainer:
                 
                 # Determine if this is the best model (based on validation loss)
                 is_best = (global_val_loss == self.early_stopper.best_loss)
+                if is_best:
+                    self.early_stopper.counter = 0
                 
                 self.save_checkpoint(is_best, epoch, global_train_loss, global_val_loss)
                 
@@ -377,10 +382,10 @@ def parse_args():
     # Data arguments
     parser.add_argument('--data_dir', type=str, required=True, 
                         help='Path to the directory containing generator output crops (e.g., /path/to/train).')
-    add_size_argument(parser, '--generator_crop_size', default=(376, 288), 
-                      help='The (W, H) size of the images produced by generator.py (source crops). Default: 376 288')
-    add_size_argument(parser, '--train_crop_size', default=(376, 288), 
-                      help='The (W, H) size of the random sub-crops used for actual training. Default: 376 288')
+    add_size_argument(parser, '--generator_crop_size', default="376 288", 
+                      help='The \"W, H\" size of the images produced by generator.py (source crops). Default: 376 288')
+    add_size_argument(parser, '--train_crop_size', default="376 288",
+                      help='The \"W, H\" size of the random sub-crops used for actual training. Default: 376 288')
     parser.add_argument('--samples_per_epoch', type=int, default=50000, 
                         help='The number of samples the dataset reports for one epoch.')
     parser.add_argument('--shuffle_data', action='store_true', default=False,
@@ -399,6 +404,8 @@ def parse_args():
     parser.add_argument('--val_fraction', type=float, default=0.1)
     parser.add_argument("--early-stop-patience", type=int, default=10)
     parser.add_argument("--early-stop-delta", type=float, default=1e-4)
+    parser.add_argument('--find_unused_parameters', action='store_true', default=False,
+                        help='If True, set find_unused_parameters=True in DDP (needed if some model parameters are not used in every forward pass).')
 
     # Checkpointing and logging
     parser.add_argument('--checkpoint_dir', type=str, default='checkpoints', 
@@ -415,6 +422,7 @@ def parse_args():
     # Performance arguments
     parser.add_argument('--use_amp', action='store_true', help='Use Automatic Mixed Precision (AMP).')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose model output.')
+    parser.add_argument('--lores_only', action='store_true', help='Use lores only mode.')
     
     return parser.parse_args()
 

@@ -83,7 +83,6 @@ class ResidualBlock(nn.Module):
         self.act1 = nn.ReLU(inplace=True) 
         self.conv2 = nn.Conv2d(mid_channels, out_channels, kernel_size, padding=kernel_size//2, bias=True)
         self.act2 = nn.ReLU(inplace=True) # Activation after addition is standard, but here we do it inside
-        self.skip_alpha = nn.Parameter(torch.tensor(0.5), requires_grad=True)
 
         self.skip_proj = None
         if in_channels != out_channels:
@@ -98,8 +97,6 @@ class ResidualBlock(nn.Module):
         
         if self.skip_proj:
             residual = self.skip_proj(residual)
-        else:
-            residual = self.skip_alpha * residual
             
         x = x + residual
         x = self.act2(x) # Post-addition activation
@@ -233,37 +230,36 @@ class HeadProcessing(nn.Module):
 class ResidualUNet(nn.Module):
     def __init__(self, input_channels=3, output_channels=3,
                  base_channels=48, max_channels=256, unet_depth=3, blocks_per_level=2,
-                 k_paths_head=3, k_paths_bottleneck=3, internal_block_channels_ratio=1.0, verbose=False):
+                 k_paths_head=3, k_paths_bottleneck=3, internal_block_channels_ratio=1.0,
+                 lores_only=False, verbose=False):
         super().__init__()
         self.verbose = verbose
         self.unet_depth = unet_depth
         self.output_channels = output_channels
-
-        # --- Criterion ---
+        self.lores_only = lores_only
+        
         self.perceptual_criterion = PerceptualLoss(
-                                        pixel_loss_weight=0.985,
-                                        vgg_weight=0.010,
-                                        pixel_loss_type='charbonnier',
-                                        high_frequency_weight=0.005,
-                                        high_frequency_type='laplacian',
-                                        lambda_lum=0.0,
-                                        input_is_linear=True
-                                    )
+            pixel_loss_weight=0.95,
+            vgg_weight=0.03,
+            pixel_loss_type='charbonnier',
+            high_frequency_weight=0.02,
+            high_frequency_type='laplacian',
+            lambda_lum=0.0,
+            input_is_linear=True
+        )
     
         # --- Global Skip Connection ---
         self.global_skip = (
-            nn.Identity()
-                if input_channels == output_channels
-                else nn.Conv2d(input_channels, output_channels, 1, bias=False)
+            nn.Identity() if input_channels == output_channels
+            else nn.Conv2d(input_channels, output_channels, 1, bias=False)
         )
-        self.skip_alpha = nn.Parameter(torch.tensor(0.5), requires_grad=True).float()
+        self.register_buffer('skip_alpha', torch.tensor(0.5))
     
         # --- Head ---
         self.head = HeadProcessing(input_channels, base_channels, k_paths_head, onebyone_expansion=3.0, twobytwo_expansion=4.0)
 
         # --- Encoder ---
         self.encoder_blocks = nn.ModuleList()
-        self.skip_alphas = nn.ParameterList([nn.Parameter(torch.tensor(0.5).float(), requires_grad=True) for _ in range(unet_depth)])
         in_ch = base_channels
         
         # Helper to cap channels
@@ -295,7 +291,7 @@ class ResidualUNet(nn.Module):
         # Optimized bottleneck: kPath block (rich features) + 1 Standard ResBlock
         self.bottleneck = nn.Sequential(
             kPathResidualFeatureBlock(bottleneck_ch, bottleneck_ch // 2, bottleneck_ch,
-                                      k_paths=k_paths_bottleneck, with_skip_connection=True,
+                                      k_paths=k_paths_bottleneck, with_skip_connection=False,
                                       use_concatenation=True, use_attention=True),
             ResidualBlock(bottleneck_ch, bottleneck_ch // 2, bottleneck_ch, kernel_size=3)
         )
@@ -305,6 +301,7 @@ class ResidualUNet(nn.Module):
         self.decoder_blocks = nn.ModuleList()
         
         prev_out_ch = bottleneck_ch
+        refine_out_channels = output_channels * (16 if lores_only else 4)
 
         for d in reversed(range(unet_depth)):
             current_level_ch = get_ch(d)
@@ -313,7 +310,7 @@ class ResidualUNet(nn.Module):
                 # Final Stage (No Upsampling)
                 in_ch = prev_out_ch + base_channels # Skip connection from head
                 self.decoder_blocks.append(
-                    nn.Conv2d(in_ch, output_channels, 1)
+                    nn.Conv2d(in_ch, in_ch, 3, padding=1)
                 )
             else:
                 # Intermediate Stage (Upsampling via PixelShuffle happens before this block)
@@ -335,12 +332,21 @@ class ResidualUNet(nn.Module):
 
         # --- Refinement ---
         self.refine = nn.Sequential(
-            nn.Conv2d(output_channels, output_channels * 4, 3, padding=1),
-            nn.PixelShuffle(2)
+            ResidualBlock(prev_out_ch + base_channels, int((prev_out_ch + base_channels) * 2), refine_out_channels, kernel_size=3),
+            nn.PixelShuffle(4 if lores_only else 2)
         )
+
+    def set_alpha(self, alpha_value):
+        self.skip_alpha.fill_(float(alpha_value))
 
     def forward(self, x):
         x_in = x
+
+        # Slice for lores only mode; we can drop every second pixel in both dimensions
+        if self.lores_only:
+            x = x[:, :, ::2, ::2]
+
+        # Head processing
         x_head = self.head(x)
 
         if self.verbose:
@@ -371,10 +377,6 @@ class ResidualUNet(nn.Module):
 
             skip = x_head if d_val == 0 else encoder_features[d_val - 1]
 
-            # Apply corresponding skip alpha (match dtype/device to avoid upcast issues)
-            alpha = self.skip_alphas[d_val]
-            skip = skip * alpha
-
             # Pad if necessary
             if x_up.shape[2:] != skip.shape[2:]:
                 diffY = skip.size(2) - x_up.size(2)
@@ -386,6 +388,7 @@ class ResidualUNet(nn.Module):
 
         x = F.relu(x, inplace=True)
         x = self.refine(x)
+
         x = x + self.skip_alpha * self.global_skip(x_in)
         return x
     
@@ -418,30 +421,32 @@ class ResidualUNet(nn.Module):
             'output_shape': self(input_tensor).shape
         }
 
-def get_model(name: str = 'light', verbose: bool = False):
+def get_model(name: str = 'light', lores_only: bool = False, verbose: bool = False):
     """
     Returns a selected model configuration.
     """
     if name == 'light':
         return ResidualUNet(
-            unet_depth=3,           # Target: Depth 3
-            blocks_per_level=1,     # Reduced blocks per level to keep FPS high with increased depth
-            base_channels=24,
-            max_channels=128,       # Cap channels
-            k_paths_head=2,
+            unet_depth=3 if lores_only else 4,
+            blocks_per_level=1,
+            base_channels=28,
+            max_channels=128,
+            k_paths_head=3,
             k_paths_bottleneck=3,
-            internal_block_channels_ratio=1.0,
+            internal_block_channels_ratio=2.0,
+            lores_only=lores_only,
             verbose=verbose
         )
     elif name == 'heavy':
         return ResidualUNet(
-            unet_depth=4,           # Target: Depth 3
+            unet_depth=4 if lores_only else 5,
             blocks_per_level=3,
             base_channels=48,
-            max_channels=256,       # Cap channels
+            max_channels=256,
             k_paths_head=4,
             k_paths_bottleneck=5,
-            internal_block_channels_ratio=1.0,
+            internal_block_channels_ratio=1.5,
+            lores_only=lores_only,
             verbose=verbose
         )
     else:
@@ -454,11 +459,12 @@ if __name__ == "__main__":
     parser.add_argument('--no_compile', action='store_true', help='Disable torch.compile for debugging.')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose printing for debugging.')
     parser.add_argument('--save_model', type=str, default=None, help='Path to save the model state_dict.')
+    parser.add_argument('--lores_only', action='store_true', help='Use lores only mode.')
 
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = get_model(args.model_type, verbose=args.verbose).to(device)
+    model = get_model(args.model_type, lores_only=args.lores_only, verbose=args.verbose).to(device)
 
     if args.save_model:
         print(f"Saving model state_dict to {args.save_model}")

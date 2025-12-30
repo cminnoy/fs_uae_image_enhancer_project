@@ -6,11 +6,11 @@ from pathlib import Path
 from model_residual_unet import get_model
 
 class AmigaEnhancer:
-    def __init__(self, model_type, checkpoint_path, device="cuda"):
+    def __init__(self, model_type, checkpoint_path, lores_only, device="cuda"):
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         
         # Load Architecture
-        self.model = get_model(model_type).to(self.device)
+        self.model = get_model(model_type, lores_only).to(self.device)
         
         # Load Checkpoint
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
@@ -54,6 +54,7 @@ def main():
     parser.add_argument('--type', type=str, required=True, choices=['light', 'heavy'])
     parser.add_argument('--input', type=str, required=True, help='Filename in samples/ or full path')
     parser.add_argument('--output', type=str, required=True, help='Output filename')
+    parser.add_argument('--lores_only', action='store_true', help='Process only low-resolution input')
     args = parser.parse_args()
 
     base_dir = Path(__file__).parent
@@ -68,7 +69,7 @@ def main():
         print(f"Error: Weight file not found at {ckpt_path}")
         return
 
-    enhancer = AmigaEnhancer(args.type, ckpt_path)
+    enhancer = AmigaEnhancer(args.type, ckpt_path, args.lores_only)
     enhancer.process(in_path, Path(args.output))
 
 if __name__ == "__main__":

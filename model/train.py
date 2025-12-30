@@ -10,7 +10,9 @@ import sys
 import time
 import shutil
 
-# --- DDP Imports ---
+import torchvision.transforms.functional as TF
+from torchvision.utils import make_grid
+from PIL import Image
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
@@ -63,6 +65,40 @@ class EarlyStopping:
         self.best_loss = state_dict.get('best_loss')
         self.counter = state_dict.get('counter', 0)
         self.should_stop = state_dict.get('should_stop', False)
+
+# ------------------------------------------------------------
+# Sample Visualizer for TensorBoard
+# ------------------------------------------------------------
+class Visualizer:
+    def __init__(self, sample_dir, device, writer):
+        self.device = device
+        self.writer = writer
+        self.sample_tensors = []
+        
+        if os.path.exists(sample_dir):
+            import torchvision.transforms.functional as TF
+            from PIL import Image
+            files = sorted([f for f in os.listdir(sample_dir) if f.endswith('.png')])
+            for f in files:
+                img = Image.open(os.path.join(sample_dir, f)).convert('RGB')
+                t = TF.to_tensor(img).unsqueeze(0).to(self.device)
+                self.sample_tensors.append(t)
+
+    def log_epoch(self, model, epoch):
+        # Master performs the inference
+        model.eval()
+        comparisons = []
+        with torch.no_grad():
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                for img_t in self.sample_tensors:
+                    output = model(img_t)
+                    combined = torch.cat([img_t, torch.clamp(output, 0, 1)], dim=3)
+                    comparisons.append(combined.squeeze(0).cpu())
+        
+        from torchvision.utils import make_grid
+        grid = make_grid(comparisons, nrow=1)
+        self.writer.add_image('Visual_Progress/Samples', grid, epoch)
+        model.train()
 
 # --------------------------------------------------------------------------------
 # Trainer Class Definition
@@ -295,11 +331,21 @@ class Trainer:
         """Main training loop."""
         if self.is_master:
             print(f"\nStarting DDP training for {self.args.epochs} epochs on device {self.device}")
+            self.visualizer = Visualizer('samples', self.device, self.writer)
         
         for epoch in range(self.current_epoch, self.args.epochs):
             self.model.train()
             epoch_loss = 0.0
-            self.train_sampler.set_epoch(epoch) 
+            self.train_sampler.set_epoch(epoch)
+
+            # Use absolute epoch for alpha calculation
+            if self.args.alpha_delta != 0:
+                new_alpha = self.args.alpha_start + (epoch * self.args.alpha_delta)
+                new_alpha = max(0.0, min(1.0, new_alpha))
+                self.model.module.set_alpha(new_alpha)
+                
+                if self.is_master:
+                    print(f"Epoch {epoch+1}: Alpha adjusted to {new_alpha:.4f}")
 
             if self.is_master:
                 print(f"\n--- Epoch {epoch+1}/{self.args.epochs} ---")
@@ -328,6 +374,9 @@ class Trainer:
                     global_step = epoch * len(self.train_dataloader) + batch_idx
                     self.writer.add_scalar('Loss/train_batch', current_loss, global_step)
             
+            if self.is_master:
+                print(f"Epoch {epoch+1} training complete. Average Loss: {epoch_loss / len(self.train_dataloader):.6f}")
+
             # --- End of Epoch Training Aggregation ---
             avg_epoch_loss = epoch_loss / len(self.train_dataloader)
             loss_tensor = torch.tensor([avg_epoch_loss]).to(self.device)
@@ -335,7 +384,6 @@ class Trainer:
             global_train_loss = loss_tensor.item() / dist.get_world_size()
 
             # --- Validation & Early Stopping ---
-            # Run validation (collects global average)
             global_val_loss = self.validate()
             
             # Check Early Stopping (Only Master decides, then broadcasts)
@@ -343,10 +391,11 @@ class Trainer:
             
             if self.is_master:
                 # Log metrics
+                self.writer.add_scalar('Alpha/epoch', self.model.module.skip_alpha.item(), epoch)
                 self.writer.add_scalar('Loss/train_epoch', global_train_loss, epoch)
                 self.writer.add_scalar('Loss/val_epoch', global_val_loss, epoch)
                 self.writer.add_scalar('LearningRate/epoch', self.optimizer.param_groups[0]['lr'], epoch)
-                
+                self.visualizer.log_epoch(self.model.module, epoch)            
                 print(f"Epoch {epoch+1} finished. Train Loss: {global_train_loss:.6f} | Val Loss: {global_val_loss:.6f}")
                 
                 # Check for improvement
@@ -362,6 +411,11 @@ class Trainer:
                 if should_stop:
                     print(f"Early stopping triggered after {self.args.early_stop_patience} epochs with no improvement.")
                     stop_training_tensor[0] = 1
+
+
+            # Rank 1 will wait until Rank 0 finishes log_epoch.
+            if dist.is_initialized():
+                dist.barrier()
 
             # Broadcast stopping decision to all GPUs
             dist.broadcast(stop_training_tensor, src=0)
@@ -423,6 +477,9 @@ def parse_args():
     parser.add_argument('--use_amp', action='store_true', help='Use Automatic Mixed Precision (AMP).')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose model output.')
     parser.add_argument('--lores_only', action='store_true', help='Use lores only mode.')
+    parser.add_argument('--alpha_start', type=float, default=0.5, help='Initial value for skip_alpha.')
+    parser.add_argument('--alpha_delta', type=float, default=0.0, help='Delta added to alpha every epoch.')
+    parser.add_argument('--static_alpha', action='store_true', help='If set, skip_alpha will not be learnable.')
     
     return parser.parse_args()
 

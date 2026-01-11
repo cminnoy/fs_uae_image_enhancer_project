@@ -105,13 +105,14 @@ class ResidualBlock(nn.Module):
 class kPathResidualFeatureBlock(nn.Module):
     def __init__(self, in_channels, mid_channels, out_channels,
                  k_paths=3, with_skip_connection=True,
-                 use_concatenation=True, use_attention=False):
+                 use_concatenation=True, use_attention=False, use_merge=True):
         super().__init__()
 
         self.k_paths = k_paths
         self.with_skip_connection = with_skip_connection
         self.use_concatenation = use_concatenation
         self.use_attention = use_attention
+        self.use_merge = use_merge
 
         # Build multi-path feature extraction blocks
         self.paths = nn.ModuleList([
@@ -127,10 +128,11 @@ class kPathResidualFeatureBlock(nn.Module):
         # Combine features from paths
         combined_channels = out_channels * k_paths if use_concatenation else out_channels
 
-        self.merge_conv = nn.Sequential(
-            nn.Conv2d(combined_channels, out_channels, kernel_size=1, bias=True),
-            nn.ReLU(inplace=True)
-        )
+        if use_merge:
+            self.merge_conv = nn.Sequential(
+                nn.Conv2d(combined_channels, out_channels, kernel_size=1, bias=True),
+                nn.ReLU(inplace=True)
+            )
 
         # Optional attention
         if use_attention:
@@ -160,7 +162,10 @@ class kPathResidualFeatureBlock(nn.Module):
             combined = self.attention(combined)
 
         # Merge
-        fused = self.merge_conv(combined)
+        if self.use_merge:
+            fused = self.merge_conv(combined)
+        else:
+            fused = combined
 
         # Residual
         if self.with_skip_connection:
@@ -177,7 +182,6 @@ class HeadProcessing(nn.Module):
         self.pixel_unshuffle = nn.PixelUnshuffle(2)
         self.avg_pool = nn.AvgPool2d(2, stride=2)
         self.max_pool = nn.MaxPool2d(2, stride=2)
-        self.min_pool = nn.MaxPool2d(2, stride=2)
         
         self.conv_2x2_path = nn.Conv2d(
             in_channels=input_channels,
@@ -194,38 +198,48 @@ class HeadProcessing(nn.Module):
             stride=1
         )
 
-        concat_input_channels=int(input_channels * 4 * onebyone_expansion) + 3 * input_channels + int(input_channels * twobytwo_expansion)
+        concat_input_channels=(input_channels * 4) + \
+                      int(input_channels * 4 * onebyone_expansion) + \
+                      (3 * input_channels) + \
+                      int(input_channels * twobytwo_expansion)
         
-        self.conv_stack = nn.Sequential(
-            nn.Conv2d(concat_input_channels, base_channels, 1, padding=0, bias=True),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(base_channels, base_channels, 3, padding=1, bias=True),
-            nn.ReLU(inplace=True),
-            kPathResidualFeatureBlock(
-                in_channels=base_channels,
+        self.conv_stack = kPathResidualFeatureBlock(
+                in_channels=concat_input_channels,
                 mid_channels=int(base_channels / 1.5),
                 out_channels=base_channels,
                 k_paths=k_paths,
                 with_skip_connection=False,
                 use_concatenation=True,
-                use_attention=False
+                use_attention=False,
+                use_merge=False
             )
-        )
+
+        stack_out_ch = base_channels * k_paths
+        combined_ch = (input_channels * 4) + stack_out_ch
+        self.se = SqueezeExcite(stack_out_ch, reduction=8)
+        self.conv_reduce = nn.Conv2d(combined_ch, base_channels, kernel_size=1, bias=True)
+        self.act = nn.ReLU(inplace=True)
 
     def forward(self, x):
         unshuffled = self.pixel_unshuffle(x)
         unshuffled_expanded = self.conv_expand(unshuffled)
         
-        avg_pool = self.avg_pool(x)
-        max_pool = self.max_pool(x)
-        min_pool = self.min_pool(-x)
-        contrast = max_pool - min_pool
+        avg_p = self.avg_pool(x)
+        max_p = self.max_pool(x)
+        min_p_neg = self.max_pool(-x) 
+        contrast = max_p + min_p_neg
         
         conv_2x2 = self.conv_2x2_path(x)
+
+        concat = torch.cat([unshuffled, unshuffled_expanded, avg_p, max_p, contrast, conv_2x2], dim=1)
         
-        concat = torch.cat([unshuffled_expanded, avg_pool, max_pool, contrast, conv_2x2], dim=1)
-        
-        return self.conv_stack(concat)
+        stacked = self.conv_stack(concat)
+        result = self.se(stacked)
+        result = torch.cat([unshuffled, result], dim=1)
+        result = self.conv_reduce(result)
+        result = self.act(result)
+
+        return result
 
 class ResidualUNet(nn.Module):
     def __init__(self, input_channels=3, output_channels=3,
@@ -247,13 +261,6 @@ class ResidualUNet(nn.Module):
             lambda_lum=0.0,
             input_is_linear=True
         )
-    
-        # --- Global Skip Connection ---
-        self.global_skip = (
-            nn.Identity() if input_channels == output_channels
-            else nn.Conv2d(input_channels, output_channels, 1, bias=False)
-        )
-        self.register_buffer('skip_alpha', torch.tensor(0.5))
     
         # --- Head ---
         self.head = HeadProcessing(input_channels, base_channels, k_paths_head, onebyone_expansion=3.0, twobytwo_expansion=4.0)
@@ -286,9 +293,8 @@ class ResidualUNet(nn.Module):
 
         self.downs = nn.ModuleList([nn.PixelUnshuffle(2) for _ in range(unet_depth - 1)])
 
-        # --- Bottleneck ---
+        # --- Bottleneck ---        
         bottleneck_ch = get_ch(unet_depth - 1)
-        # Optimized bottleneck: kPath block (rich features) + 1 Standard ResBlock
         self.bottleneck = nn.Sequential(
             kPathResidualFeatureBlock(bottleneck_ch, bottleneck_ch // 2, bottleneck_ch,
                                       k_paths=k_paths_bottleneck, with_skip_connection=False,
@@ -332,19 +338,24 @@ class ResidualUNet(nn.Module):
 
         # --- Refinement ---
         self.refine = nn.Sequential(
-            ResidualBlock(prev_out_ch + base_channels, int((prev_out_ch + base_channels) * 2), refine_out_channels, kernel_size=3),
+            ResidualBlock(
+                prev_out_ch + base_channels, 
+                int((prev_out_ch + base_channels) * 2), 
+                refine_out_channels, 
+                kernel_size=3
+            ),
+            nn.Conv2d(refine_out_channels, refine_out_channels, 3, padding=1),
             nn.PixelShuffle(4 if lores_only else 2)
         )
-
-    def set_alpha(self, alpha_value):
-        self.skip_alpha.fill_(float(alpha_value))
 
     def forward(self, x):
         x_in = x
 
         # Slice for lores only mode; we can drop every second pixel in both dimensions
         if self.lores_only:
-            x = x[:, :, ::2, ::2]
+            #  x = x[:, :, ::2, ::2] # Using alternative as MiGraph does not support advanced indexing  
+            # x = nn.PixelUnshuffle(2)(x)[:, :3, :, :]
+            x = F.avg_pool2d(x, kernel_size=2, stride=2)
 
         # Head processing
         x_head = self.head(x)
@@ -388,8 +399,6 @@ class ResidualUNet(nn.Module):
 
         x = F.relu(x, inplace=True)
         x = self.refine(x)
-
-        x = x + self.skip_alpha * self.global_skip(x_in)
         return x
     
     def criterion(self, output, target):
@@ -429,23 +438,23 @@ def get_model(name: str = 'light', lores_only: bool = False, verbose: bool = Fal
         return ResidualUNet(
             unet_depth=3 if lores_only else 4,
             blocks_per_level=1,
-            base_channels=28,
+            base_channels=32 if lores_only else 28,
             max_channels=128,
-            k_paths_head=3,
-            k_paths_bottleneck=3,
-            internal_block_channels_ratio=2.0,
+            k_paths_head=5 if lores_only else 3,
+            k_paths_bottleneck=5 if lores_only else 3,
+            internal_block_channels_ratio=2.0 if lores_only else 1.5,
             lores_only=lores_only,
             verbose=verbose
         )
     elif name == 'heavy':
         return ResidualUNet(
-            unet_depth=4 if lores_only else 5,
-            blocks_per_level=3,
-            base_channels=48,
+            unet_depth=3 if lores_only else 4,
+            blocks_per_level=4 if lores_only else 2,
+            base_channels=72 if lores_only else 32,
             max_channels=256,
-            k_paths_head=4,
+            k_paths_head=5,
             k_paths_bottleneck=5,
-            internal_block_channels_ratio=1.5,
+            internal_block_channels_ratio=2.0 if lores_only else 1.5,
             lores_only=lores_only,
             verbose=verbose
         )

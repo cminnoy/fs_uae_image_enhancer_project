@@ -4,9 +4,9 @@ python generator.py \
     --test_images dataset/groundtruth_test \
     --train_num_crops 10000 \
     --test_num_crops 2000 \
-    --destination_dir dataset/dataset_ocs_games \
+    --destination_dir dataset/dataset_aga_games \
     --max_workers 28 \
-    --rgb 444 \
+    --rgb 888 \
     --crop_size 752 576 \
     --rotate 0 1 2 3 4 5 6 7 8 9 10 \
              11 12 13 14 15 16 17 18 19 20 \
@@ -20,6 +20,6 @@ python generator.py \
     --downscale 90 80 70 60 50 40 \
     --resolution lores \
     --palette_algorithm median_cut \
-    --palette 24 32 64 128 \
-    --dither checkerboard floyd-steinberg atkinson sierra2 stucki burkes sierra3 bayer2x2 bayer4x4 bayer8x8 None \
+    --palette 0 128 256 512 \
+    --dither checkerboard floyd-steinberg atkinson sierra2 stucki burkes sierra3 bayer2x2 bayer4x4 bayer8x8 \
     --verbose 1

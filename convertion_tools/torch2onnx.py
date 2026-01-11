@@ -4,17 +4,11 @@ import torch.onnx
 import sys
 import onnx
 import onnx.helper
-from onnx import TensorProto
 import numpy as np
 import argparse
 import io # For saving ONNX model to a byte stream in memory for verification
 import os
 import time
-
-# Importing ONNX symbolic helper and opset11 for custom symbolic functions
-import torch.onnx.symbolic_helper as sym_help
-import torch.onnx.symbolic_opset18 as sym_opset18
-from torch.onnx.symbolic_helper import parse_args, _unimplemented
 
 sys.path.append(os.getcwd()) # Ensure current directory is in path for model loading
 

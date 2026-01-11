@@ -12,15 +12,15 @@ EPOCHS_DIGGING="${2:-16}"
 
 # Set initial batch size based on model type
 if [ "$MODEL_TYPE" = "light" ]; then
-    BATCH_SIZE=22
+    BATCH_SIZE=24
     echo "Using LIGHT model with batch size $BATCH_SIZE"
 else
-    BATCH_SIZE=16
+    BATCH_SIZE=18
     echo "Using FULL model with batch size $BATCH_SIZE"
 fi
 
-DATASET="../dataset_generator/dataset/dataset_train_ocs_games_large"
-MODEL_DIR="$MODEL_TYPE"
+DATASET="../dataset_generator/dataset/dataset_aga_games"
+MODEL_DIR="${MODEL_TYPE}_aga_games"
 
 # Prefer the latest epoch checkpoint (highest epoch number). If none, fall back to best_model.pth.
 LATEST_EPOCH_CHECKPOINT=$(ls -1 "${MODEL_DIR}"/epoch_*.pth 2>/dev/null | sort -V | tail -n 1)
@@ -32,9 +32,7 @@ else
     CHECKPOINT=""
 fi
 
-SAMPLES_PER_EPOCH=50000
-ALPHA_START=0.5
-ALPHA_DELTA=0.05
+SAMPLES_PER_EPOCH=44000
 
 # --------------------------------------------------
 # Phase 1: "Stepping on the grass" (ONLY if no checkpoint exists)
@@ -52,12 +50,9 @@ if [ -z "$CHECKPOINT" ] || [[ ! -f "$CHECKPOINT" ]]; then
         --shuffle_data \
         --samples_per_epoch $SAMPLES_PER_EPOCH \
         --lores_only \
-        --checkpoint_dir "$MODEL_TYPE" \
+        --checkpoint_dir "$MODEL_DIR" \
         --num_workers 12 \
-        --use_amp \
-        --alpha_start "$ALPHA_START" \
-        --alpha_delta "$ALPHA_DELTA" \
-        --static_alpha
+        --use_amp
 else
     echo "Found checkpoint ($CHECKPOINT). Skipping initial training step."
 fi
@@ -87,13 +82,10 @@ if [ -n "$CHECKPOINT" ] && [[ -f "$CHECKPOINT" ]]; then
         --generator_crop_size "752 576" \
         --train_crop_size "752 576" \
         --samples_per_epoch $SAMPLES_PER_EPOCH \
-        --checkpoint_dir "$MODEL_TYPE" \
+        --checkpoint_dir "$MODEL_DIR" \
         --lores_only \
         --num_workers 12 \
-        --use_amp \
-        --alpha_start "$ALPHA_START" \
-        --alpha_delta "$ALPHA_DELTA" \
-        --static_alpha
+        --use_amp
 else
     echo "No checkpoint to load — starting without --load_checkpoint"
     torchrun --nproc_per_node 2 train.py \
@@ -105,12 +97,9 @@ else
         --generator_crop_size "752 576" \
         --train_crop_size "752 576" \
         --samples_per_epoch $SAMPLES_PER_EPOCH \
-        --checkpoint_dir "$MODEL_TYPE" \
+        --checkpoint_dir "$MODEL_DIR" \
         --lores_only \
         --num_workers 12 \
-        --use_amp \
-        --alpha_start "$ALPHA_START" \
-        --alpha_delta "$ALPHA_DELTA" \
-        --static_alpha
+        --use_amp
 fi
 

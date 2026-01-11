@@ -1,11 +1,13 @@
 #!/bin/bash
 python generator.py \
     --train_images dataset/groundtruth_train \
-    --train_num_crops 20 \
-    --destination_dir dataset/dataset_train_aga \
-    --max_workers 24 \
+    --test_images dataset/groundtruth_test \
+    --train_num_crops 10000 \
+    --test_num_crops 2000 \
+    --destination_dir dataset/dataset_aga \
+    --max_workers 28 \
     --rgb 888 \
-    --crop_size 376 288 \
+    --crop_size 752 576 \
     --rotate 0 1 2 3 4 5 6 7 8 9 10 \
              11 12 13 14 15 16 17 18 19 20 \
              21 22 23 24 25 26 27 28 29 30 \
@@ -18,6 +20,6 @@ python generator.py \
     --downscale 90 80 70 60 50 40 \
     --resolution lores lores_laced hires hires_laced \
     --palette_algorithm median_cut \
-    --palette 0 32 64 128 256 512 \
+    --palette 0 128 256 512 \
     --dither checkerboard floyd-steinberg atkinson sierra2 stucki burkes sierra3 bayer2x2 bayer4x4 bayer8x8 \
     --verbose 1

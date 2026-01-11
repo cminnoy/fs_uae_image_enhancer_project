@@ -338,15 +338,6 @@ class Trainer:
             epoch_loss = 0.0
             self.train_sampler.set_epoch(epoch)
 
-            # Use absolute epoch for alpha calculation
-            if self.args.alpha_delta != 0:
-                new_alpha = self.args.alpha_start + (epoch * self.args.alpha_delta)
-                new_alpha = max(0.0, min(1.0, new_alpha))
-                self.model.module.set_alpha(new_alpha)
-                
-                if self.is_master:
-                    print(f"Epoch {epoch+1}: Alpha adjusted to {new_alpha:.4f}")
-
             if self.is_master:
                 print(f"\n--- Epoch {epoch+1}/{self.args.epochs} ---")
             
@@ -391,7 +382,6 @@ class Trainer:
             
             if self.is_master:
                 # Log metrics
-                self.writer.add_scalar('Alpha/epoch', self.model.module.skip_alpha.item(), epoch)
                 self.writer.add_scalar('Loss/train_epoch', global_train_loss, epoch)
                 self.writer.add_scalar('Loss/val_epoch', global_val_loss, epoch)
                 self.writer.add_scalar('LearningRate/epoch', self.optimizer.param_groups[0]['lr'], epoch)
@@ -477,9 +467,6 @@ def parse_args():
     parser.add_argument('--use_amp', action='store_true', help='Use Automatic Mixed Precision (AMP).')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose model output.')
     parser.add_argument('--lores_only', action='store_true', help='Use lores only mode.')
-    parser.add_argument('--alpha_start', type=float, default=0.5, help='Initial value for skip_alpha.')
-    parser.add_argument('--alpha_delta', type=float, default=0.0, help='Delta added to alpha every epoch.')
-    parser.add_argument('--static_alpha', action='store_true', help='If set, skip_alpha will not be learnable.')
     
     return parser.parse_args()
 

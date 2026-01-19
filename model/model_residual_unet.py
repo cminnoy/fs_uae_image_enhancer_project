@@ -217,8 +217,11 @@ class HeadProcessing(nn.Module):
         stack_out_ch = base_channels * k_paths
         combined_ch = (input_channels * 4) + stack_out_ch
         self.se = SqueezeExcite(stack_out_ch, reduction=8)
-        self.conv_reduce = nn.Conv2d(combined_ch, base_channels, kernel_size=1, bias=True)
-        self.act = nn.ReLU(inplace=True)
+        self.conv_reduce = nn.Sequential(
+            nn.Conv2d(combined_ch, base_channels * 2, kernel_size=1, bias=True),
+            ResidualBlock(base_channels * 2, base_channels * 2, base_channels, kernel_size=3)
+        )
+        self.act = nn.ReLU(inplace=False)
 
     def forward(self, x):
         unshuffled = self.pixel_unshuffle(x)
@@ -348,14 +351,17 @@ class ResidualUNet(nn.Module):
             nn.PixelShuffle(4 if lores_only else 2)
         )
 
+        if self.lores_only:
+            self.towards_lores = nn.Conv2d(3, 3, kernel_size=2, stride=2, bias=False)
+
     def forward(self, x):
         x_in = x
 
         # Slice for lores only mode; we can drop every second pixel in both dimensions
         if self.lores_only:
             #  x = x[:, :, ::2, ::2] # Using alternative as MiGraph does not support advanced indexing  
-            # x = nn.PixelUnshuffle(2)(x)[:, :3, :, :]
-            x = F.avg_pool2d(x, kernel_size=2, stride=2)
+            # x = F.avg_pool2d(x, kernel_size=2, stride=2)
+            x = self.towards_lores(x)
 
         # Head processing
         x_head = self.head(x)

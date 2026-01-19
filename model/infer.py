@@ -41,7 +41,7 @@ class AmigaEnhancer:
         input_tensor = torch.from_numpy(img_linear).permute(2, 0, 1).unsqueeze(0).half().to(self.device)
 
         with torch.no_grad():
-            output = self.model(input_tensor)
+            output = self.model(input_tensor).clamp(0, 1)
 
         output = output.squeeze(0).permute(1, 2, 0).cpu().float().numpy()
         output = self._linear_to_srgb(np.clip(output, 0, 1))
@@ -52,25 +52,40 @@ class AmigaEnhancer:
 def main():
     parser = argparse.ArgumentParser(description='Amiga Image Enhancer Inference')
     parser.add_argument('--type', type=str, required=True, choices=['light', 'heavy'])
-    parser.add_argument('--input', type=str, required=True, help='Filename in samples/ or full path')
-    parser.add_argument('--output', type=str, required=True, help='Output filename')
+    parser.add_argument('--checkpoint', '-c', type=str, required=False,
+                        help='Path to .pth checkpoint file. If omitted, defaults to model/<type>/best_model.pth')
+    parser.add_argument('--input', type=str, required=True, help='Path to input image file')
+    parser.add_argument('--output', type=str, required=True, help='Path to output image file or directory')
     parser.add_argument('--lores_only', action='store_true', help='Process only low-resolution input')
     args = parser.parse_args()
 
     base_dir = Path(__file__).parent
-    ckpt_path = base_dir / args.type / "best_model.pth"
-    
-    # Resolve input path: handle both 'sample0.png' and 'samples/sample0.png'
-    in_path = Path(args.input)
-    if not in_path.exists():
-        in_path = base_dir / "samples" / in_path.name
+    # Determine checkpoint path: explicit override or default location
+    if args.checkpoint:
+        ckpt_path = Path(args.checkpoint)
+    else:
+        ckpt_path = base_dir / args.type / "best_model.pth"
 
     if not ckpt_path.exists():
         print(f"Error: Weight file not found at {ckpt_path}")
         return
 
+    # Resolve input path: require the provided path to exist (no implicit samples/ fallback)
+    in_path = Path(args.input)
+    if not in_path.exists():
+        print(f"Error: Input file not found at {in_path}")
+        return
+
+    # Resolve output path: if user provided a directory, save with input filename inside it
+    out_path = Path(args.output)
+    if out_path.exists() and out_path.is_dir():
+        out_path = out_path / in_path.name
+    else:
+        # Ensure parent directory exists
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
     enhancer = AmigaEnhancer(args.type, ckpt_path, args.lores_only)
-    enhancer.process(in_path, Path(args.output))
+    enhancer.process(in_path, out_path)
 
 if __name__ == "__main__":
     main()

@@ -385,7 +385,7 @@ class Trainer:
                 self.writer.add_scalar('Loss/train_epoch', global_train_loss, epoch)
                 self.writer.add_scalar('Loss/val_epoch', global_val_loss, epoch)
                 self.writer.add_scalar('LearningRate/epoch', self.optimizer.param_groups[0]['lr'], epoch)
-                self.visualizer.log_epoch(self.model.module, epoch)            
+                self.visualizer.log_epoch(self.model.module, epoch)
                 print(f"Epoch {epoch+1} finished. Train Loss: {global_train_loss:.6f} | Val Loss: {global_val_loss:.6f}")
                 
                 # Check for improvement
@@ -448,7 +448,7 @@ def parse_args():
     parser.add_argument('--val_fraction', type=float, default=0.1)
     parser.add_argument("--early-stop-patience", type=int, default=10)
     parser.add_argument("--early-stop-delta", type=float, default=1e-4)
-    parser.add_argument('--find_unused_parameters', action='store_true', default=False,
+    parser.add_argument('--find_unused_parameters', action='store_true', default=True,
                         help='If True, set find_unused_parameters=True in DDP (needed if some model parameters are not used in every forward pass).')
 
     # Checkpointing and logging

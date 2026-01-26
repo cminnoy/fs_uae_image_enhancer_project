@@ -4,6 +4,7 @@ import numpy as np
 from PIL import Image
 from pathlib import Path
 from model_residual_unet import get_model
+from gamma import srgb_to_linear_approx, linear_to_srgb_approx
 
 class AmigaEnhancer:
     def __init__(self, model_type, checkpoint_path, lores_only, device="cuda"):
@@ -26,25 +27,18 @@ class AmigaEnhancer:
         self.model.load_state_dict(state_dict, strict=False)
         self.model.half().eval()
 
-    def _srgb_to_linear(self, x):
-        """ Conversion required for FS-UAE framebuffers """
-        return np.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4)
-
-    def _linear_to_srgb(self, x):
-        return np.where(x <= 0.0031308, x * 12.92, 1.055 * (x ** (1.0 / 2.4)) - 0.055)
-
     def process(self, input_path, output_path):
         with Image.open(input_path).convert("RGB") as img:
             img_np = np.array(img).astype(np.float32) / 255.0
 
-        img_linear = self._srgb_to_linear(img_np)
+        img_linear = srgb_to_linear_approx(img_np)
         input_tensor = torch.from_numpy(img_linear).permute(2, 0, 1).unsqueeze(0).half().to(self.device)
 
         with torch.no_grad():
             output = self.model(input_tensor).clamp(0, 1)
 
         output = output.squeeze(0).permute(1, 2, 0).cpu().float().numpy()
-        output = self._linear_to_srgb(np.clip(output, 0, 1))
+        output = linear_to_srgb_approx(np.clip(output, 0, 1))
         
         Image.fromarray((output * 255.0).astype(np.uint8)).save(output_path)
         print(f"Processed {input_path.name} -> {output_path}")

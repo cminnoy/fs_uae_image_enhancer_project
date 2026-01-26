@@ -5,6 +5,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from loss_vgg import PerceptualLoss
+from activations import get_activation
 
 # Residual U-Net with Multi-Path Residual Feature Blocks
 #
@@ -76,13 +77,45 @@ class ResidualBlock(nn.Module):
     """
     Standard Residual Block (Conv-ReLU-Conv).
     """
-    def __init__(self, in_channels, mid_channels, out_channels, kernel_size=3):
+    def __init__(self, in_channels, mid_channels, out_channels, kernel_size=3,
+                 activation1='relu', activation2='relu',
+                 activation1_params=None, activation2_params=None,
+                 inplace=True):
         super().__init__()
-        
+
         self.conv1 = nn.Conv2d(in_channels, mid_channels, kernel_size, padding=kernel_size//2, bias=True)
-        self.act1 = nn.ReLU(inplace=True) 
+        # Build activations, forwarding any provided params and ensuring
+        # channel-aware activations get a sensible default if params omitted.
+        def make_act(name, channels_for_act, params, inplace_local=True):
+            if name is None:
+                return nn.Identity()
+            key = name.lower()
+            # Copy params to avoid mutating caller dict
+            p = dict(params) if params is not None else {}
+
+            # Provide sensible defaults for activations that expect channel counts
+            if key in ('apprelu', 'app_relu', 'aprelu') and 'channels' not in p:
+                p['channels'] = channels_for_act
+            if key in ('conv_relu', 'convrelu') and 'channels' not in p:
+                p['channels'] = channels_for_act
+            if key in ('biased_relu', 'biasedprelu', 'biased_prelu', 'biased') and 'num_parameters' not in p:
+                p['num_parameters'] = channels_for_act
+            if key == 'prelu' and 'num_parameters' not in p:
+                p['num_parameters'] = channels_for_act
+
+            # Ensure inplace is passed when requested and constructor accepts it
+            if inplace_local and 'inplace' not in p:
+                p['inplace'] = True
+
+            try:
+                return get_activation(name, params=p, inplace=inplace_local)
+            except TypeError:
+                # Fall back: try without params
+                return get_activation(name, params=None, inplace=inplace_local)
+
+        self.act1 = make_act(activation1, mid_channels, activation1_params, inplace_local=inplace)
         self.conv2 = nn.Conv2d(mid_channels, out_channels, kernel_size, padding=kernel_size//2, bias=True)
-        self.act2 = nn.ReLU(inplace=True) # Activation after addition is standard, but here we do it inside
+        self.act2 = make_act(activation2, out_channels, activation2_params, inplace_local=inplace) # Post-addition activation
 
         self.skip_proj = None
         if in_channels != out_channels:
@@ -177,35 +210,43 @@ class kPathResidualFeatureBlock(nn.Module):
         return fused
 
 class HeadProcessing(nn.Module):
-    def __init__(self, input_channels, base_channels, k_paths, onebyone_expansion=2.0, twobytwo_expansion=2.0):
+    def __init__(self, input_channels, base_channels, k_paths, onebyone_expansion=2.0, twobytwo_expansion=2.0, preprocessing=True):
         super().__init__()
-        self.pixel_unshuffle = nn.PixelUnshuffle(2)
-        self.avg_pool = nn.AvgPool2d(2, stride=2)
-        self.max_pool = nn.MaxPool2d(2, stride=2)
-        
-        self.conv_2x2_path = nn.Conv2d(
-            in_channels=input_channels,
-            out_channels=int(input_channels * twobytwo_expansion),
-            kernel_size=2,
-            stride=2
-        )
-          
-        self.conv_expand = nn.Conv2d(
-            in_channels=input_channels * 4,
-            out_channels=int(input_channels * 4 * onebyone_expansion),
-            kernel_size=1,
-            padding=0,
-            stride=1
-        )
 
-        concat_input_channels=(input_channels * 4) + \
-                      int(input_channels * 4 * onebyone_expansion) + \
-                      (3 * input_channels) + \
-                      int(input_channels * twobytwo_expansion)
+        self.preprocessing = preprocessing
+        self.pixel_unshuffle = nn.PixelUnshuffle(2)
+        unshuffled_ch = input_channels * 4
+        
+        if preprocessing:
+            self.avg_pool = nn.AvgPool2d(2, stride=2)
+            self.max_pool = nn.MaxPool2d(2, stride=2)
+        
+            self.conv_2x2_path = nn.Conv2d(
+                in_channels=input_channels,
+                out_channels=int(input_channels * twobytwo_expansion),
+                kernel_size=2,
+                stride=2
+            )
+            
+            self.conv_expand = nn.Conv2d(
+                in_channels=unshuffled_ch,
+                out_channels=int(unshuffled_ch * onebyone_expansion),
+                kernel_size=1,
+                padding=0,
+                stride=1
+            )
+
+            concat_input_channels = unshuffled_ch + \
+                        int(unshuffled_ch * onebyone_expansion) + \
+                        (3 * input_channels) + \
+                        int(input_channels * twobytwo_expansion)
+        else:
+            # In lores_only, we only pass the unshuffled 4x channels
+            concat_input_channels = unshuffled_ch
         
         self.conv_stack = kPathResidualFeatureBlock(
                 in_channels=concat_input_channels,
-                mid_channels=int(base_channels / 1.5),
+                mid_channels=int(base_channels * 1.5),
                 out_channels=base_channels,
                 k_paths=k_paths,
                 with_skip_connection=False,
@@ -215,34 +256,68 @@ class HeadProcessing(nn.Module):
             )
 
         stack_out_ch = base_channels * k_paths
-        combined_ch = (input_channels * 4) + stack_out_ch
-        self.se = SqueezeExcite(stack_out_ch, reduction=8)
+        se_in_ch = stack_out_ch + unshuffled_ch
+        conv_reduce_in = stack_out_ch + unshuffled_ch
+
+        self.se = SqueezeExcite(se_in_ch, reduction=8)
         self.conv_reduce = nn.Sequential(
-            nn.Conv2d(combined_ch, base_channels * 2, kernel_size=1, bias=True),
-            ResidualBlock(base_channels * 2, base_channels * 2, base_channels, kernel_size=3)
+            ResidualBlock(conv_reduce_in, base_channels * 2, base_channels, kernel_size=3)
         )
         self.act = nn.ReLU(inplace=False)
 
     def forward(self, x):
         unshuffled = self.pixel_unshuffle(x)
-        unshuffled_expanded = self.conv_expand(unshuffled)
         
-        avg_p = self.avg_pool(x)
-        max_p = self.max_pool(x)
-        min_p_neg = self.max_pool(-x) 
-        contrast = max_p + min_p_neg
+        if self.preprocessing:
+            unshuffled_expanded = self.conv_expand(unshuffled)
+            unshuffled_expanded = F.relu(unshuffled_expanded, inplace=False)
         
-        conv_2x2 = self.conv_2x2_path(x)
+            avg_p = self.avg_pool(x)
+            max_p = self.max_pool(x)
+            min_p_neg = self.max_pool(-x) 
+            contrast = max_p + min_p_neg
+        
+            conv_2x2 = self.conv_2x2_path(x)
+            conv_2x2 = F.relu(conv_2x2, inplace=False)
 
-        concat = torch.cat([unshuffled, unshuffled_expanded, avg_p, max_p, contrast, conv_2x2], dim=1)
+            concat = torch.cat([unshuffled, unshuffled_expanded, avg_p, max_p, contrast, conv_2x2], dim=1)
+        else:
+            # Per instructions: unshuffled output goes directly into kPathRB
+            concat = unshuffled
         
         stacked = self.conv_stack(concat)
-        result = self.se(stacked)
-        result = torch.cat([unshuffled, result], dim=1)
-        result = self.conv_reduce(result)
-        result = self.act(result)
+        
+        # Spatial dimensions now match: both are H/2, W/2
+        se_in = torch.cat([unshuffled, stacked], dim=1)
 
-        return result
+        result = self.se(se_in)
+        result = F.relu(result, inplace=False)
+        result = self.conv_reduce(result)      
+
+        return result, unshuffled
+
+
+class RefineWithUnshuffle(nn.Module):
+    """Refinement that projects the head pixel-unshuffled features with a
+    1x1 conv to `proj_ch`, adds them to the ResidualBlock output (element-wise),
+    then applies PixelShuffle directly. The ResidualBlock must output
+    `proj_ch` channels so the addition is valid.
+    """
+    def __init__(self, res_in_ch, res_mid_ch, proj_ch, unshuffled_ch, lores_only=False):
+        super().__init__()
+        # Residual block produces `proj_ch` channels so it can be added.
+        self.res = ResidualBlock(res_in_ch, res_mid_ch, proj_ch, kernel_size=3, activation1='apprelu', activation2=None, activation1_params={'channels': res_mid_ch}, inplace=False)
+        # Project unshuffled (e.g., 12) -> proj_ch (e.g., 48) using 1x1 conv
+        self.unsh_proj = nn.Conv2d(unshuffled_ch, proj_ch, kernel_size=1, stride=1, bias=False)
+        # Direct pixel shuffle; no additional conv required per request
+        self.ps = nn.PixelShuffle(4 if lores_only else 2)
+
+    def forward(self, x, unshuffled):
+        x = self.res(x)
+        unsh_p = self.unsh_proj(unshuffled)
+        x = x + unsh_p
+        x = self.ps(x)
+        return x
 
 class ResidualUNet(nn.Module):
     def __init__(self, input_channels=3, output_channels=3,
@@ -254,19 +329,22 @@ class ResidualUNet(nn.Module):
         self.unet_depth = unet_depth
         self.output_channels = output_channels
         self.lores_only = lores_only
+        self.base_channels = base_channels
+        # Number of channels produced by HeadProcessing.pixel_unshuffle
+        self.unshuffled_ch = input_channels * 4
         
         self.perceptual_criterion = PerceptualLoss(
-            pixel_loss_weight=0.95,
+            pixel_loss_weight=0.94, #0.95,
             vgg_weight=0.03,
             pixel_loss_type='charbonnier',
-            high_frequency_weight=0.02,
+            high_frequency_weight=0.03, #0.02,
             high_frequency_type='laplacian',
             lambda_lum=0.0,
             input_is_linear=True
         )
     
         # --- Head ---
-        self.head = HeadProcessing(input_channels, base_channels, k_paths_head, onebyone_expansion=3.0, twobytwo_expansion=4.0)
+        self.head = HeadProcessing(input_channels, base_channels, k_paths_head, onebyone_expansion=3.0, twobytwo_expansion=4.0, preprocessing=not lores_only)
 
         # --- Encoder ---
         self.encoder_blocks = nn.ModuleList()
@@ -275,7 +353,7 @@ class ResidualUNet(nn.Module):
         # Helper to cap channels
         def get_ch(depth_idx):
             ch = base_channels * (2 ** depth_idx)
-            return min(ch, max_channels)
+            return int(min(ch, max_channels))
 
         for d in range(unet_depth):
             out_ch = get_ch(d)
@@ -294,19 +372,31 @@ class ResidualUNet(nn.Module):
             self.encoder_blocks.append(nn.Sequential(*blocks))
             in_ch = out_ch
 
-        self.downs = nn.ModuleList([nn.PixelUnshuffle(2) for _ in range(unet_depth - 1)])
+        self.downs = nn.ModuleList([nn.PixelUnshuffle(2) for _ in range(max(0, unet_depth - 1))])
 
-        # --- Bottleneck ---        
-        bottleneck_ch = get_ch(unet_depth - 1)
-        self.bottleneck = nn.Sequential(
-            kPathResidualFeatureBlock(bottleneck_ch, bottleneck_ch // 2, bottleneck_ch,
-                                      k_paths=k_paths_bottleneck, with_skip_connection=False,
-                                      use_concatenation=True, use_attention=True),
-            ResidualBlock(bottleneck_ch, bottleneck_ch // 2, bottleneck_ch, kernel_size=3)
-        )
+        # --- Bottleneck ---
+        if unet_depth > 0:
+            bottleneck_ch = get_ch(unet_depth - 1)
+            self.bottleneck_ch = bottleneck_ch
+            self.bottleneck = nn.Sequential(
+                kPathResidualFeatureBlock(bottleneck_ch, bottleneck_ch // 2, bottleneck_ch,
+                                          k_paths=k_paths_bottleneck, with_skip_connection=False,
+                                          use_concatenation=True, use_attention=True),
+                ResidualBlock(bottleneck_ch, bottleneck_ch // 2, bottleneck_ch, kernel_size=3)
+            )
+            # Projection from head output to bottleneck input if channels differ
+            if base_channels != bottleneck_ch:
+                self.head_to_bottleneck = nn.Conv2d(base_channels, bottleneck_ch, kernel_size=1, bias=False)
+            else:
+                self.head_to_bottleneck = None
+        else:
+            # When UNet depth is zero we skip bottleneck processing and propagate head features
+            bottleneck_ch = base_channels
+            self.bottleneck = nn.Identity()
+            self.bottleneck_ch = bottleneck_ch
 
         # --- Decoder ---
-        self.ups = nn.ModuleList([nn.PixelShuffle(2) for _ in range(unet_depth - 1)])
+        self.ups = nn.ModuleList([nn.PixelShuffle(2) for _ in range(max(0, unet_depth - 1))])
         self.decoder_blocks = nn.ModuleList()
         
         prev_out_ch = bottleneck_ch
@@ -317,7 +407,8 @@ class ResidualUNet(nn.Module):
             
             if d == 0:
                 # Final Stage (No Upsampling)
-                in_ch = prev_out_ch + base_channels # Skip connection from head
+                # Final Stage (No Upsampling)
+                in_ch = prev_out_ch + base_channels
                 self.decoder_blocks.append(
                     nn.Conv2d(in_ch, in_ch, 3, padding=1)
                 )
@@ -340,46 +431,76 @@ class ResidualUNet(nn.Module):
                 prev_out_ch = out_ch
 
         # --- Refinement ---
-        self.refine = nn.Sequential(
-            ResidualBlock(
-                prev_out_ch + base_channels, 
-                int((prev_out_ch + base_channels) * 2), 
-                refine_out_channels, 
-                kernel_size=3
-            ),
-            nn.Conv2d(refine_out_channels, refine_out_channels, 3, padding=1),
-            nn.PixelShuffle(4 if lores_only else 2)
-        )
+        # refine_out_channels = 3 * 16 = 48 (lores) or 3 * 4 = 12 (non-lores)
+        
+        if self.unet_depth == 0:
+            proj_ch = refine_out_channels
+            self.refine = RefineWithUnshuffle(
+                res_in_ch=base_channels,
+                res_mid_ch=int(base_channels * 2),
+                proj_ch=proj_ch,
+                unshuffled_ch=self.unshuffled_ch,
+                lores_only=lores_only
+            )
+        else:
+            proj_ch = refine_out_channels
+            self.refine = RefineWithUnshuffle(
+                res_in_ch=prev_out_ch + base_channels,
+                res_mid_ch=int((prev_out_ch + base_channels) * 2),
+                proj_ch=proj_ch,
+                unshuffled_ch=self.unshuffled_ch,
+                lores_only=lores_only
+            )
 
         if self.lores_only:
-            self.towards_lores = nn.Conv2d(3, 3, kernel_size=2, stride=2, bias=False)
+            # Non-learnable depthwise convolution that picks the upper-left pixel
+            # of each 2x2 block (kernel = [[1,0],[0,0]]). Use groups=3 to
+            # apply the same 2x2 kernel independently per channel.
+            self.towards_lores = nn.Conv2d(3, 3, kernel_size=2, stride=2, bias=False, groups=3)
+            with torch.no_grad():
+                self.towards_lores.weight.zero_()
+                for i in range(3):
+                    self.towards_lores.weight.data[i, 0, 0, 0] = 1.0
+            # Make weights non-learnable
+            self.towards_lores.weight.requires_grad = False
 
     def forward(self, x):
         x_in = x
 
         # Slice for lores only mode; we can drop every second pixel in both dimensions
         if self.lores_only:
-            #  x = x[:, :, ::2, ::2] # Using alternative as MiGraph does not support advanced indexing  
-            # x = F.avg_pool2d(x, kernel_size=2, stride=2)
+            # Assume input is an Amiga lores image
             x = self.towards_lores(x)
 
-        # Head processing
-        x_head = self.head(x)
+        # Analyse different resolutions
+        x_head, x_unshuffled = self.head(x)
 
         if self.verbose:
             print(f"[Head] {x_head.shape}")
 
         encoder_features = []
-        
-        # Level 0
-        x = self.encoder_blocks[0](x_head)
-        encoder_features.append(x)
 
-        # Levels 1 to Depth-1
-        for d in range(1, self.unet_depth):
-            x = self.downs[d - 1](x)
-            x = self.encoder_blocks[d](x)
+        # If UNet depth is zero, skip encoder/bottleneck/decoder entirely and use head output
+        if self.unet_depth == 0:
+            x = x_head
+        else:
+            # Level 0
+            x = self.encoder_blocks[0](x_head)
             encoder_features.append(x)
+
+            # Levels 1 to Depth-1
+            for d in range(1, self.unet_depth):
+                x = self.downs[d - 1](x)
+                x = self.encoder_blocks[d](x)
+                encoder_features.append(x)
+
+        # Ensure the feature channels match the bottleneck expectation. If the encoder
+        # didn't increase channels (e.g., unusual path), project from head channels.
+        if x.shape[1] != self.bottleneck_ch:
+            if getattr(self, 'head_to_bottleneck', None) is not None and x.shape[1] == self.base_channels:
+                x = self.head_to_bottleneck(x)
+            else:
+                raise RuntimeError(f"Channel mismatch before bottleneck: got {x.shape[1]}, expected {self.bottleneck_ch}")
 
         x = self.bottleneck(x)
 
@@ -403,8 +524,7 @@ class ResidualUNet(nn.Module):
             x = torch.cat([x_up, skip], dim=1)
             x = block(x)
 
-        x = F.relu(x, inplace=True)
-        x = self.refine(x)
+        x = self.refine(x, x_unshuffled)
         return x
     
     def criterion(self, output, target):
@@ -458,8 +578,8 @@ def get_model(name: str = 'light', lores_only: bool = False, verbose: bool = Fal
             blocks_per_level=4 if lores_only else 2,
             base_channels=72 if lores_only else 32,
             max_channels=256,
-            k_paths_head=5,
-            k_paths_bottleneck=5,
+            k_paths_head=5 if lores_only else 4,
+            k_paths_bottleneck=5 if lores_only else 4,
             internal_block_channels_ratio=2.0 if lores_only else 1.5,
             lores_only=lores_only,
             verbose=verbose

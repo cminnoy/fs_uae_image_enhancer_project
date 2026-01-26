@@ -52,7 +52,9 @@ if [ -z "$CHECKPOINT" ] || [[ ! -f "$CHECKPOINT" ]]; then
         --lores_only \
         --checkpoint_dir "$MODEL_DIR" \
         --num_workers 12 \
-        --use_amp
+        --use_amp \
+        --log_dir "runs/aga_games/${MODEL_TYPE}" \
+        --find_unused_parameters
 else
     echo "Found checkpoint ($CHECKPOINT). Skipping initial training step."
 fi
@@ -85,7 +87,9 @@ if [ -n "$CHECKPOINT" ] && [[ -f "$CHECKPOINT" ]]; then
         --checkpoint_dir "$MODEL_DIR" \
         --lores_only \
         --num_workers 12 \
-        --use_amp
+        --use_amp \
+        --log_dir "runs/aga_games/${MODEL_TYPE}" \
+        --find_unused_parameters
 else
     echo "No checkpoint to load — starting without --load_checkpoint"
     torchrun --nproc_per_node 2 train.py \
@@ -100,6 +104,8 @@ else
         --checkpoint_dir "$MODEL_DIR" \
         --lores_only \
         --num_workers 12 \
-        --use_amp
+        --use_amp \
+        --log_dir "runs/aga_games/${MODEL_TYPE}" \
+        --find_unused_parameters
 fi
 

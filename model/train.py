@@ -4,11 +4,13 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
+from torchvision.utils import make_grid
 import argparse
 import os
 import sys
 import time
 import shutil
+import random
 
 import torchvision.transforms.functional as TF
 from torchvision.utils import make_grid
@@ -27,6 +29,7 @@ if project_root not in sys.path:
 from model_residual_unet import get_model
 from srdataset import SRDataset, gather_all_samples_from_directory, add_size_argument 
 from loss_vgg import PerceptualLoss
+from gamma import srgb_to_linear_approx, linear_to_srgb_approx
 
 # ------------------------------------------------------------
 # Early stopping helper (Enhanced for Serialization)
@@ -85,17 +88,22 @@ class Visualizer:
                 self.sample_tensors.append(t)
 
     def log_epoch(self, model, epoch):
-        # Master performs the inference
         model.eval()
         comparisons = []
         with torch.no_grad():
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                 for img_t in self.sample_tensors:
-                    output = model(img_t)
-                    combined = torch.cat([img_t, torch.clamp(output, 0, 1)], dim=3)
+                    # 1. Linearize input to match training distribution
+                    img_linear = srgb_to_linear_approx(img_t)
+                    
+                    output = model(img_linear)
+                    
+                    # 2. Convert back to sRGB for TensorBoard display
+                    output_srgb = linear_to_srgb_approx(torch.clamp(output, 0, 1))
+                    
+                    combined = torch.cat([img_t, output_srgb], dim=3)
                     comparisons.append(combined.squeeze(0).cpu())
-        
-        from torchvision.utils import make_grid
+
         grid = make_grid(comparisons, nrow=1)
         self.writer.add_image('Visual_Progress/Samples', grid, epoch)
         model.train()
@@ -133,35 +141,57 @@ class Trainer:
         self.setup_model_and_optimizer()
 
     def setup_data(self):
-        # Data gathering and setup
+        # 1. Gather all unique file pairs from disk
         if self.is_master:
             print(f"Gathering samples from: {self.args.data_dir}")
-        sample_pairs = gather_all_samples_from_directory(
+        
+        all_pairs = gather_all_samples_from_directory(
             directory_path=self.args.data_dir,
             expected_crop_size=self.args.generator_crop_size,
-            styles_to_include=None, # Include all styles for training
+            styles_to_include=None,
             verbose=2 if self.is_master else 0
         )
-        
-        # Determine training crop size from arguments (must be a tuple)
+
+        # 2. Deterministic Shuffle and Physical Split
+        # We seed here so every DDP rank performs the EXACT same split
+        random.seed(42)
+        random.shuffle(all_pairs)
+
+        val_count = int(len(all_pairs) * self.args.val_fraction)
+        val_pairs = all_pairs[:val_count]
+        train_pairs = all_pairs[val_count:]
+
+        # 3. Handle training crop size tuple conversion
         if isinstance(self.args.train_crop_size, int):
-            train_crop_size_tuple = (self.args.train_crop_size, self.args.train_crop_size)
+            crop_size = (self.args.train_crop_size, self.args.train_crop_size)
         else:
-            train_crop_size_tuple = self.args.train_crop_size
-        
+            crop_size = self.args.train_crop_size
+
+        # 4. Initialize separate Dataset instances
+        # Train dataset uses your virtual epoch length (samples_per_epoch)
         self.train_dataset = SRDataset(
-            sample_pairs_list=sample_pairs, 
+            sample_pairs_list=train_pairs,
+            generator_output_crop_size=self.args.generator_crop_size,
+            train_crop_size=crop_size
+        )
+
+        # Validation dataset uses all available validation samples.
+        # A rotating validation window limits how many are checked per epoch.
+        self.val_dataset = SRDataset(
+            sample_pairs_list=val_pairs, 
             generator_output_crop_size=self.args.generator_crop_size, 
-            train_crop_size=train_crop_size_tuple,
-            num_samples=self.args.samples_per_epoch
+            train_crop_size=crop_size 
         )
-        val_len = int(len(self.train_dataset) * self.args.val_fraction)
-        train_len = len(self.train_dataset) - val_len
-        self.train_dataset, self.val_dataset = torch.utils.data.random_split(
-            self.train_dataset, [train_len, val_len],
-            generator=torch.Generator().manual_seed(42)
-        )
-        
+
+        # Rotating validation window: start offset and per-epoch max samples (configurable)
+        self.val_limit = min(int(self.args.val_limit), len(val_pairs)) if len(val_pairs) > 0 else 0
+        self.val_offset = 0
+
+        if self.is_master:
+            print(f"Total pairs: {len(all_pairs)} | Train pool: {len(train_pairs)} | Val pool: {len(val_pairs)}")
+            print(f"Epoch configuration -> Train steps: {self.args.samples_per_epoch} | Val steps: {self.args.val_limit} (rotating window)")
+
+        # 5. Distributed Samplers
         self.train_sampler = DistributedSampler(
             self.train_dataset,
             num_replicas=dist.get_world_size(),
@@ -169,6 +199,7 @@ class Trainer:
             shuffle=self.args.shuffle_data,
             drop_last=True
         )
+        
         self.val_sampler = DistributedSampler(
             self.val_dataset,
             num_replicas=dist.get_world_size(),
@@ -177,18 +208,20 @@ class Trainer:
             drop_last=False
         )
 
+        # 6. DataLoaders
         self.train_dataloader = DataLoader(
             self.train_dataset,
             batch_size=self.args.batch_size,
-            shuffle=False,
+            shuffle=False, # Sampler handles shuffling
             num_workers=self.args.num_workers,
             pin_memory=True,
             drop_last=True,
             sampler=self.train_sampler
         )
+        
         self.val_dataloader = DataLoader(
             self.val_dataset,
-            batch_size=16,  # Fixed smaller batch size for validation
+            batch_size=16,
             shuffle=False,
             num_workers=self.args.num_workers,
             pin_memory=True,
@@ -222,36 +255,92 @@ class Trainer:
         Runs validation loop and returns global average validation loss.
         """
         self.model.eval()
+
+        # If there are no validation samples, return 0.0
+        val_dataset_len = len(self.val_dataset)
+        if val_dataset_len == 0 or self.val_limit == 0:
+            self.model.train()
+            return 0.0
+
+        # Build the rotating slice of indices for this validation run
+        start = int(self.val_offset) % val_dataset_len
+        end = start + int(self.val_limit)
+        if end <= val_dataset_len:
+            indices = list(range(start, end))
+        else:
+            # Wrap around
+            indices = list(range(start, val_dataset_len)) + list(range(0, end - val_dataset_len))
+
+        # Create a Subset and DataLoader for this validation slice, using DistributedSampler
+        from torch.utils.data import Subset
+        subset = Subset(self.val_dataset, indices)
+        subset_sampler = DistributedSampler(
+            subset,
+            num_replicas=dist.get_world_size(),
+            rank=dist.get_rank(),
+            shuffle=False,
+            drop_last=False
+        )
+
+        val_batch_size = getattr(self.val_dataloader, 'batch_size', 16)
+        val_num_workers = getattr(self.val_dataloader, 'num_workers', self.args.num_workers)
+        val_pin_memory = getattr(self.val_dataloader, 'pin_memory', True)
+
+        val_loader = DataLoader(
+            subset,
+            batch_size=val_batch_size,
+            shuffle=False,
+            num_workers=val_num_workers,
+            pin_memory=val_pin_memory,
+            drop_last=False,
+            sampler=subset_sampler
+        )
+
         total_val_loss = 0.0
         num_batches = 0
-        
-        for batch in self.val_dataloader:
-            # Depending on dataset structure, adjust keys
-            # Assuming dataset returns dictionary or tuple
-            # Based on SRDataset usage implies keys might be used or tuple
-            # Here assuming tuple/list unpacking based on train loop: (styled_input, target_hr)
+        local_samples_processed = 0
+        log_interval = getattr(self.args, 'val_log_interval', 50)
+
+        for batch in val_loader:
             if isinstance(batch, dict):
-                 lr = batch["lr"].to(self.device)
-                 hr = batch["hr"].to(self.device)
+                lr = batch["lr"].to(self.device)
+                hr = batch["hr"].to(self.device)
             else:
-                 lr, hr = batch
-                 lr = lr.to(self.device)
-                 hr = hr.to(self.device)
+                lr, hr = batch
+                lr = lr.to(self.device)
+                hr = hr.to(self.device)
 
             out = self.model(lr)
-            # Use module.criterion because model is DDP wrapped
             loss = self.model.module.criterion(out, hr)
             total_val_loss += loss.item()
             num_batches += 1
+            # Track processed samples for progress logging
+            batch_n = hr.size(0) if hasattr(hr, 'size') else 1
+            local_samples_processed += int(batch_n)
+
+            # Periodically aggregate progress across ranks and log from master
+            if (num_batches % log_interval) == 0 or local_samples_processed >= len(indices):
+                if dist.is_initialized():
+                    proc_tensor = torch.tensor([local_samples_processed], dtype=torch.long, device=self.device)
+                    dist.all_reduce(proc_tensor, op=dist.ReduceOp.SUM)
+                    global_processed = int(proc_tensor.item())
+                else:
+                    global_processed = local_samples_processed
+
+                if self.is_master:
+                    print(f"    Validation progress: {global_processed}/{len(indices)} samples ({(global_processed/ max(1,len(indices)))*100:.1f}%)")
 
         # 1. Calculate local average
         local_avg_loss = total_val_loss / max(1, num_batches)
-        
+
         # 2. Aggregate across all GPUs
         loss_tensor = torch.tensor([local_avg_loss], device=self.device)
         dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
         global_val_loss = loss_tensor.item() / dist.get_world_size()
-        
+
+        # Advance the rotating offset for next epoch (only local update; persisted in checkpoints)
+        self.val_offset = (self.val_offset + self.val_limit) % val_dataset_len
+
         self.model.train()
         return global_val_loss
 
@@ -266,6 +355,7 @@ class Trainer:
             'loss': loss,
             'val_loss': val_loss,
             'early_stopping_state': self.early_stopper.state_dict(),
+            'val_offset': getattr(self, 'val_offset', 0),
             'model_state_dict': self.model.module.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scaler_state_dict': self.scaler.state_dict(),
@@ -311,6 +401,8 @@ class Trainer:
                     self.early_stopper.patience = self.args.early_stop_patience
                     self.early_stopper.min_delta = self.args.early_stop_delta
                     self.early_stopper.should_stop = False
+                    # Restore validation offset if present
+                    self.val_offset = checkpoint.get('val_offset', getattr(self, 'val_offset', 0))
                 else:
                     # Backward compatibility for older checkpoints
                     old_best = checkpoint.get('best_loss')
@@ -328,10 +420,14 @@ class Trainer:
                 print("Starting training from scratch.")
 
     def train_model(self):
-        """Main training loop."""
+        """Main training loop using virtual epochs and DDP."""
         if self.is_master:
             print(f"\nStarting DDP training for {self.args.epochs} epochs on device {self.device}")
             self.visualizer = Visualizer('samples', self.device, self.writer)
+
+        # TECHNIQUE: Calculate steps per rank to reach a global samples_per_epoch
+        world_size = dist.get_world_size()
+        total_batches_per_epoch = self.args.samples_per_epoch // (self.args.batch_size * world_size)
         
         for epoch in range(self.current_epoch, self.args.epochs):
             self.model.train()
@@ -342,6 +438,10 @@ class Trainer:
                 print(f"\n--- Epoch {epoch+1}/{self.args.epochs} ---")
             
             for batch_idx, (styled_input, target_hr) in enumerate(self.train_dataloader):
+                # Break early to respect the virtual epoch limit
+                if batch_idx >= total_batches_per_epoch:
+                    break
+
                 styled_input = styled_input.to(self.device, non_blocking=True)
                 target_hr = target_hr.to(self.device, non_blocking=True)
                 
@@ -355,29 +455,27 @@ class Trainer:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 
-                current_loss = loss.item()
-                epoch_loss += current_loss
+                epoch_loss += loss.item()
 
-                # Log batch metrics
                 if self.is_master and (batch_idx + 1) % self.args.log_interval == 0:
-                    avg_batch_loss = epoch_loss / (batch_idx + 1)
-                    print(f"    Batch {batch_idx+1}/{len(self.train_dataloader)} | Train Loss: {current_loss:.6f}")
-                    global_step = epoch * len(self.train_dataloader) + batch_idx
-                    self.writer.add_scalar('Loss/train_batch', current_loss, global_step)
-            
-            if self.is_master:
-                print(f"Epoch {epoch+1} training complete. Average Loss: {epoch_loss / len(self.train_dataloader):.6f}")
+                    print(f"    Batch {batch_idx+1}/{total_batches_per_epoch} | Loss: {loss.item():.6f}")
+                    global_step = epoch * total_batches_per_epoch + batch_idx
+                    self.writer.add_scalar('Loss/train_batch', loss.item(), global_step)
 
             # --- End of Epoch Training Aggregation ---
-            avg_epoch_loss = epoch_loss / len(self.train_dataloader)
-            loss_tensor = torch.tensor([avg_epoch_loss]).to(self.device)
+            # Use actual steps processed for normalization
+            avg_epoch_loss = epoch_loss / total_batches_per_epoch
+            loss_tensor = torch.tensor([avg_epoch_loss], device=self.device)
             dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-            global_train_loss = loss_tensor.item() / dist.get_world_size()
+            global_train_loss = loss_tensor.item() / world_size
+
+            if self.is_master:
+                print(f"Epoch {epoch+1} training complete. Average Loss: {avg_epoch_loss:.6f}")
 
             # --- Validation & Early Stopping ---
+            print("Starting validation...")
             global_val_loss = self.validate()
             
-            # Check Early Stopping (Only Master decides, then broadcasts)
             stop_training_tensor = torch.tensor([0], dtype=torch.int, device=self.device)
             
             if self.is_master:
@@ -446,6 +544,10 @@ def parse_args():
     parser.add_argument('--adam_beta2', type=float, default=0.999, help='Beta2 for Adam optimizer.')
     parser.add_argument('--num_workers', type=int, default=8, help='Number of DataLoader workers per GPU.')
     parser.add_argument('--val_fraction', type=float, default=0.1)
+    parser.add_argument('--val_limit', type=int, default=2000,
+                        help='Maximum number of validation images to evaluate per epoch (rotating window).')
+    parser.add_argument('--val_log_interval', type=int, default=50,
+                        help='Log validation progress every N batches (per rank).')
     parser.add_argument("--early-stop-patience", type=int, default=10)
     parser.add_argument("--early-stop-delta", type=float, default=1e-4)
     parser.add_argument('--find_unused_parameters', action='store_true', default=True,

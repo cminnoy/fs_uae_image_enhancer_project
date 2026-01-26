@@ -51,7 +51,9 @@ if [ -z "$CHECKPOINT" ] || [[ ! -f "$CHECKPOINT" ]]; then
         --samples_per_epoch $SAMPLES_PER_EPOCH \
         --checkpoint_dir "$MODEL_DIR" \
         --num_workers 12 \
-        --use_amp
+        --use_amp \
+        --log_dir "runs/ocs/${MODEL_TYPE}" \
+        --find_unused_parameters
 else
     echo "Found checkpoint ($CHECKPOINT). Skipping initial training step."
 fi
@@ -83,7 +85,9 @@ if [ -n "$CHECKPOINT" ] && [[ -f "$CHECKPOINT" ]]; then
         --samples_per_epoch $SAMPLES_PER_EPOCH \
         --checkpoint_dir "$MODEL_DIR" \
         --num_workers 12 \
-        --use_amp
+        --use_amp \
+        --log_dir "runs/ocs/${MODEL_TYPE}" \
+        --find_unused_parameters
 else
     echo "No checkpoint to load for Phase 2 — starting without --load_checkpoint"
     torchrun --nproc_per_node 2 train.py \
@@ -97,5 +101,7 @@ else
         --samples_per_epoch $SAMPLES_PER_EPOCH \
         --checkpoint_dir "$MODEL_DIR" \
         --num_workers 12 \
-        --use_amp
+        --use_amp \
+        --log_dir "runs/ocs/${MODEL_TYPE}" \
+        --find_unused_parameters
 fi

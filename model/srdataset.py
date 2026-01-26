@@ -324,7 +324,7 @@ class SRDataset(Dataset):
     Performs random sub-cropping and synchronized flips on these loaded crops.
     """
     # Keep __init__ signature similar to the version that worked, but add train_crop_size
-    def __init__(self, sample_pairs_list: list[tuple[str, str]], generator_output_crop_size: tuple[int, int], train_crop_size: tuple[int, int], num_samples: int):
+    def __init__(self, sample_pairs_list: list[tuple[str, str]], generator_output_crop_size: tuple[int, int], train_crop_size: tuple[int, int]):
         """
         Args:
             sample_pairs_list: A list of (styled_img_path, target_img_path) tuples (generator output).
@@ -340,7 +340,6 @@ class SRDataset(Dataset):
         self.available_samples_pool: list[tuple[str, str]] = sample_pairs_list # Directly assign the list
         self.generator_output_w, self.generator_output_h = generator_output_crop_size
         self.train_crop_w, self.train_crop_h = train_crop_size
-        self.num_samples = num_samples # The declared length of the dataset for an epoch
 
         # Validation: Ensure train_crop_size is not larger than generator_output_crop_size
         if self.train_crop_w > self.generator_output_w or self.train_crop_h > self.generator_output_h:
@@ -353,112 +352,62 @@ class SRDataset(Dataset):
             warnings.warn(f"SRDataset initialized with an empty sample pool.")
 
         self.to_tensor = ToTensor()
-        # to_pil is not needed
 
-    # __len__ method remains the same
     def __len__(self):
         """
         Returns the declared length of the dataset, determined by num_samples.
         """
-        return self.num_samples
+        return len(self.available_samples_pool)
 
-    # __getitem__ method adapted for random sub-cropping
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Loads a randomly selected sample pair (generator output crops),
-        performs a random sub-crop, and applies synchronized flips.
-
-        Ignores the input index `idx`.
+        Retrieves a sample pair using the index for deterministic selection,
+        then performs random sub-cropping and data augmentation.
         """
-        # Ensure there are samples available to draw from
         if not self.available_samples_pool:
-            raise IndexError("SRDataset pool is empty. Cannot draw samples.")
+            raise IndexError("SRDataset pool is empty.")
 
-        # Implement a simple retry mechanism for image loading errors
-        max_retries = 5
-        for attempt in range(max_retries):
-            try:
-                # Randomly select an index from the list of available generator output sample pairs
-                pool_size = len(self.available_samples_pool)
-                if pool_size == 0:
-                     raise IndexError("SRDataset pool is empty. Cannot draw samples.")
-                random_idx = random.randint(0, pool_size - 1)
+        styled_img_path, target_img_path = self.available_samples_pool[idx]
 
-                # Get the file paths for the styled input and the target image using the random index
-                styled_img_path, target_img_path = self.available_samples_pool[random_idx]
+        # Load images
+        try:
+            styled_img_pil = Image.open(styled_img_path).convert('RGB')
+            target_img_pil = Image.open(target_img_path).convert('RGB')
+        except Exception as e:
+            # Fallback: if a specific file fails, try the next one in the pool
+            warnings.warn(f"Error loading {styled_img_path}: {e}. Retrying with next index.")
+            return self.__getitem__(idx + 1)
 
-                # Load the images using Pillow. Convert to RGB.
-                styled_img_pil = Image.open(styled_img_path).convert('RGB')
-                target_img_pil = Image.open(target_img_path).convert('RGB')
-
-                # Optional: Validate loaded image dimensions (should match generator_output_crop_size)
-                # This check is now a warning as the primary validation is in __init__
-                if styled_img_pil.size != (self.generator_output_w, self.generator_output_h):
-                     warnings.warn(f"Styled image {styled_img_path} has unexpected dimensions: {styled_img_pil.size}. Expected: {(self.generator_output_w, self.generator_output_h)}. Sub-cropping may behave unexpectedly.")
-                if target_img_pil.size != (self.generator_output_w, self.generator_output_h):
-                     warnings.warn(f"Target image {target_img_path} has unexpected dimensions: {target_img_pil.size}. Expected: {(self.generator_output_w, self.generator_output_h)}. Sub-cropping may behave unexpectedly.")
-
-                break # Exit retry loop if loading is successful
-
-            except FileNotFoundError:
-                 # If the file is missing, it's a permanent error for this path
-                 warnings.warn(f"Attempt {attempt+1}/{max_retries}: Generator output file not found: {styled_img_path} or {target_img_path}. Skipping and retrying with another sample pair.")
-                 if attempt == max_retries - 1:
-                      raise FileNotFoundError(f"Failed to load generator output files after {max_retries} attempts for pair ({styled_img_path}, {target_img_path})")
-                 # Retry with another random sample immediately
-                 continue
-            except Exception as e:
-                 # For other errors (like 'cannot identify'), retry
-                 warnings.warn(f"Attempt {attempt+1}/{max_retries}: Error loading generator output images for sample ({styled_img_path}, {target_img_path}): {e}. Retrying.")
-                 if attempt == max_retries - 1:
-                      raise RuntimeError(f"Failed to load generator output images after {max_retries} attempts for pair ({styled_img_path}, {target_img_path})")
-                 time.sleep(0.1) # Wait a bit before retrying
-
-        # --- Perform Random Sub-Cropping ---
-        img_width, img_height = styled_img_pil.size # Should ideally be generator_output_crop_size
-
-        # Calculate maximum possible top-left coordinates for the training crop
-        # Ensure crop does not go out of bounds within the loaded generator output crop
+        # Calculate random sub-crop coordinates
+        img_width, img_height = styled_img_pil.size
         max_crop_x = img_width - self.train_crop_w
         max_crop_y = img_height - self.train_crop_h
 
-        # Check if loaded image is large enough for the desired training crop
-        if max_crop_x < 0 or max_crop_y < 0:
-             # This should ideally be caught by the generator_output_crop_size validation in __init__
-             # but handle defensively in case image sizes vary.
-             warnings.warn(f"Generator output crop ({img_width}x{img_height}) is smaller than training crop size ({self.train_crop_w}x{self.train_crop_h}) for sample ({styled_img_path}, {target_img_path}). Skipping and retrying.")
-             return self.__getitem__(idx) # Retry with another random sample
+        # Alignment: Ensure crop starts on an even pixel (important for Bayer/Chunky data)
+        crop_x = random.randrange(0, max_crop_x + 1, 2) if max_crop_x > 0 else 0
+        crop_y = random.randrange(0, max_crop_y + 1, 2) if max_crop_y > 0 else 0
 
-        # Randomly select top-left crop coordinates for the sub-crop, ensuring they are divisible by 2
-        # Use random.randrange(start, stop, step)
-        # Stop is exclusive, so max_crop_x + 1 is needed to include max_crop_x if it's even
-        # Ensure start is not negative
-        crop_x = random.randrange(0, max_crop_x + 1, 2) if max_crop_x >= 0 else 0
-        crop_y = random.randrange(0, max_crop_y + 1, 2) if max_crop_y >= 0 else 0
+        # Apply sub-cropping
+        box = (crop_x, crop_y, crop_x + self.train_crop_w, crop_y + self.train_crop_h)
+        lr_crop_pil = styled_img_pil.crop(box)
+        hr_crop_pil = target_img_pil.crop(box)
 
-        # Extract the smaller training crops (LR and HR)
-        lr_crop_pil = styled_img_pil.crop((crop_x, crop_y, crop_x + self.train_crop_w, crop_y + self.train_crop_h))
-        hr_crop_pil = target_img_pil.crop((crop_x, crop_y, crop_x + self.train_crop_w, crop_y + self.train_crop_h))
+        # Convert to Tensors [0, 1]
+        lr_t = self.to_tensor(lr_crop_pil)
+        hr_t = self.to_tensor(hr_crop_pil)
 
-        # Convert Pillow images to PyTorch tensors (scales to [0, 1])
-        # Ensure images are in RGB format before converting to tensor
-        lr_t = self.to_tensor(lr_crop_pil.convert("RGB"))
-        hr_t = self.to_tensor(hr_crop_pil.convert("RGB"))
-
+        # Preprocessing: Convert to Linear space (matches model training distribution)
         lr_t = srgb_to_linear_approx(lr_t)
         hr_t = srgb_to_linear_approx(hr_t)
 
-        # Apply synchronized random horizontal flip to the SMALLER crops
+        # Augmentation: Synchronized Flips
         if random.random() < 0.5:
             lr_t = F.hflip(lr_t)
             hr_t = F.hflip(hr_t)
-
-        # Apply synchronized random vertical flip to the SMALLER crops
         if random.random() < 0.5:
             lr_t = F.vflip(lr_t)
             hr_t = F.vflip(hr_t)
 
-        # Return the LR input and HR target tensors (from the sub-crops)
         return lr_t, hr_t
 
 # inference_on_directory, save_training_stats, load_last_epoch and train_model functions remain.

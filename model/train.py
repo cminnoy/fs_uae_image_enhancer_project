@@ -29,7 +29,7 @@ if project_root not in sys.path:
 from model_residual_unet import get_model
 from srdataset import SRDataset, gather_all_samples_from_directory, add_size_argument 
 from loss_vgg import PerceptualLoss
-from gamma import srgb_to_linear_approx, linear_to_srgb_approx
+import gamma
 
 # ------------------------------------------------------------
 # Early stopping helper (Enhanced for Serialization)
@@ -93,15 +93,8 @@ class Visualizer:
         with torch.no_grad():
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                 for img_t in self.sample_tensors:
-                    # 1. Linearize input to match training distribution
-                    img_linear = srgb_to_linear_approx(img_t)
-                    
-                    output = model(img_linear)
-                    
-                    # 2. Convert back to sRGB for TensorBoard display
-                    output_srgb = linear_to_srgb_approx(torch.clamp(output, 0, 1))
-                    
-                    combined = torch.cat([img_t, output_srgb], dim=3)
+                    output = model(img_t)                   
+                    combined = torch.cat([img_t, output], dim=3)
                     comparisons.append(combined.squeeze(0).cpu())
 
         grid = make_grid(comparisons, nrow=1)

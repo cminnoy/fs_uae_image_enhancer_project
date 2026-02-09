@@ -1,10 +1,10 @@
 import argparse
 import torch
 import numpy as np
+import gamma
 from PIL import Image
 from pathlib import Path
 from model_residual_unet import get_model
-from gamma import srgb_to_linear_approx, linear_to_srgb_approx
 
 class AmigaEnhancer:
     def __init__(self, model_type, checkpoint_path, lores_only, device="cuda"):
@@ -30,17 +30,14 @@ class AmigaEnhancer:
     def process(self, input_path, output_path):
         with Image.open(input_path).convert("RGB") as img:
             img_np = np.array(img).astype(np.float32) / 255.0
-
-        img_linear = srgb_to_linear_approx(img_np)
-        input_tensor = torch.from_numpy(img_linear).permute(2, 0, 1).unsqueeze(0).half().to(self.device)
+            input_srgb = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(self.device).half()
 
         with torch.no_grad():
-            output = self.model(input_tensor).clamp(0, 1)
+            output_srgb = self.model(input_srgb).clamp(0, 1)
 
-        output = output.squeeze(0).permute(1, 2, 0).cpu().float().numpy()
-        output = linear_to_srgb_approx(np.clip(output, 0, 1))
+        output_final = output_srgb.squeeze(0).permute(1, 2, 0).cpu().float().numpy()
         
-        Image.fromarray((output * 255.0).astype(np.uint8)).save(output_path)
+        Image.fromarray((output_final * 255.0).astype(np.uint8)).save(output_path)
         print(f"Processed {input_path.name} -> {output_path}")
 
 def main():

@@ -9,6 +9,11 @@ fi
 
 MODEL_TYPE="$1"
 EPOCHS_DIGGING="${2:-16}"
+if [ -z "${3:-}" ]; then
+    TRIAL=""
+else
+    TRIAL="_${3}"
+fi
 
 # Set initial batch size based on model type
 if [ "$MODEL_TYPE" = "light" ]; then
@@ -19,7 +24,7 @@ else
     echo "Using FULL model with batch size $BATCH_SIZE"
 fi
 
-DATASET="../dataset_generator/dataset/dataset_ocs_games"
+DATASET="../dataset_generator/dataset/dataset_ocs"
 MODEL_DIR="${MODEL_TYPE}_ocs_games"
 
 # Prefer the latest epoch checkpoint (highest epoch number). If none, fall back to best_model.pth.
@@ -54,7 +59,7 @@ if [ -z "$CHECKPOINT" ] || [[ ! -f "$CHECKPOINT" ]]; then
         --checkpoint_dir "$MODEL_DIR" \
         --num_workers 12 \
         --use_amp \
-        --log_dir "runs/ocs_games/${MODEL_TYPE}" \
+        --log_dir "runs/ocs_games/${MODEL_TYPE}${TRIAL}" \
         --find_unused_parameters \
         --val_limit $SAMPLES_VALIDATION
 else
@@ -90,9 +95,10 @@ if [ -n "$CHECKPOINT" ] && [[ -f "$CHECKPOINT" ]]; then
         --lores_only \
         --num_workers 12 \
         --use_amp \
-        --log_dir "runs/ocs_games/${MODEL_TYPE}" \
+        --log_dir "runs/ocs_games/${MODEL_TYPE}${TRIAL}" \
         --find_unused_parameters \
-        --val_limit $SAMPLES_VALIDATION
+        --val_limit $SAMPLES_VALIDATION \
+        --early-stop-patience 20 
 else
     echo "No checkpoint to load — starting without --load_checkpoint"
     torchrun --nproc_per_node 2 train.py \
@@ -108,8 +114,9 @@ else
         --lores_only \
         --num_workers 12 \
         --use_amp \
-        --log_dir "runs/ocs_games/${MODEL_TYPE}" \
+        --log_dir "runs/ocs_games/${MODEL_TYPE}${TRIAL}" \
         --find_unused_parameters \
-        --val_limit $SAMPLES_VALIDATION
+        --val_limit $SAMPLES_VALIDATION \
+        --early-stop-patience 20 
 fi
 

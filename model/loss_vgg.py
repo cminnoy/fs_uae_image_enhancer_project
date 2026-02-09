@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torchvision.models as models
 import torchvision.transforms as transforms
 import kornia
-from gamma import linear_to_srgb_poly
+import gamma
 
 # Charbonnier loss
 def charbonnier_loss(output, target, epsilon=1e-6):
@@ -181,8 +181,8 @@ class PerceptualLoss(nn.Module):
         if self.input_is_linear:
             safe_output = output.clamp(0.0, 1.0)
             safe_target = target.clamp(0.0, 1.0)
-            output_for_vgg = self.normalize(linear_to_srgb_poly(safe_output))
-            target_for_vgg = self.normalize(linear_to_srgb_poly(safe_target))
+            output_for_vgg = self.normalize(gamma.linear_to_srgb_poly(safe_output))
+            target_for_vgg = self.normalize(gamma.linear_to_srgb_poly(safe_target))
             if not torch.isfinite(output_for_vgg).all():
                 raise RuntimeError("Non-finite VGG input")
         else:

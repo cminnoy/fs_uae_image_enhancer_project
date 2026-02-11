@@ -3,9 +3,9 @@ python generator.py \
     --train_images dataset/groundtruth_train \
     --test_images dataset/groundtruth_test \
     --train_num_crops 10000 \
-    --test_num_crops 2000 \
+    --test_num_crops 1000 \
     --destination_dir dataset/dataset_ocs \
-    --max_workers 28 \
+    --max_workers 30 \
     --rgb 444 \
     --crop_size 752 576 \
     --rotate 0 1 2 3 4 5 6 7 8 9 10 \

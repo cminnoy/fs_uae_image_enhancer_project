@@ -180,98 +180,66 @@ def _apply_palette_dithering_numba(image_float: np.ndarray, diff_map_list: list,
 
 @nb.njit(cache=True)
 def _apply_checkerboard_dithering_numba_optimized(
-    image_float_input: np.ndarray,  # (H, W, 3) float64
-    palette_float: np.ndarray,      # (N, 3) float64, for distance calculations
-    palette_uint8: np.ndarray,      # (N, 3) uint8, for assignment
-    output_image_uint8: np.ndarray  # (H, W, 3) uint8, to be filled
+    image_float: np.ndarray,    # (H, W, 3) float64
+    palette_float: np.ndarray,  # (N, 3) float64, for distance calculations
+    palette_uint8: np.ndarray,  # (N, 3) uint8, for assignment
+    output_uint8: np.ndarray    # (H, W, 3) uint8, to be filled
 ):
     """
-    Numba-accelerated checkerboard dithering using a specified palette.
-    For each pixel in the input image, it finds the two closest colors
-    from the palette and alternates them in a checkerboard pattern.
-    Modifies output_image_uint8 in place.
+    Applies checkerboard dithering with a distance-ratio gate to prevent 
+    noise in solid/pure color areas.
     """
-    height, width, _ = image_float_input.shape
-    num_palette_colors = palette_float.shape[0]
+    height, width, _ = image_float.shape
+    num_colors = palette_float.shape[0]
 
-    if num_palette_colors == 0: # Should ideally be caught by caller
-        for y_idx in range(height):
-            for x_idx in range(width):
-                output_image_uint8[y_idx, x_idx, 0] = 0
-                output_image_uint8[y_idx, x_idx, 1] = 0
-                output_image_uint8[y_idx, x_idx, 2] = 0
-        return
+    for y in range(height):
+        for x in range(width):
+            px = image_float[y, x]
+            
+            # Find the two closest palette colors
+            d1, d2 = 1e20, 1e20
+            idx1, idx2 = 0, 0
 
-    if num_palette_colors == 1: # Only one color in palette
-        color_val_r = palette_uint8[0, 0]
-        color_val_g = palette_uint8[0, 1]
-        color_val_b = palette_uint8[0, 2]
-        for y_idx in range(height):
-            for x_idx in range(width):
-                output_image_uint8[y_idx, x_idx, 0] = color_val_r
-                output_image_uint8[y_idx, x_idx, 1] = color_val_g
-                output_image_uint8[y_idx, x_idx, 2] = color_val_b
-        return
-
-    # Main logic for num_palette_colors >= 2
-    for y_idx in range(height):
-        for x_idx in range(width):
-            current_pixel_float_r = image_float_input[y_idx, x_idx, 0]
-            current_pixel_float_g = image_float_input[y_idx, x_idx, 1]
-            current_pixel_float_b = image_float_input[y_idx, x_idx, 2]
-
-            # Find 1st closest color index
-            min_dist_sq1 = np.inf
-            idx1 = 0
-            for i in range(num_palette_colors):
-                d_r1 = current_pixel_float_r - palette_float[i, 0]
-                d_g1 = current_pixel_float_g - palette_float[i, 1]
-                d_b1 = current_pixel_float_b - palette_float[i, 2]
-                dist_sq = d_r1**2 + d_g1**2 + d_b1**2
-                if dist_sq < min_dist_sq1:
-                    min_dist_sq1 = dist_sq
+            for i in range(num_colors):
+                pal_c = palette_float[i]
+                dist_sq = (px[0] - pal_c[0])**2 + \
+                          (px[1] - pal_c[1])**2 + \
+                          (px[2] - pal_c[2])**2
+                
+                if dist_sq < d1:
+                    d2 = d1
+                    idx2 = idx1
+                    d1 = dist_sq
                     idx1 = i
-            
-            # Find 2nd closest color index (must be different from idx1)
-            min_dist_sq2 = np.inf
-            idx2 = 0 # Default initialization
-            # Ensure idx2 starts as a different index if possible, otherwise will find it in loop
-            if num_palette_colors > 1 and idx1 == 0:
-                idx2 = 1 
-            elif num_palette_colors > 1 and idx1 != 0:
-                idx2 = 0
-            # If num_palette_colors is 1, this block is skipped, and idx2 will remain 0 (same as idx1)
-            # which is fine, as single color case is handled above.
-
-            found_second = False
-            for i in range(num_palette_colors):
-                if i == idx1:
-                    continue
-                d_r2 = current_pixel_float_r - palette_float[i, 0]
-                d_g2 = current_pixel_float_g - palette_float[i, 1]
-                d_b2 = current_pixel_float_b - palette_float[i, 2]
-                dist_sq = d_r2**2 + d_g2**2 + d_b2**2
-                if dist_sq < min_dist_sq2:
-                    min_dist_sq2 = dist_sq
+                elif dist_sq < d2:
+                    d2 = dist_sq
                     idx2 = i
-                    found_second = True
+
+            # Calculate distance ratio: 0.0 (at idx1) to 0.5 (midpoint)
+            dist1 = np.sqrt(d1)
+            dist2 = np.sqrt(d2)
+            denom = dist1 + dist2
             
-            # If the closest colour is an exact match (error is zero), always choose that one
-            if min_dist_sq1 == 0.0:
-                chosen_idx = idx1
-            elif not found_second and num_palette_colors > 1:
-                # Fallback if only one distinct color found despite num_palette_colors > 1
-                # This can happen if all other colors are much further away.
-                chosen_idx = idx1
-            else: # Otherwise alternate between closest and second closest colour
-                chosen_idx = idx1 if (x_idx + y_idx) % 2 == 0 else idx2
+            if denom < 1e-7:
+                fraction = 0.0
+            else:
+                fraction = dist1 / denom
+
+            # TECHNIQUE: Distance-Ratio Gating
+            # We only apply the pattern if we are significantly away from a pure color.
+            # A threshold of 0.25 means the checkerboard only appears when the color 
+            # is in the middle 50% of the transition between two palette entries.
+            gate_threshold = 0.25
             
-            chosen_color_r = palette_uint8[chosen_idx, 0]
-            chosen_color_g = palette_uint8[chosen_idx, 1]
-            chosen_color_b = palette_uint8[chosen_idx, 2]
-            output_image_uint8[y_idx, x_idx, 0] = chosen_color_r
-            output_image_uint8[y_idx, x_idx, 1] = chosen_color_g
-            output_image_uint8[y_idx, x_idx, 2] = chosen_color_b
+            if fraction > gate_threshold:
+                # Checkerboard pattern: alternate idx1 and idx2
+                if (x + y) % 2 == 0:
+                    output_uint8[y, x] = palette_uint8[idx2]
+                else:
+                    output_uint8[y, x] = palette_uint8[idx1]
+            else:
+                # Solid color: stay with the closest match
+                output_uint8[y, x] = palette_uint8[idx1]
 
 @nb.njit(cache=True)
 def _apply_ordered_dithering_numba_optimized(

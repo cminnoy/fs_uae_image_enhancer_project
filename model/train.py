@@ -228,17 +228,30 @@ class Trainer:
         self.model = get_model(self.args.model_type, lores_only=self.args.lores_only, verbose=self.args.verbose).to(self.device)
         if self.is_master and self.args.print_model_layers:
             print(self.model)
-        
+
+        world_size = dist.get_world_size()
+        total_batches_per_epoch = self.args.samples_per_epoch // (self.args.batch_size * world_size)
+        self.learning_rate = self.args.learning_rate
+        self.warmup_steps = 500   # About half of one virtual epoch
+        self.steps_per_epoch = total_batches_per_epoch
+
         self.optimizer = optim.AdamW(
             self.model.parameters(), 
-            lr=self.args.learning_rate, 
+            lr=self.learning_rate, # The scheduler will override this
             betas=(self.args.adam_beta1, self.args.adam_beta2)
+        )
+
+        self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            self.optimizer, 
+            T_0=self.steps_per_epoch * 5,
+            T_mult=2,
+            eta_min=1e-7
         )
 
         # Load checkpoint if specified
         if self.args.load_checkpoint:
             self.load_checkpoint(self.args.load_checkpoint)
-            
+
         # Wrap the model with DDP
         self.model = DDP(self.model, device_ids=[self.local_rank], find_unused_parameters=self.args.find_unused_parameters)
 
@@ -351,6 +364,7 @@ class Trainer:
             'val_offset': getattr(self, 'val_offset', 0),
             'model_state_dict': self.model.module.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
             'scaler_state_dict': self.scaler.state_dict(),
             'args': self.args.__dict__,
             'time_elapsed': time.time() - self.start_time
@@ -358,12 +372,12 @@ class Trainer:
 
         filepath = os.path.join(self.args.checkpoint_dir, f'epoch_{epoch:04d}.pth')
         torch.save(checkpoint, filepath)
-        
+
         if is_best:
             best_filepath = os.path.join(self.args.checkpoint_dir, 'best_model.pth')
             shutil.copyfile(filepath, best_filepath)
             print(f"Saved best model (Val Loss: {val_loss:.6f}) to {best_filepath}")
-        
+
         print(f"Saved checkpoint to {filepath}")
 
     def load_checkpoint(self, checkpoint_path: str):
@@ -378,16 +392,17 @@ class Trainer:
         try:
             # Note: Load model onto CPU first if loading happens before DDP wrapping
             checkpoint = torch.load(checkpoint_path, map_location='cpu')
-            
+
             # Use the model's load_state_dict *before* DDP wrapping
             self.model.load_state_dict(checkpoint['model_state_dict'])
-            
+
             if not self.args.reset_optimizer:
                 self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
                 self.current_epoch = checkpoint['epoch'] + 1
                 self.start_time -= checkpoint.get('time_elapsed', 0.0)
-                
+                if 'scheduler_state_dict' in checkpoint:
+                    self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
                 # Restore Early Stopping State
                 if 'early_stopping_state' in checkpoint:
                     self.early_stopper.load_state_dict(checkpoint['early_stopping_state'])
@@ -418,10 +433,10 @@ class Trainer:
             print(f"\nStarting DDP training for {self.args.epochs} epochs on device {self.device}")
             self.visualizer = Visualizer('samples', self.device, self.writer)
 
-        # TECHNIQUE: Calculate steps per rank to reach a global samples_per_epoch
+        # Calculate steps per rank to reach a global samples_per_epoch
         world_size = dist.get_world_size()
         total_batches_per_epoch = self.args.samples_per_epoch // (self.args.batch_size * world_size)
-        
+
         for epoch in range(self.current_epoch, self.args.epochs):
             self.model.train()
             epoch_loss = 0.0
@@ -429,7 +444,7 @@ class Trainer:
 
             if self.is_master:
                 print(f"\n--- Epoch {epoch+1}/{self.args.epochs} ---")
-            
+
             for batch_idx, (styled_input, target_hr) in enumerate(self.train_dataloader):
                 # Break early to respect the virtual epoch limit
                 if batch_idx >= total_batches_per_epoch:
@@ -437,26 +452,58 @@ class Trainer:
 
                 styled_input = styled_input.to(self.device, non_blocking=True)
                 target_hr = target_hr.to(self.device, non_blocking=True)
-                
-                self.optimizer.zero_grad()
-                
-                with autocast(device_type=self.device.type, dtype=torch.float16, enabled=self.args.use_amp):
+
+                self.optimizer.zero_grad(set_to_none=True)
+                dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+                with autocast(device_type=self.device.type, dtype=dtype, enabled=self.args.use_amp):
                     output_sr = self.model(styled_input)
+
+                    # if not torch.isfinite(output_sr).all():
+                    #     if self.is_master:
+                    #         print(f"!!! NaN activations detected at batch {batch_idx}")
+                    #     self.optimizer.zero_grad(set_to_none=True)
+                    #     continue
+
                     loss = self.model.module.criterion(output_sr.float(), target_hr.float()) 
-                
-                self.scaler.scale(loss).backward()
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-                
+
+                    # if not torch.isfinite(loss):
+                    #     if self.is_master:
+                    #         print(f"!!! NaN loss at batch {batch_idx}. Model output finite: {torch.isfinite(output_sr).all()}")
+                    #     # Skip this batch to prevent weight corruption
+                    #     continue
+
+                if self.args.use_amp:
+                    self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.optimizer.step()
+
+                current_step = (epoch * self.steps_per_epoch) + batch_idx
+
+                if current_step < self.warmup_steps:
+                    # Linear warmup: scale LR from 0 to max_lr
+                    lr = (current_step / self.warmup_steps) * self.learning_rate
+                    for param_group in self.optimizer.param_groups:
+                        param_group['lr'] = lr
+                else:
+                    # After warmup, let the Cosine scheduler take over
+                    self.scheduler.step(current_step)
+
                 epoch_loss += loss.item()
 
                 if self.is_master and (batch_idx + 1) % self.args.log_interval == 0:
-                    print(f"    Batch {batch_idx+1}/{total_batches_per_epoch} | Loss: {loss.item():.6f}")
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                    print(f"    Batch {batch_idx+1}/{self.steps_per_epoch} | Loss: {loss.item():.6f} | LR: {current_lr:.8f}")
                     global_step = epoch * total_batches_per_epoch + batch_idx
                     self.writer.add_scalar('Loss/train_batch', loss.item(), global_step)
+                    self.writer.add_scalar('LearningRate/batch', current_lr, global_step)
 
             # --- End of Epoch Training Aggregation ---
-            # Use actual steps processed for normalization
             avg_epoch_loss = epoch_loss / total_batches_per_epoch
             loss_tensor = torch.tensor([avg_epoch_loss], device=self.device)
             dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
@@ -468,9 +515,9 @@ class Trainer:
             # --- Validation & Early Stopping ---
             print("Starting validation...")
             global_val_loss = self.validate()
-            
+
             stop_training_tensor = torch.tensor([0], dtype=torch.int, device=self.device)
-            
+
             if self.is_master:
                 # Log metrics
                 self.writer.add_scalar('Loss/train_epoch', global_train_loss, epoch)
@@ -478,21 +525,20 @@ class Trainer:
                 self.writer.add_scalar('LearningRate/epoch', self.optimizer.param_groups[0]['lr'], epoch)
                 self.visualizer.log_epoch(self.model.module, epoch)
                 print(f"Epoch {epoch+1} finished. Train Loss: {global_train_loss:.6f} | Val Loss: {global_val_loss:.6f}")
-                
+
                 # Check for improvement
                 should_stop = self.early_stopper.step(global_val_loss)
-                
+
                 # Determine if this is the best model (based on validation loss)
                 is_best = (global_val_loss == self.early_stopper.best_loss)
                 if is_best:
                     self.early_stopper.counter = 0
-                
+
                 self.save_checkpoint(is_best, epoch, global_train_loss, global_val_loss)
-                
+
                 if should_stop:
                     print(f"Early stopping triggered after {self.args.early_stop_patience} epochs with no improvement.")
                     stop_training_tensor[0] = 1
-
 
             # Rank 1 will wait until Rank 0 finishes log_epoch.
             if dist.is_initialized():
@@ -500,7 +546,7 @@ class Trainer:
 
             # Broadcast stopping decision to all GPUs
             dist.broadcast(stop_training_tensor, src=0)
-            
+
             if stop_training_tensor.item() == 1:
                 break
 

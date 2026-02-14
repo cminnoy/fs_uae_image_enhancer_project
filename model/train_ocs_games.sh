@@ -25,7 +25,7 @@ else
 fi
 
 DATASET="../dataset_generator/dataset/dataset_ocs"
-MODEL_DIR="${MODEL_TYPE}_ocs_games"
+MODEL_DIR="${MODEL_TYPE}_ocs_games${TRIAL}"
 
 # Prefer the latest epoch checkpoint (highest epoch number). If none, fall back to best_model.pth.
 LATEST_EPOCH_CHECKPOINT=$(ls -1 "${MODEL_DIR}"/epoch_*.pth 2>/dev/null | sort -V | tail -n 1)
@@ -49,7 +49,7 @@ if [ -z "$CHECKPOINT" ] || [[ ! -f "$CHECKPOINT" ]]; then
         --model_type "$MODEL_TYPE" \
         --epochs 1 \
         --batch_size "$BATCH_SIZE" \
-        --learning_rate 0.001 \
+        --learning_rate 0.0008 \
         --data_dir "$DATASET" \
         --generator_crop_size "752 576" \
         --train_crop_size "752 576" \
@@ -86,7 +86,7 @@ if [ -n "$CHECKPOINT" ] && [[ -f "$CHECKPOINT" ]]; then
         --model_type "$MODEL_TYPE" \
         --epochs "$EPOCHS_DIGGING" \
         --batch_size "$BATCH_SIZE" \
-        --learning_rate 0.0004 \
+        --learning_rate 0.0008 \
         --data_dir "$DATASET" \
         --generator_crop_size "752 576" \
         --train_crop_size "752 576" \
@@ -105,7 +105,7 @@ else
         --model_type "$MODEL_TYPE" \
         --epochs "$EPOCHS_DIGGING" \
         --batch_size "$BATCH_SIZE" \
-        --learning_rate 0.0004 \
+        --learning_rate 0.0008 \
         --data_dir "$DATASET" \
         --generator_crop_size "752 576" \
         --train_crop_size "752 576" \

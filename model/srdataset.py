@@ -209,7 +209,6 @@ def gather_all_samples_from_directory(directory_path: str, expected_crop_size: t
              if verbose >= 3: print(f"DEBUG GATHER: Skipping root directory: {root}")
              continue # Skip the root directory itself
 
-
         for filename in files:
             # Use the standalone parser to get structured info from the filename itself
             # Pass verbose level to the parser
@@ -403,6 +402,24 @@ class SRDataset(Dataset):
         if random.random() < 0.5:
             lr_t = F.vflip(lr_t)
             hr_t = F.vflip(hr_t)
+
+        # Photometric augmentation (synchronized LR/HR)
+        # Simulates fade-in / alpha ramp / brightness shift
+        if random.random() < 0.8:
+            # Bias towards darker factors (fade-in scenario)
+            brightness = 1.0 - (random.random() ** 2) * 0.7   # ~ [0.3, 1.0]
+            lr_t = lr_t * brightness
+            hr_t = hr_t * brightness
+
+        if random.random() < 0.5:
+            # Gamma jitter (simulate linear<->sRGB mismatch)
+            gamma_val = random.uniform(0.7, 1.4)
+            lr_t = torch.clamp(lr_t, 1e-6, 1.0).pow(gamma_val)
+            hr_t = torch.clamp(hr_t, 1e-6, 1.0).pow(gamma_val)
+
+        # Clamp to valid range
+        lr_t = torch.clamp(lr_t, 0.0, 1.0)
+        hr_t = torch.clamp(hr_t, 0.0, 1.0)
 
         return lr_t, hr_t
 

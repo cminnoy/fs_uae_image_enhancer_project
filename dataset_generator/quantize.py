@@ -878,6 +878,12 @@ def reduce_color_depth_and_dither(
         if verbose > 1:
             print(f"Palette calculation took {end_time - start_time:.2f} seconds.")
 
+        # Here we make sure that the palette always hold the pure black colour.
+        # If it is not already in the palette we add it extra to the palette.
+        black_pixel = np.array([0, 0, 0], dtype=np.uint8)
+        if not np.any(np.all(target_palette_8bit == black_pixel, axis=1)):
+            target_palette_8bit = np.vstack((target_palette_8bit, black_pixel))
+  
         palette_float = target_palette_8bit.astype(np.float64)
 
     # --- Apply Dithering or direct mapping ---
@@ -915,7 +921,7 @@ def reduce_color_depth_and_dither(
         if target_palette_8bit is None or palette_float is None: # Should be caught by earlier check
             raise ValueError("Checkerboard dithering requires a target_palette_size to be specified, "
                              "which defines the palette for dithering.")
-        
+
         if verbose > 1:
             print(f"Applying checkerboard dithering with {target_palette_8bit.shape[0]}-color palette.")
 
@@ -932,7 +938,7 @@ def reduce_color_depth_and_dither(
     elif dithering_method.startswith('bayer'):
         if target_palette_8bit is None or palette_float is None: # Should be caught by earlier check
             raise ValueError(f"Bayer dithering ('{dithering_method}') requires a target_palette_size to be specified.")
-        
+
         dither_matrix = None
         if dithering_method == 'bayer2x2':
             dither_matrix = BAYER_MATRIX_2X2
@@ -940,7 +946,7 @@ def reduce_color_depth_and_dither(
             dither_matrix = BAYER_MATRIX_4X4
         elif dithering_method == 'bayer8x8':
             dither_matrix = BAYER_MATRIX_8X8
-        
+
         if dither_matrix is None:
             raise ValueError(f"Unknown Bayer dithering method: {dithering_method}")
 
@@ -950,7 +956,7 @@ def reduce_color_depth_and_dither(
 
         if verbose > 1:
             print(f"Applying {dithering_method} dithering with {target_palette_8bit.shape[0]}-color palette.")
-        
+
         img_output_np = np.zeros_like(image_np, dtype=np.uint8)
         image_for_dither_float = image_np.astype(np.float64)
 
@@ -966,7 +972,7 @@ def reduce_color_depth_and_dither(
         if target_palette_8bit is None or palette_float is None: # Should be caught by earlier check
              raise RuntimeError(f"Error diffusion dithering ('{dithering_method}') requires a palette. "
                                 "Ensure target_palette_size is specified.")
-        
+
         diff_map_list = DIFFUSION_MAPS[dithering_method]
         img_float_dither = image_np.astype(np.float64).copy() # Numba function modifies this copy
 
@@ -978,7 +984,7 @@ def reduce_color_depth_and_dither(
         if verbose > 1:
             print(f"Dithering took {end_time - start_time:.2f} seconds.")
         img_output_np = np.clip(img_float_dither, 0, 255).astype(np.uint8)
-    
+
     return img_output_np.astype(np.uint8)
 
 

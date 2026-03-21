@@ -106,8 +106,8 @@ class PerceptualLoss(nn.Module):
             raise ValueError(f"Invalid pixel_loss_type: {pixel_loss_type}. Must be 'l1' or 'charbonnier'")
 
         # Validate high-frequency loss type
-        if self.high_frequency_type not in ['laplacian']:
-            raise ValueError(f"Invalid high_frequency_type: {high_frequency_type}. Must be 'laplacian'")
+        if self.high_frequency_type not in ['laplacian', 'sobel', 'prewitt']:
+            raise ValueError(f"Invalid high_frequency_type: {high_frequency_type}. Must be 'laplacian' or 'sobel' or 'prewitt'")
 
         # Define image normalization for VGG input
         self.normalize = transforms.Normalize(
@@ -123,6 +123,32 @@ class PerceptualLoss(nn.Module):
             [ 1, -4,  1],
             [ 0,  1,  0]
         ], dtype=torch.float32).reshape(1, 1, 3, 3) # Reshape for conv2d: (out_channels, in_channels, kH, kW)
+
+        # Sobel kernels (3x3)
+        self.sobel_kernel_x = torch.tensor([
+            [-1, 0, 1],
+            [-2, 0, 2],
+            [-1, 0, 1]
+        ], dtype=torch.float32).reshape(1, 1, 3, 3)
+
+        self.sobel_kernel_y = torch.tensor([
+            [-1, -2, -1],
+            [ 0,  0,  0],
+            [ 1,  2,  1]
+        ], dtype=torch.float32).reshape(1, 1, 3, 3)
+
+        # Prewitt kernels
+        self.prewitt_kernel_x = torch.tensor([
+            [-1, 0, 1],
+            [-1, 0, 1],
+            [-1, 0, 1]
+        ], dtype=torch.float32).reshape(1, 1, 3, 3)
+
+        self.prewitt_kernel_y = torch.tensor([
+            [ 1,  1,  1],
+            [ 0,  0,  0],
+            [-1, -1, -1]
+        ], dtype=torch.float32).reshape(1, 1, 3, 3)
 
     def extract_vgg_features(self, x):
         features = x
@@ -148,34 +174,80 @@ class PerceptualLoss(nn.Module):
             return charbonnier_loss(output, target, self.charbonnier_epsilon)
         else:
             raise ValueError("Invalid pixel_loss_type (this should not happen)")
-        
+
     def calculate_high_frequency_loss(self, output, target):
         """
-        Calculates the high-frequency loss using a specified filter (e.g., Laplacian).
-        Applies the filter channel-wise to both output and target, then computes L1 loss.
+        Calculates high-frequency loss using Laplacian or Sobel.
+        Sobel version uses gradient magnitude L1.
         """
-        if self.high_frequency_type == 'laplacian':
-            # safety clamp (linear domain, symmetric)
-            output = output.clamp(-1.0, 1.0)
-            target = target.clamp(-1.0, 1.0)
 
+        # Clamp for stability
+        channels = output.shape[1]
+        output = output.clamp(0.0, 1.0)
+        target = target.clamp(0.0, 1.0)
+
+        if self.high_frequency_type == 'laplacian':
             kernel = self.laplacian_kernel.to(output.device)
 
             high_freq_output = F.conv2d(
                 output,
                 kernel.repeat(output.shape[1], 1, 1, 1),
-                padding='same',
+                padding=1,
                 groups=output.shape[1]
             )
+
             high_freq_target = F.conv2d(
                 target,
                 kernel.repeat(target.shape[1], 1, 1, 1),
-                padding='same',
+                padding=1,
                 groups=target.shape[1]
             )
+
             return F.l1_loss(high_freq_output, high_freq_target)
+
+        elif self.high_frequency_type == 'sobel':
+
+            sobel_x = self.sobel_kernel_x.to(output.device)
+            sobel_y = self.sobel_kernel_y.to(output.device)
+
+            sobel_x = sobel_x.repeat(output.shape[1], 1, 1, 1)
+            sobel_y = sobel_y.repeat(output.shape[1], 1, 1, 1)
+
+            # Gradients
+            grad_out_x = F.conv2d(output, sobel_x, padding=1, groups=output.shape[1])
+            grad_out_y = F.conv2d(output, sobel_y, padding=1, groups=output.shape[1])
+
+            grad_tgt_x = F.conv2d(target, sobel_x, padding=1, groups=target.shape[1])
+            grad_tgt_y = F.conv2d(target, sobel_y, padding=1, groups=target.shape[1])
+
+            # Gradient magnitude
+            grad_out = torch.sqrt(grad_out_x**2 + grad_out_y**2 + 1e-6)
+            grad_tgt = torch.sqrt(grad_tgt_x**2 + grad_tgt_y**2 + 1e-6)
+
+            return F.l1_loss(grad_out, grad_tgt)
+
+        elif self.high_frequency_type == 'prewitt':
+            kx = self.prewitt_kernel_x.to(output.device)
+            ky = self.prewitt_kernel_y.to(output.device)
+
+            gx_out = F.conv2d(output, kx.repeat(channels,1,1,1),
+                            padding='same', groups=channels)
+            gy_out = F.conv2d(output, ky.repeat(channels,1,1,1),
+                            padding='same', groups=channels)
+
+            gx_tgt = F.conv2d(target, kx.repeat(channels,1,1,1),
+                            padding='same', groups=channels)
+            gy_tgt = F.conv2d(target, ky.repeat(channels,1,1,1),
+                            padding='same', groups=channels)
+
+            # gradient magnitude
+            grad_out = torch.sqrt(gx_out**2 + gy_out**2 + 1e-6)
+            grad_tgt = torch.sqrt(gx_tgt**2 + gy_tgt**2 + 1e-6)
+
+            return F.l1_loss(grad_out, grad_tgt)
+
         else:
-            raise ValueError("Invalid high_frequency_type (this should not happen)")
+            raise ValueError("Invalid high_frequency_type")
 
     def forward(self, output, target):
         if self.input_is_linear:

@@ -9,6 +9,7 @@ import time
 from datetime import timedelta 
 import warnings
 import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import math
 import re
 from quantize import (
@@ -41,6 +42,142 @@ try:
 except ImportError:
     print("Please ensure util.py is in the same directory.")
     exit(1)
+
+class DatasetScannerMixin:
+    """
+    Mixin class containing the optimized scanning operations. 
+    Inherit this in your main dataset generator class.
+    """
+
+    def _scan_output_directory(self):
+        """
+        Scans output directory using multithreading and fast tuple matching.
+        Delegates directory processing to a ThreadPoolExecutor.
+        """
+        if self.verbose >= 1:
+            print(f"Scanning output directory for existing files: {self.dest_dir}")
+
+        for split in ['train', 'test']:
+            split_dir = os.path.join(self.dest_dir, split)
+            if not os.path.isdir(split_dir):
+                continue
+
+            # 1. Fast traversal: Grab subdirectories immediately via os.scandir
+            try:
+                subdirs = [
+                    (entry.path, entry.name) 
+                    for entry in os.scandir(split_dir) 
+                    if entry.is_dir()
+                ]
+            except OSError:
+                continue
+
+            # 2. Parallel Processing: Use Threads instead of Processes to share 
+            # the massive 181M memory footprint of self.full_valid_output_specs
+            max_threads = min(32, (os.cpu_count() or 4) * 2)
+            
+            with ThreadPoolExecutor(max_workers=max_threads) as executor:
+                # Submit worker tasks for each subdirectory
+                futures = {
+                    executor.submit(self._process_single_directory, path, name, split): path 
+                    for path, name in subdirs
+                }
+
+                for future in as_completed(futures):
+                    if getattr(self, 'stop_requested', False):
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        return
+
+                    # Merge the isolated results back into the main state
+                    local_invalid, local_targets, local_styles = future.result()
+                    
+                    if local_invalid:
+                        self.invalid_files[split].extend(local_invalid)
+                    if local_targets:
+                        self.existing_target_specs[split].update(local_targets)
+                    if local_styles:
+                        self.existing_output_specs[split].update(local_styles)
+
+    def _process_single_directory(self, root, folder_name, split):
+        """
+        Worker method to process files within a single subdirectory.
+        Completely eliminates string formatting and minimizes I/O calls.
+        """
+        local_invalid = []
+        local_targets = set()
+        local_styles = set()
+        
+        original_img_path = self._resolve_source_path(folder_name, split)
+        if not original_img_path:
+            return local_invalid, local_targets, local_styles
+
+        try:
+            # Read all file entries natively, caching stat buffers
+            entries = list(os.scandir(root))
+        except OSError:
+            return local_invalid, local_targets, local_styles
+
+        # 3. Tuple Cache: Store valid targets as tuples for O(1) lookups
+        valid_target_bases = set()
+        
+        # PASS 1: Identify targets and cache their specifications
+        for entry in entries:
+            if getattr(self, 'stop_requested', False): break
+            if not entry.is_file() or not entry.name.startswith("target_"):
+                continue
+
+            # Disable verbosity deep in the loop to prevent massive I/O console lag
+            parsed = parse_generated_filename(entry.name, verbose=False)
+            if not parsed:
+                local_invalid.append(entry.path)
+                continue
+
+            spec = (original_img_path, parsed['crop_x'], parsed['crop_y'], 
+                    parsed['rot_deg'], parsed['scale_perc'])
+
+            if spec in self.full_valid_target_specs[split]:
+                # Delay expensive dimension check until specification is validated
+                if self._verify_file_dimensions(entry.path):
+                    local_targets.add(spec)
+                    # Store the fast O(1) tuple to check dependencies later
+                    valid_target_bases.add(
+                        (parsed['crop_x'], parsed['crop_y'], parsed['scale_perc'], parsed['rot_deg'])
+                    )
+                else:
+                    local_invalid.append(entry.path)
+            else:
+                local_invalid.append(entry.path)
+
+        # PASS 2: Validate styles using the fast tuple cache
+        for entry in entries:
+            if getattr(self, 'stop_requested', False): break
+            if not entry.is_file() or not entry.name.startswith("style_"):
+                continue
+
+            parsed = parse_generated_filename(entry.name, verbose=False)
+            if not parsed:
+                local_invalid.append(entry.path)
+                continue
+
+            # 4. Fast Dependency Check: No string concatenation required
+            base_tuple = (parsed['crop_x'], parsed['crop_y'], parsed['scale_perc'], parsed['rot_deg'])
+            if base_tuple not in valid_target_bases:
+                local_invalid.append(entry.path)
+                continue
+
+            spec = (original_img_path, parsed['crop_x'], parsed['crop_y'], 
+                    parsed['rot_deg'], parsed['scale_perc'], parsed['rgb'], 
+                    parsed['pal'], parsed['dither'], parsed['resolution'])
+
+            if spec in self.full_valid_output_specs[split]:
+                if self._verify_file_dimensions(entry.path):
+                    local_styles.add(spec)
+                else:
+                    local_invalid.append(entry.path)
+            else:
+                local_invalid.append(entry.path)
+
+        return local_invalid, local_targets, local_styles
 
 # --- Helper to Construct Filenames ---
 # This is the reverse of parsing, must match exactly for scan/match to work
@@ -599,7 +736,7 @@ def generate_and_save_styled_worker(styled_spec, crop_w_worker, crop_h_worker, d
         return (styled_spec, False, message)
 
 # --- Main Generator Class ---
-class DatasetGenerator:
+class DatasetGenerator(DatasetScannerMixin):
     def __init__(self, args):
         # Store arguments and initialize instance variables
         self.args = args
@@ -917,7 +1054,10 @@ class DatasetGenerator:
             if self.verbose >= 2:
                  print("  Active style combinations:")
                  # Sort for consistent output in debug prints
-                 sorted_combinations = sorted(list(self.active_style_combinations))
+                 sorted_combinations = sorted(
+                    list(self.active_style_combinations),
+                    key=lambda x: tuple(str(e) if e is not None else "" for e in x)
+                 )
                  for combo in sorted_combinations:
                       # Format Palette Size and Dither Method for clear printing
                       ps_str = 'None' if combo[2] is None else str(combo[2])
@@ -1101,74 +1241,6 @@ class DatasetGenerator:
             # If the crop is valid, it's a parameter mismatch (RGB, Palette, Dither, or Res)
             print(f"  [Invalid] {filename}: Parameter mismatch for valid crop.")
             print(f"    - Found: Res={res}, CS={cs}, Pal={pal}, Dither={dit}")
-
-    def _scan_output_directory(self):
-        """
-        Scans output directory. Verifies dimensions and validity.
-        Uses self.output_cache to avoid redundant PIL opens.
-        """
-        if self.verbose >= 1:
-            print(f"Scanning output directory for existing files: {self.dest_dir}")
-
-        for split in ['train', 'test']:
-            split_dir = os.path.join(self.dest_dir, split)
-            if not os.path.isdir(split_dir): continue
-
-            for root, _, files in os.walk(split_dir):
-                if root == split_dir: continue # Skip root split dir
-                
-                folder_name = os.path.basename(root)
-                original_img_path = self._resolve_source_path(folder_name, split)
-                
-                # Pre-scan for targets in this subdir (dependency check)
-                found_targets = {f for f in files if f.startswith("target_")}
-
-                for filename in files:
-                    if self.stop_requested: return
-                    full_path = os.path.join(root, filename)
-                    
-                    # 1. Parse Filename
-                    parsed = parse_generated_filename(filename, verbose=self.verbose)
-                    if not parsed or not original_img_path:
-                        self.invalid_files[split].append(full_path)
-                        continue
-
-                    # 2. Verify Dimensions (with Cache)
-                    if not self._verify_file_dimensions(full_path):
-                        if self.verbose >= 2:
-                            print(f"  [Invalid] {filename}: Dimension mismatch (expected {self.crop_w}x{self.crop_h})")
-                        self.invalid_files[split].append(full_path)
-                        continue
-
-                    # 3. Validate against current plan/specs
-                    if parsed['type'] == 'target':
-                        spec = (original_img_path, parsed['crop_x'], parsed['crop_y'], 
-                                parsed['rot_deg'], parsed['scale_perc'])
-                        
-                        if spec in self.full_valid_target_specs[split]:
-                            self.existing_target_specs[split].add(spec)
-                        else:
-                            self.invalid_files[split].append(full_path)
-                    
-                    elif parsed['type'] == 'style':
-                        cs_str = parsed['rgb'] # FIX: 'rgb' already contains "RGB" prefix
-                        spec = (original_img_path, parsed['crop_x'], parsed['crop_y'], 
-                                parsed['rot_deg'], parsed['scale_perc'], cs_str, 
-                                parsed['pal'], parsed['dither'], parsed['resolution'])
-                        
-                        # Dependency check: Target must exist
-                        target_fn = f"target_{parsed['crop_x']}_{parsed['crop_y']}_s{parsed['scale_perc']}_r{parsed['rot_deg']}.png"
-                        
-                        if target_fn not in found_targets:
-                            if self.verbose >= 2:
-                                print(f"  [Invalid] Style {filename} missing required target file.")
-                            self.invalid_files[split].append(full_path)
-                        elif spec in self.full_valid_output_specs[split]:
-                            self.existing_output_specs[split].add(spec)
-                        else:
-                            if self.verbose >= 2:
-                                self._print_mismatch_reason(filename, spec, split)
-                            self.invalid_files[split].append(full_path)
 
     def _verify_file_dimensions(self, file_path):
         """

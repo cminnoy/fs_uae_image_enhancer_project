@@ -9,13 +9,13 @@ from model_residual_unet import get_model
 class AmigaEnhancer:
     def __init__(self, model_type, checkpoint_path, lores_only, device="cuda"):
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
-        
+
         # Load Architecture
         self.model = get_model(model_type, lores_only).to(self.device)
-        
+
         # Load Checkpoint
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        
+
         # Extract model state from the full checkpoint dictionary
         if "model_state_dict" in checkpoint:
             state_dict = checkpoint["model_state_dict"]
@@ -36,13 +36,13 @@ class AmigaEnhancer:
             output_srgb = self.model(input_srgb).clamp(0, 1)
 
         output_final = output_srgb.squeeze(0).permute(1, 2, 0).cpu().float().numpy()
-        
+
         Image.fromarray((output_final * 255.0).astype(np.uint8)).save(output_path)
         print(f"Processed {input_path.name} -> {output_path}")
 
 def main():
     parser = argparse.ArgumentParser(description='Amiga Image Enhancer Inference')
-    parser.add_argument('--type', type=str, required=True, choices=['light', 'heavy'])
+    parser.add_argument('--type', type=str, required=True, choices=['light', 'heavy'], help='Type of model: light, heavy')
     parser.add_argument('--checkpoint', '-c', type=str, required=False,
                         help='Path to .pth checkpoint file. If omitted, defaults to model/<type>/best_model.pth')
     parser.add_argument('--input', type=str, required=True, help='Path to input image file')

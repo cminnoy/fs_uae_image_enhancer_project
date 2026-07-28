@@ -11,8 +11,7 @@ from activations import get_activation
 #
 # This model is designed specifically for image enhancement of the FS-UAE Amiga emulator.
 # FS-UAE uses a single frame buffer with 32-bit RGBA format, where each color channel is in sRGB space.
-# The model is trained on linear space images, so input images are converted from sRGB to linear space.
-# An sRGB to linear conversion and normalisation is done after the model is trained by the ONNX export script.
+# The model is trained in sRGB space, to be compatible with VGG.
 # 
 # The FS-UAE framebuffer has a fixed size of 752x576 pixels.
 # Amiga lores mode uses 4 raw pixels for every displayed pixel, in a 2x2 grid, resulting in a 376x288 effective resolution.
@@ -27,12 +26,12 @@ from activations import get_activation
 # a new convolutional path to extract rich features before entering the U-Net.
 # The U-Net consists of an encoder-decoder structure with skip connections and a bottleneck.
 # The output is refined and combined with a global skip connection from the input.
-# The model is trained using a perceptual loss that combines pixel-wise loss,
-# VGG-based perceptual loss, and high-frequency loss.
+# The model is trained using a perceptual loss that combines pixel-wise loss, VGG-based perceptual loss, and high-frequency loss.
 # 
 # Amiga games are mostly handdrawn pixel art with sharp edges and limited color palettes.
 # Often artists used dithering to simulate more colors and gradients, but not always in a consistent way.
-# The model is trained on a dataset of high resolution images in full colour with there corresponding lores counterparts.
+# The model is trained on a dataset of high resolution images (natural images but mostly game footage)
+# in full colour with there corresponding lores counterparts.
 # 
 # Dithering patterns applied to lores images in the training dataset include:
 # - Floyd-Steinberg dithering
@@ -54,7 +53,14 @@ from activations import get_activation
 # - 512 color palette
 # - HAM6 for Amiga lores and lores interlace
 # - SHAM (Split HAM6) for Amiga lores and lores interlace
-# - DynamicHires (16 color palette per scanline) for Amiga hires and hires interlace
+#
+# We train models for two case, OCS and AGA.
+# OCS is the original Amiga chipset, which has a maximum of 32 colors on screen at once (with some tricks to get more).
+# AGA is the Advanced Graphics Architecture, which has a maximum of 256 colors on screen at once.
+# OCS games are typically more pixelated and have more dithering, while AGA games can have smoother gradients and more colors.
+# The OCS dataset consists out of the following modes: palette 16 24 32 64 128, EHB, HAM6, SHAM.
+# The AGA dataset consists out of the following modes: palette 0 128 256 512 (0 meaning full 24 bit color).
+
 
 class SqueezeExcite(nn.Module):
     def __init__(self, channels, reduction=8):
@@ -123,14 +129,14 @@ class ResidualBlock(nn.Module):
 
     def forward(self, x):
         residual = x
-        
+
         x = self.conv1(x)
         x = self.act1(x)
         x = self.conv2(x)
-        
+
         if self.skip_proj:
             residual = self.skip_proj(residual)
-            
+
         x = x + residual
         x = self.act2(x) # Post-addition activation
         return x
@@ -206,7 +212,7 @@ class kPathResidualFeatureBlock(nn.Module):
             if self.skip_alpha is not None:
                 skip = skip * self.skip_alpha
             fused = fused + skip
-            
+
         return fused
 
 class HeadProcessing(nn.Module):
@@ -216,18 +222,18 @@ class HeadProcessing(nn.Module):
         self.preprocessing = preprocessing
         self.pixel_unshuffle = nn.PixelUnshuffle(2)
         unshuffled_ch = input_channels * 4
-        
+
         if preprocessing:
             self.avg_pool = nn.AvgPool2d(2, stride=2)
             self.max_pool = nn.MaxPool2d(2, stride=2)
-        
+
             self.conv_2x2_path = nn.Conv2d(
                 in_channels=input_channels,
                 out_channels=int(input_channels * twobytwo_expansion),
                 kernel_size=2,
                 stride=2
             )
-            
+
             self.conv_expand = nn.Conv2d(
                 in_channels=unshuffled_ch,
                 out_channels=int(unshuffled_ch * onebyone_expansion),
@@ -243,7 +249,7 @@ class HeadProcessing(nn.Module):
         else:
             # In lores_only, we only pass the unshuffled 4x channels
             concat_input_channels = unshuffled_ch
-        
+
         self.conv_stack = kPathResidualFeatureBlock(
                 in_channels=concat_input_channels,
                 mid_channels=int(base_channels * 1.5),
@@ -267,16 +273,16 @@ class HeadProcessing(nn.Module):
 
     def forward(self, x):
         unshuffled = self.pixel_unshuffle(x)
-        
+
         if self.preprocessing:
             unshuffled_expanded = self.conv_expand(unshuffled)
             unshuffled_expanded = F.relu(unshuffled_expanded, inplace=False)
-        
+
             avg_p = self.avg_pool(x)
             max_p = self.max_pool(x)
             min_p_neg = self.max_pool(-x) 
             contrast = max_p + min_p_neg
-        
+
             conv_2x2 = self.conv_2x2_path(x)
             conv_2x2 = F.relu(conv_2x2, inplace=False)
 
@@ -284,18 +290,17 @@ class HeadProcessing(nn.Module):
         else:
             # Per instructions: unshuffled output goes directly into kPathRB
             concat = unshuffled
-        
+
         stacked = self.conv_stack(concat)
-        
+
         # Spatial dimensions now match: both are H/2, W/2
         se_in = torch.cat([unshuffled, stacked], dim=1)
 
         result = self.se(se_in)
         result = F.relu(result, inplace=False)
-        result = self.conv_reduce(result)      
+        result = self.conv_reduce(result)
 
         return result, unshuffled
-
 
 class RefineWithUnshuffle(nn.Module):
     """Refinement that projects the head pixel-unshuffled features with a
@@ -332,24 +337,36 @@ class ResidualUNet(nn.Module):
         self.base_channels = base_channels
         # Number of channels produced by HeadProcessing.pixel_unshuffle
         self.unshuffled_ch = input_channels * 4
-        
+
+        # Used since epoch 0
+        # self.perceptual_criterion = PerceptualLoss(
+        #     pixel_loss_type='charbonnier',
+        #     pixel_loss_weight=0.60,      # Reduced from 0.94
+        #     vgg_weight=0.20,             # Increased from 0.03
+        #     high_frequency_type='laplacian',
+        #     high_frequency_weight=0.020,  # Increased from 0.03
+        #     lambda_lum=0.0,
+        #     input_is_linear=False
+        # )
+
+        # Used since epoch 54
         self.perceptual_criterion = PerceptualLoss(
-            pixel_loss_weight=0.94, #0.95,
-            vgg_weight=0.03,
             pixel_loss_type='charbonnier',
-            high_frequency_weight=0.03, #0.02,
-            high_frequency_type='laplacian',
+            pixel_loss_weight=1.00,
+            vgg_weight=0.01,
+            high_frequency_type='prewitt',
+            high_frequency_weight=0.08,
             lambda_lum=0.0,
-            input_is_linear=True
+            input_is_linear=False
         )
-    
+
         # --- Head ---
         self.head = HeadProcessing(input_channels, base_channels, k_paths_head, onebyone_expansion=3.0, twobytwo_expansion=4.0, preprocessing=not lores_only)
 
         # --- Encoder ---
         self.encoder_blocks = nn.ModuleList()
         in_ch = base_channels
-        
+
         # Helper to cap channels
         def get_ch(depth_idx):
             ch = base_channels * (2 ** depth_idx)
@@ -357,7 +374,7 @@ class ResidualUNet(nn.Module):
 
         for d in range(unet_depth):
             out_ch = get_ch(d)
-            
+
             # Account for PixelUnshuffle expansion (x4) for levels d > 0 input logic
             # Logic: Input to Level 0 is base_channels.
             # Input to Level 1 is Level 0 out (base) * 4 (due to unshuffle downsample)
@@ -398,13 +415,13 @@ class ResidualUNet(nn.Module):
         # --- Decoder ---
         self.ups = nn.ModuleList([nn.PixelShuffle(2) for _ in range(max(0, unet_depth - 1))])
         self.decoder_blocks = nn.ModuleList()
-        
+
         prev_out_ch = bottleneck_ch
         refine_out_channels = output_channels * (16 if lores_only else 4)
 
         for d in reversed(range(unet_depth)):
             current_level_ch = get_ch(d)
-            
+
             if d == 0:
                 # Final Stage (No Upsampling)
                 # Final Stage (No Upsampling)
@@ -416,23 +433,23 @@ class ResidualUNet(nn.Module):
                 # Intermediate Stage (Upsampling via PixelShuffle happens before this block)
                 # Input is: (Prev // 4) + Skip
                 upsampled_ch = prev_out_ch // 4
-                
+
                 skip_ch = get_ch(d - 1)
-                
+
                 in_ch = upsampled_ch + skip_ch
                 out_ch = current_level_ch
-                
+
                 blocks = [ResidualBlock(in_ch if i == 0 else out_ch,
                                         int(out_ch * internal_block_channels_ratio),
                                         out_ch, kernel_size=3)
                           for i in range(blocks_per_level)]
                 self.decoder_blocks.append(nn.Sequential(*blocks))
-                
+
                 prev_out_ch = out_ch
 
         # --- Refinement ---
         # refine_out_channels = 3 * 16 = 48 (lores) or 3 * 4 = 12 (non-lores)
-        
+
         if self.unet_depth == 0:
             proj_ch = refine_out_channels
             self.refine = RefineWithUnshuffle(
@@ -526,7 +543,7 @@ class ResidualUNet(nn.Module):
 
         x = self.refine(x, x_unshuffled)
         return x
-    
+
     def criterion(self, output, target):
         return self.perceptual_criterion(output, target)
 

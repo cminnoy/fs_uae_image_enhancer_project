@@ -13,12 +13,16 @@ class AmigaONNXEnhancer:
     def __init__(self, model_path, use_gpu=True):
         # Select providers based on hardware and request
         providers = ['CPUExecutionProvider']
-        if use_gpu and 'CUDAExecutionProvider' in ort.get_available_providers():
-            providers.insert(0, 'CUDAExecutionProvider')
-        
+        if use_gpu:
+            if 'CUDAExecutionProvider' in ort.get_available_providers():
+                providers.insert(0, 'CUDAExecutionProvider')
+            if 'MIGraphXExecutionProvider' in ort.get_available_providers():
+                providers.insert(0, 'MIGraphXExecutionProvider')
+        print(providers)
+
         print(f"Loading ONNX session with providers: {providers}")
         self.session = ort.InferenceSession(model_path, providers=providers)
-        
+
         # Metadata from the model
         self.input_name = self.session.get_inputs()[0].name
         self.input_shape = self.session.get_inputs()[0].shape  # [1, 576, 752, 4]
@@ -48,7 +52,7 @@ class AmigaONNXEnhancer:
         # 4. Post-processing
         # Remove batch dim and save. Output is already UINT8 RGBA.
         output_img_np = np.squeeze(output_data, axis=0)
-        
+
         Image.fromarray(output_img_np, "RGBA").save(output_path)
         print(f"ONNX Processed: {input_path.name} -> {output_path}")
 
@@ -57,7 +61,7 @@ def main():
     parser.add_argument('--model', type=str, required=True, help='Path to .onnx model')
     parser.add_argument('--input', type=str, required=True, help='Input image path')
     parser.add_argument('--output', type=str, required=True, help='Output image path')
-    parser.add_argument('--cpu', action='store_true', help='Force CPU execution')
+    parser.add_argument('--gpu', action='store_true', help='Use GPU execution')
     args = parser.parse_args()
 
     # Resolve paths
@@ -71,7 +75,7 @@ def main():
         print(f"Error: ONNX model not found at {args.model}")
         return
 
-    enhancer = AmigaONNXEnhancer(args.model, use_gpu=not args.cpu)
+    enhancer = AmigaONNXEnhancer(args.model, use_gpu=args.gpu)
     enhancer.process(in_path, Path(args.output))
 
 if __name__ == "__main__":

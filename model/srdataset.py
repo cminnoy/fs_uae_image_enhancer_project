@@ -311,6 +311,46 @@ def gather_all_samples_from_directory(directory_path: str, expected_crop_size: t
 
     return available_samples_pool
 
+# shift image
+def translate_image(img, dx, dy):
+    """
+    Translate image without wraparound.
+    Newly exposed pixels are filled by edge replication.
+    """
+
+    w, h = img.size
+
+    # Affine translation
+    shifted = img.transform(
+        (w, h),
+        Image.AFFINE,
+        (1, 0, dx,
+         0, 1, dy),
+        resample=Image.NEAREST
+    )
+
+    # Fill exposed borders with edge pixels
+    if dx > 0:
+        edge = shifted.crop((dx, 0, dx + 1, h))
+        for x in range(dx):
+            shifted.paste(edge, (x, 0))
+
+    elif dx < 0:
+        edge = shifted.crop((w + dx - 1, 0, w + dx, h))
+        for x in range(w + dx, w):
+            shifted.paste(edge, (x, 0))
+
+    if dy > 0:
+        edge = shifted.crop((0, dy, w, dy + 1))
+        for y in range(dy):
+            shifted.paste(edge, (0, y))
+
+    elif dy < 0:
+        edge = shifted.crop((0, h + dy - 1, w, h + dy))
+        for y in range(h + dy, h):
+            shifted.paste(edge, (0, y))
+
+    return shifted
 
 # ----------------------------
 # Dataset for Super-Resolution
@@ -376,6 +416,13 @@ class SRDataset(Dataset):
             # Fallback: if a specific file fails, try the next one in the pool
             warnings.warn(f"Error loading {styled_img_path}: {e}. Retrying with next index.")
             return self.__getitem__(idx + 1)
+
+        # We shift images a bit to learn correct phase translation
+        if random.random() < 0.5:
+            dx = random.randint(-1, 1)
+            dy = random.randint(-1, 1)
+            styled_img_pil = translate_image(styled_img_pil, dx, dy)
+            target_img_pil = translate_image(target_img_pil, dx, dy)
 
         # Calculate random sub-crop coordinates
         img_width, img_height = styled_img_pil.size

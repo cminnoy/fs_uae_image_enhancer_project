@@ -8,78 +8,94 @@ from PIL import Image, ImageCms, UnidentifiedImageError
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".webp", ".png", ".gif", ".tif", ".tiff", ".bmp", ".avif"}
 
-def process_image(src: Path, input_dir: Path, output_dir: Path, max_crop_size):
-    try:
-        with Image.open(src) as img:
-            # Convert color space to sRGB if ICC profile present
-            icc_bytes = img.info.get("icc_profile")
-            if icc_bytes:
-                try:
-                    src_profile = ImageCms.ImageCmsProfile(io.BytesIO(icc_bytes))
-                    dst_profile = ImageCms.createProfile("sRGB")
-                    img = ImageCms.profileToProfile(img, src_profile, dst_profile, outputMode="RGB")
-                    print(f"[ICC→sRGB] {src}")
-                except Exception as e:
-                    print(f"[ICC warn] {src} — could not apply ICC profile ({e}); falling back to RGB")
+class ImageProcessor:
+    def __init__(self, input_dir, output_dir, max_crop_size, pad_to_max=False, prefix_dir=False):
+        self.input_dir = Path(input_dir)
+        self.output_dir = Path(output_dir)
+        self.max_crop_size = max_crop_size
+        self.pad_to_max = pad_to_max
+        self.prefix_dir = prefix_dir
+
+    def process_image(self, src: Path):
+        try:
+            with Image.open(src) as img:
+                # 1. Color Space Management
+                icc_bytes = img.info.get("icc_profile")
+                if icc_bytes:
+                    try:
+                        src_profile = ImageCms.ImageCmsProfile(io.BytesIO(icc_bytes))
+                        dst_profile = ImageCms.createProfile("sRGB")
+                        img = ImageCms.profileToProfile(img, src_profile, dst_profile, outputMode="RGB")
+                    except Exception:
+                        if img.mode != "RGB":
+                            img = img.convert("RGB")
+                else:
                     if img.mode != "RGB":
                         img = img.convert("RGB")
-            else:
-                if img.mode != "RGB":
-                    print(f"[RGB] {src} → RGB")
-                    img = img.convert("RGB")
 
-            # Optional resize (keeps aspect ratio)
-            if max_crop_size:
-                w, h = img.size
-                if w > max_crop_size[0] or h > max_crop_size[1]:
-                    img.thumbnail(max_crop_size, Image.LANCZOS)
+                # 2. Resize and Pad
+                if self.max_crop_size:
+                    target_w, target_h = self.max_crop_size
+                    img.thumbnail(self.max_crop_size, Image.LANCZOS)
+                    
+                    if self.pad_to_max:
+                        new_img = Image.new("RGB", (target_w, target_h), (0, 0, 0))
+                        curr_w, curr_h = img.size
+                        offsets = ((target_w - curr_w) // 2, (target_h - curr_h) // 2)
+                        new_img.paste(img, offsets)
+                        img = new_img
 
-            # Mirror subdirectory structure, change extension to .png
-            rel = src.relative_to(input_dir)
-            dst = (output_dir / rel).with_suffix(".png")
-            dst.parent.mkdir(parents=True, exist_ok=True)
+                # 3. Path and Filename Logic
+                rel_path = src.relative_to(self.input_dir)
+                parent_dir_name = rel_path.parent.name
+                
+                # Apply prefix if requested and if a parent subdirectory exists
+                if self.prefix_dir and parent_dir_name:
+                    new_name = f"{parent_dir_name}_{src.stem}.png"
+                else:
+                    new_name = f"{src.stem}.png"
 
-            if dst.exists():
-                return f"SKIP (exists) {dst}"
+                dst = self.output_dir / rel_path.parent / new_name
+                dst.parent.mkdir(parents=True, exist_ok=True)
 
-            img.save(dst, format="PNG")
-            return f"OK {src} -> {dst}"
-    except UnidentifiedImageError:
-        return f"SKIP (unidentified image) {src}"
-    except Exception as e:
-        return f"ERROR {src}: {e}"
+                if dst.exists():
+                    return f"SKIP (exists) {dst.name}"
+
+                img.save(dst, format="PNG")
+                return f"OK {src.name} -> {dst.name}"
+                
+        except UnidentifiedImageError:
+            return f"SKIP (unidentified) {src}"
+        except Exception as e:
+            return f"ERROR {src}: {e}"
 
 def main():
-    parser = argparse.ArgumentParser(description="Prepare groundtruth images (recursive, ICC→sRGB, PNG out).")
-    parser.add_argument("input_dir", type=Path, help="Directory containing input images (may have subdirectories).")
-    parser.add_argument("output_dir", type=Path, help="Directory to save processed PNGs (subdirs mirrored).")
-    parser.add_argument("--max_crop_size", type=int, nargs=2, metavar=("WIDTH", "HEIGHT"),
-                        help="Maximum size (width height); images larger than this are downscaled proportionally.")
-    parser.add_argument("--workers", type=int, default=32, help="Number of worker threads (default: 32).")
+    parser = argparse.ArgumentParser(description="Prepare groundtruth images with optional padding and prefixing.")
+    parser.add_argument("input_dir", type=Path)
+    parser.add_argument("output_dir", type=Path)
+    parser.add_argument("--max_crop_size", type=int, nargs=2, metavar=("WIDTH", "HEIGHT"))
+    parser.add_argument("--pad", action="store_true", help="Pad to max_crop_size with black borders.")
+    parser.add_argument("--prefix", action="store_true", help="Rename files to <subdir>_<original_name>.")
+    parser.add_argument("--workers", type=int, default=32)
     args = parser.parse_args()
 
-    input_dir: Path = args.input_dir
-    output_dir: Path = args.output_dir
-    max_crop_size = tuple(args.max_crop_size) if args.max_crop_size else None
+    max_size = tuple(args.max_crop_size) if args.max_crop_size else None
+    processor = ImageProcessor(args.input_dir, args.output_dir, max_size, args.pad, args.prefix)
 
-    if not input_dir.is_dir():
-        raise SystemExit(f"Input directory not found: {input_dir}")
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Collect files recursively
-    src_files = [p for p in input_dir.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
+    src_files = [p for p in args.input_dir.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
+    
     if not src_files:
-        print("No images found in input_dir.")
+        print("No images found.")
         return
 
-    print(f"Found {len(src_files)} images under {input_dir}. Processing...")
+    print(f"Processing {len(src_files)} images...")
 
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futures = [ex.submit(process_image, p, input_dir, output_dir, max_crop_size) for p in src_files]
+        futures = [ex.submit(processor.process_image, p) for p in src_files]
         for fut in as_completed(futures):
-            msg = fut.result()
-            if msg:
-                print(msg)
+            res = fut.result()
+            if res:
+                print(res)
 
 if __name__ == "__main__":
     main()

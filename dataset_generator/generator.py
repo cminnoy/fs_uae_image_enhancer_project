@@ -57,12 +57,18 @@ class DatasetScannerMixin:
         if self.verbose >= 1:
             print(f"Scanning output directory for existing files: {self.dest_dir}")
 
+        overall_start_time = time.time()
+
         for split in ['train', 'test']:
             split_dir = os.path.join(self.dest_dir, split)
             if not os.path.isdir(split_dir):
                 continue
 
+            split_start_time = time.time()
+
             # 1. Fast traversal: Grab subdirectories immediately via os.scandir
+            print(f"Scanning split '{split}' for existing files...")
+            scandir_start = time.time()
             try:
                 subdirs = [
                     (entry.path, entry.name) 
@@ -71,111 +77,158 @@ class DatasetScannerMixin:
                 ]
             except OSError:
                 continue
+            scandir_time = time.time() - scandir_start
+
+            if self.verbose >= 1:
+                print(f"Found {len(subdirs)} subdirectories in split '{split}' to scan for existing files.")
+            if self.verbose >= 2:
+                print(f"  [TIMING] os.scandir took {scandir_time:.2f}s for {len(subdirs)} directories")
 
             # 2. Parallel Processing: Use Threads instead of Processes to share 
             # the massive 181M memory footprint of self.full_valid_output_specs
             max_threads = min(32, (os.cpu_count() or 4) * 2)
-            
+            if self.verbose >= 1:
+                print(f"Processing subdirectories in parallel with up to {max_threads} threads...")
+
+            thread_submit_start = time.time()
             with ThreadPoolExecutor(max_workers=max_threads) as executor:
                 # Submit worker tasks for each subdirectory
                 futures = {
                     executor.submit(self._process_single_directory, path, name, split): path 
                     for path, name in subdirs
                 }
+            thread_submit_time = time.time() - thread_submit_start
 
-                for future in as_completed(futures):
-                    if getattr(self, 'stop_requested', False):
-                        executor.shutdown(wait=False, cancel_futures=True)
-                        return
+            if self.verbose >= 2:
+                print(f"  [TIMING] Created {len(futures)} thread tasks in {thread_submit_time:.2f}s")
 
-                    # Merge the isolated results back into the main state
-                    local_invalid, local_targets, local_styles = future.result()
-                    
-                    if local_invalid:
-                        self.invalid_files[split].extend(local_invalid)
-                    if local_targets:
-                        self.existing_target_specs[split].update(local_targets)
-                    if local_styles:
-                        self.existing_output_specs[split].update(local_styles)
+            # Process futures as they complete and collect timing data
+            processing_start = time.time()
+            processed_count = 0
+            merge_times = []
+
+            for future in as_completed(futures):
+                if getattr(self, 'stop_requested', False):
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    return
+
+                merge_start = time.time()
+                # Merge the isolated results back into the main state
+                local_invalid, local_targets, local_styles = future.result()
+
+                if local_invalid:
+                    self.invalid_files[split].extend(local_invalid)
+                if local_targets:
+                    self.existing_target_specs[split].update(local_targets)
+                if local_styles:
+                    self.existing_output_specs[split].update(local_styles)
+
+                merge_time = time.time() - merge_start
+                merge_times.append(merge_time)
+                processed_count += 1
+
+                if self.verbose >= 2 and processed_count % max(1, len(futures) // 10) == 0:
+                    elapsed = time.time() - processing_start
+                    print(f"  [TIMING] Processed {processed_count}/{len(futures)} directories in {elapsed:.2f}s ({elapsed/processed_count:.3f}s per dir)")
+
+            processing_time = time.time() - processing_start
+            split_time = time.time() - split_start_time
+
+            if self.verbose >= 2:
+                avg_merge_time = sum(merge_times) / len(merge_times) if merge_times else 0
+                print(f"  [TIMING] Split '{split}' processing: {processing_time:.2f}s ({processing_time/len(futures):.3f}s/dir)")
+                print(f"  [TIMING] Average merge time per result: {avg_merge_time*1000:.2f}ms")
+                print(f"  [TIMING] Total split '{split}' time: {split_time:.2f}s")
+                print(f"    - Directory listing: {scandir_time:.2f}s")
+                print(f"    - Worker processing: {processing_time:.2f}s")
+
+        overall_time = time.time() - overall_start_time
+        if self.verbose >= 2:
+            print(f"  [TIMING] Total _scan_output_directory time: {overall_time:.2f}s")
 
     def _process_single_directory(self, root, folder_name, split):
         """
         Worker method to process files within a single subdirectory.
-        Completely eliminates string formatting and minimizes I/O calls.
+        Optimized to recognize all valid files regardless of target existence.
         """
+        if self.verbose >= 2:
+            dir_start_time = time.time()
+
         local_invalid = []
         local_targets = set()
         local_styles = set()
-        
+
+        # O(1) reverse lookup of the source image path
         original_img_path = self._resolve_source_path(folder_name, split)
         if not original_img_path:
             return local_invalid, local_targets, local_styles
 
         try:
-            # Read all file entries natively, caching stat buffers
-            entries = list(os.scandir(root))
+            # os.scandir is significantly faster than os.listdir/os.walk
+            entries = os.scandir(root)
         except OSError:
             return local_invalid, local_targets, local_styles
 
-        # 3. Tuple Cache: Store valid targets as tuples for O(1) lookups
-        valid_target_bases = set()
-        
-        # PASS 1: Identify targets and cache their specifications
+        entry_count = 0
+        parse_time = 0
+        lookup_time = 0
+        verify_time = 0
+
         for entry in entries:
             if getattr(self, 'stop_requested', False): break
-            if not entry.is_file() or not entry.name.startswith("target_"):
+            if not entry.is_file():
                 continue
 
-            # Disable verbosity deep in the loop to prevent massive I/O console lag
+            entry_count += 1
+
+            parse_start = time.time()
             parsed = parse_generated_filename(entry.name, verbose=False)
+            parse_time += time.time() - parse_start
+
             if not parsed:
-                local_invalid.append(entry.path)
                 continue
 
-            spec = (original_img_path, parsed['crop_x'], parsed['crop_y'], 
-                    parsed['rot_deg'], parsed['scale_perc'])
+            lookup_start = time.time()
+            # Case 1: Processing a target file
+            if parsed['type'] == 'target':
+                spec = (original_img_path, parsed['crop_x'], parsed['crop_y'], 
+                        parsed['rot_deg'], parsed['scale_perc'])
 
-            if spec in self.full_valid_target_specs[split]:
-                # Delay expensive dimension check until specification is validated
-                if self._verify_file_dimensions(entry.path):
-                    local_targets.add(spec)
-                    # Store the fast O(1) tuple to check dependencies later
-                    valid_target_bases.add(
-                        (parsed['crop_x'], parsed['crop_y'], parsed['scale_perc'], parsed['rot_deg'])
-                    )
+                if spec in self.full_valid_target_specs[split]:
+                    verify_start = time.time()
+                    if self._verify_file_dimensions(entry.path):
+                        local_targets.add(spec)
+                    else:
+                        local_invalid.append(entry.path)
+                    verify_time += time.time() - verify_start
+                else:
+                    # File exists but isn't in the current configuration plan
+                    local_invalid.append(entry.path)
+
+            # Case 2: Processing a styled output file
+            elif parsed['type'] == 'style':
+                spec = (original_img_path, parsed['crop_x'], parsed['crop_y'], 
+                        parsed['rot_deg'], parsed['scale_perc'], parsed['rgb'], 
+                        parsed['pal'], parsed['dither'], parsed['resolution'])
+
+                # FIX: We no longer check if a physical 'target_' file exists. 
+                # If the style file matches the valid spec and dimensions, it's recognized.
+                if spec in self.full_valid_output_specs[split]:
+                    verify_start = time.time()
+                    if self._verify_file_dimensions(entry.path):
+                        local_styles.add(spec)
+                    else:
+                        local_invalid.append(entry.path)
+                    verify_time += time.time() - verify_start
                 else:
                     local_invalid.append(entry.path)
-            else:
-                local_invalid.append(entry.path)
 
-        # PASS 2: Validate styles using the fast tuple cache
-        for entry in entries:
-            if getattr(self, 'stop_requested', False): break
-            if not entry.is_file() or not entry.name.startswith("style_"):
-                continue
+            lookup_time += time.time() - lookup_start
 
-            parsed = parse_generated_filename(entry.name, verbose=False)
-            if not parsed:
-                local_invalid.append(entry.path)
-                continue
-
-            # 4. Fast Dependency Check: No string concatenation required
-            base_tuple = (parsed['crop_x'], parsed['crop_y'], parsed['scale_perc'], parsed['rot_deg'])
-            if base_tuple not in valid_target_bases:
-                local_invalid.append(entry.path)
-                continue
-
-            spec = (original_img_path, parsed['crop_x'], parsed['crop_y'], 
-                    parsed['rot_deg'], parsed['scale_perc'], parsed['rgb'], 
-                    parsed['pal'], parsed['dither'], parsed['resolution'])
-
-            if spec in self.full_valid_output_specs[split]:
-                if self._verify_file_dimensions(entry.path):
-                    local_styles.add(spec)
-                else:
-                    local_invalid.append(entry.path)
-            else:
-                local_invalid.append(entry.path)
+        if self.verbose >= 2:
+            total_time = time.time() - dir_start_time
+            if entry_count > 0:
+                print(f"  [TIMING] Worker {folder_name}: processed {entry_count} files in {total_time:.3f}s ({parse_time*1000:.1f}ms parse, {lookup_time*1000:.1f}ms lookup, {verify_time*1000:.1f}ms verify)")
 
         return local_invalid, local_targets, local_styles
 

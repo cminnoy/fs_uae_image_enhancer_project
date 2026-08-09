@@ -2,8 +2,8 @@
 python generator.py \
     --train_images dataset/groundtruth_train \
     --test_images dataset/groundtruth_test \
-    --train_num_crops 10000 \
-    --test_num_crops 2000 \
+    --train_num_crops 10800 \
+    --test_num_crops 200 \
     --destination_dir dataset/dataset_aga \
     --max_workers 28 \
     --rgb 888 \

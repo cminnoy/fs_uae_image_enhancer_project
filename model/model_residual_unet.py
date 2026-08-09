@@ -61,7 +61,6 @@ from activations import get_activation
 # The OCS dataset consists out of the following modes: palette 16 24 32 64 128, EHB, HAM6, SHAM.
 # The AGA dataset consists out of the following modes: palette 0 128 256 512 (0 meaning full 24 bit color).
 
-
 class SqueezeExcite(nn.Module):
     def __init__(self, channels, reduction=8):
         super().__init__()
@@ -86,13 +85,13 @@ class ResidualBlock(nn.Module):
     def __init__(self, in_channels, mid_channels, out_channels, kernel_size=3,
                  activation1='relu', activation2='relu',
                  activation1_params=None, activation2_params=None,
-                 inplace=True):
+                 inplace=False):
         super().__init__()
 
         self.conv1 = nn.Conv2d(in_channels, mid_channels, kernel_size, padding=kernel_size//2, bias=True)
         # Build activations, forwarding any provided params and ensuring
         # channel-aware activations get a sensible default if params omitted.
-        def make_act(name, channels_for_act, params, inplace_local=True):
+        def make_act(name, channels_for_act, params, inplace_local=False):
             if name is None:
                 return nn.Identity()
             key = name.lower()
@@ -107,6 +106,7 @@ class ResidualBlock(nn.Module):
             if key in ('biased_relu', 'biasedprelu', 'biased_prelu', 'biased') and 'num_parameters' not in p:
                 p['num_parameters'] = channels_for_act
             if key == 'prelu' and 'num_parameters' not in p:
+                print(f"Warning: PReLU activation in ResidualBlock with {channels_for_act} channels but 'num_parameters' not specified. Defaulting to num_parameters={channels_for_act}. For better performance, consider explicitly setting 'num_parameters' in the activation parameters.")
                 p['num_parameters'] = channels_for_act
 
             # Ensure inplace is passed when requested and constructor accepts it
@@ -115,10 +115,13 @@ class ResidualBlock(nn.Module):
 
             try:
                 return get_activation(name, params=p, inplace=inplace_local)
-            except TypeError:
+            except TypeError as e:
+                print(f"Error occurred while creating activation {name}: {e}")
                 # Fall back: try without params
                 return get_activation(name, params=None, inplace=inplace_local)
 
+        #print(f"ResidualBlock: activation1={activation1} with params {activation1_params}, activation2={activation2} with params {activation2_params}")
+        #print(f"ResidualBlock: conv1 in_channels={in_channels}, mid_channels={mid_channels}, out_channels={out_channels}, kernel_size={kernel_size}")
         self.act1 = make_act(activation1, mid_channels, activation1_params, inplace_local=inplace)
         self.conv2 = nn.Conv2d(mid_channels, out_channels, kernel_size, padding=kernel_size//2, bias=True)
         self.act2 = make_act(activation2, out_channels, activation2_params, inplace_local=inplace) # Post-addition activation
@@ -137,7 +140,7 @@ class ResidualBlock(nn.Module):
         if self.skip_proj:
             residual = self.skip_proj(residual)
 
-        x = x + residual
+        x = residual + 0.1 * x  # Scaled residual for stability
         x = self.act2(x) # Post-addition activation
         return x
 
@@ -152,38 +155,43 @@ class kPathResidualFeatureBlock(nn.Module):
         self.use_concatenation = use_concatenation
         self.use_attention = use_attention
         self.use_merge = use_merge
+        self.skip_alpha = None
+        self.skip_proj = None
+
+        self.path_acts = nn.ModuleList([
+            get_activation("mish", inplace=True),                                               # Path 0: Smooth gradients
+            get_activation("prelu", params={"num_parameters": mid_channels}, inplace=False),    # Path 1: Negative residuals
+            get_activation("telu"),                                                             # Path 2: Text/UI edges
+            get_activation("biased_relu", params={"num_parameters": mid_channels})              # Path 4: Color offsets
+        ])
 
         # Build multi-path feature extraction blocks
         self.paths = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=True),
-                nn.ReLU(inplace=True),
+                self.path_acts[i % len(self.path_acts)],
                 nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=True),
-                nn.ReLU(inplace=True)
             )
-            for _ in range(k_paths)
+            for i in range(k_paths)
         ])
 
         # Combine features from paths
         combined_channels = out_channels * k_paths if use_concatenation else out_channels
+        final_out_channels = out_channels if use_merge else combined_channels
 
         if use_merge:
             self.merge_conv = nn.Sequential(
-                nn.Conv2d(combined_channels, out_channels, kernel_size=1, bias=True),
-                nn.ReLU(inplace=True)
+                nn.Conv2d(combined_channels, out_channels, kernel_size=1, bias=True)
             )
 
         # Optional attention
         if use_attention:
             self.attention = SqueezeExcite(combined_channels)
-    
-        self.skip_proj = None
+
         if with_skip_connection:
-            if in_channels != out_channels:
-                self.skip_proj = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
-                self.skip_alpha = None
+            if in_channels != final_out_channels:
+                self.skip_proj = nn.Conv2d(in_channels, final_out_channels, kernel_size=1, bias=False)
             else:
-                self.skip_proj = None
                 self.skip_alpha = nn.Parameter(torch.tensor(0.5), requires_grad=True).float()
 
     def forward(self, x):
@@ -196,7 +204,7 @@ class kPathResidualFeatureBlock(nn.Module):
         else:
             combined = sum(path_outputs) / self.k_paths
 
-        # Optional attention        
+        # Optional attention
         if self.use_attention:
             combined = self.attention(combined)
 
@@ -215,8 +223,111 @@ class kPathResidualFeatureBlock(nn.Module):
 
         return fused
 
+class DecayedFastMambaBlock(nn.Module):
+    def __init__(self, channels, d_state=16):
+        super().__init__()
+        self.d_inner = channels * 2
+        self.d_state = d_state
+
+        self.in_proj = nn.Linear(channels, self.d_inner * 2, bias=False)
+        self.x_proj = nn.Linear(self.d_inner, d_state * 2, bias=False)
+        self.out_proj = nn.Linear(self.d_inner, channels, bias=False)
+
+        # Learnable decay factor for the row context
+        self.decay_factor = nn.Parameter(torch.ones(1, 1, d_state))
+
+    def forward(self, x):
+        # Force execution within local autocast context to keep MatMul ops in FP16
+        with torch.autocast(device_type=x.device.type, enabled=True, dtype=torch.float16):
+            orig_dtype = x.dtype
+
+            # Keep accumulator-sensitive scaling/decay weights in FP32, cast inputs for the MatMul block
+            decay_fp32 = self.decay_factor.to(torch.float32)
+
+            # 1. Handle 4D input: [B, C, H, W] -> [B*H, W, C]
+            is_4d = len(x.shape) == 4
+            if is_4d:
+                B, C, H, W = x.shape
+                x = x.permute(0, 2, 3, 1).reshape(B * H, W, C)
+
+            # x shape is now [Batch, Seq, Channels]
+            xz = self.in_proj(x)
+            x_proj, z = xz.chunk(2, dim=-1)
+
+            # SSM States (Key/Query/Value approximation)
+            states = self.x_proj(x_proj) 
+            B_ssm, C_ssm = states.chunk(2, dim=-1)
+
+            # Decayed Global Aggregation (MatMul executed in FP16 via autocast)
+            gate = torch.sigmoid(B_ssm)
+
+            # Promote only the decay multiplication step to FP32 to prevent underflow, then cast back to FP16 for MatMul
+            context_gate = (gate * decay_fp32).to(x_proj.dtype)
+            context = torch.matmul(context_gate.transpose(-1, -2), x_proj)
+
+            # Apply memory and gate (FP16 MatMul)
+            y = torch.matmul(C_ssm, context)
+            y = y * F.silu(z)
+            out = self.out_proj(y)
+
+            # 2. Restore 4D shape: [B*H, W, C] -> [B, C, H, W]
+            if is_4d:
+                out = out.view(B, H, W, -1).permute(0, 3, 1, 2)
+
+            out = out.to(orig_dtype)
+
+        return out
+
+class CrossScanMambaBottleneck(nn.Module):
+    """Issue: when attaching multiple cross-scan Mamba blocks, MiGraphX fails to compile."""
+
+    def __init__(self, channels, d_state = 16):
+        super().__init__()
+        # Path 1: Horizontal Scan (for text/rows)
+        self.mamba_h = DecayedFastMambaBlock(channels, d_state)
+
+        # Path 2: Vertical Scan (for Copper/gradients)
+        self.mamba_v = DecayedFastMambaBlock(channels, d_state)
+
+        # Path 3: Spatial (for dither patterns)
+        self.spatial = nn.Sequential(
+            # 1. Look at local 3x3 context (Depthwise = Cheap)
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False),
+            nn.GroupNorm(1, channels),
+            nn.SiLU(inplace=True), # Use SiLU/Swish for smoother gradients
+            # 2. Project back (Pointwise = Mixes information)
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+        )
+
+        # Merge: 4 paths (Identity + H + V + Spatial)
+        self.selector = nn.Conv2d(channels * 4, channels, kernel_size=1, bias=False)
+        self.norm = nn.GroupNorm(1, channels)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+
+        # 1. Horizontal Path
+        y_h = self.mamba_h(x)
+
+        # 2. Vertical Path
+        # Swap H and W so the 'sequence' is the column
+        x_v = x.transpose(2, 3) # [B, C, W, H]
+        y_v = self.mamba_v(x_v)
+        del x_v
+        y_v = y_v.transpose(2, 3) # [B, C, H, W]
+
+        # 3. Spatial Path
+        y_s = self.spatial(x)
+
+        # 4. Gated Concatenation
+        feat = torch.cat([x, y_h, y_v, y_s], dim=1)
+        out = self.selector(feat)
+
+        return self.norm(out)
+
+
 class HeadProcessing(nn.Module):
-    def __init__(self, input_channels, base_channels, k_paths, onebyone_expansion=2.0, twobytwo_expansion=2.0, preprocessing=True):
+    def __init__(self, input_channels, base_channels, k_paths, onebyone_expansion=2.0, twobytwo_expansion=2.0, preprocessing=True, with_residual=True):
         super().__init__()
 
         self.preprocessing = preprocessing
@@ -266,10 +377,12 @@ class HeadProcessing(nn.Module):
         conv_reduce_in = stack_out_ch + unshuffled_ch
 
         self.se = SqueezeExcite(se_in_ch, reduction=8)
-        self.conv_reduce = nn.Sequential(
-            ResidualBlock(conv_reduce_in, base_channels * 2, base_channels, kernel_size=3)
-        )
-        self.act = nn.ReLU(inplace=False)
+        self.conv_proj = nn.Conv2d(unshuffled_ch, base_channels, kernel_size=1, bias=True)
+        self.conv_reduce = nn.Conv2d(conv_reduce_in, base_channels, kernel_size=1, padding=0, bias=True)
+        if with_residual:
+            self.conv_residual = ResidualBlock(base_channels, base_channels * 2, base_channels, kernel_size=3, activation1='silu', activation2=None)
+        else:
+            self.conv_residual = nn.Identity()
 
     def forward(self, x):
         unshuffled = self.pixel_unshuffle(x)
@@ -297,8 +410,9 @@ class HeadProcessing(nn.Module):
         se_in = torch.cat([unshuffled, stacked], dim=1)
 
         result = self.se(se_in)
-        result = F.relu(result, inplace=False)
         result = self.conv_reduce(result)
+        result = self.conv_proj(unshuffled) + result # Global skip connection from unshuffled input
+        result = self.conv_residual(result)
 
         return result, unshuffled
 
@@ -311,7 +425,7 @@ class RefineWithUnshuffle(nn.Module):
     def __init__(self, res_in_ch, res_mid_ch, proj_ch, unshuffled_ch, lores_only=False):
         super().__init__()
         # Residual block produces `proj_ch` channels so it can be added.
-        self.res = ResidualBlock(res_in_ch, res_mid_ch, proj_ch, kernel_size=3, activation1='apprelu', activation2=None, activation1_params={'channels': res_mid_ch}, inplace=False)
+        self.res = ResidualBlock(res_in_ch, res_mid_ch, proj_ch, kernel_size=3, activation1='prelu', activation2=None, activation1_params={'num_parameters': res_mid_ch}, inplace=False)
         # Project unshuffled (e.g., 12) -> proj_ch (e.g., 48) using 1x1 conv
         self.unsh_proj = nn.Conv2d(unshuffled_ch, proj_ch, kernel_size=1, stride=1, bias=False)
         # Direct pixel shuffle; no additional conv required per request
@@ -325,10 +439,19 @@ class RefineWithUnshuffle(nn.Module):
         return x
 
 class ResidualUNet(nn.Module):
-    def __init__(self, input_channels=3, output_channels=3,
-                 base_channels=48, max_channels=256, unet_depth=3, blocks_per_level=2,
-                 k_paths_head=3, k_paths_bottleneck=3, internal_block_channels_ratio=1.0,
-                 lores_only=False, verbose=False):
+    def __init__(self,
+                 input_channels=3,
+                 output_channels=3,
+                 base_channels=48,
+                 max_channels=256,
+                 unet_depth=3,
+                 blocks_per_level_encoder=2,
+                 blocks_per_level_decoder=2,
+                 k_paths_head=3,
+                 internal_block_channels_ratio=1.0,
+                 lores_only=False,
+                 verbose=False,
+                 d_state=16):
         super().__init__()
         self.verbose = verbose
         self.unet_depth = unet_depth
@@ -338,18 +461,16 @@ class ResidualUNet(nn.Module):
         # Number of channels produced by HeadProcessing.pixel_unshuffle
         self.unshuffled_ch = input_channels * 4
 
-        # Used since epoch 0
-        # self.perceptual_criterion = PerceptualLoss(
-        #     pixel_loss_type='charbonnier',
-        #     pixel_loss_weight=0.60,      # Reduced from 0.94
-        #     vgg_weight=0.20,             # Increased from 0.03
-        #     high_frequency_type='laplacian',
-        #     high_frequency_weight=0.020,  # Increased from 0.03
-        #     lambda_lum=0.0,
-        #     input_is_linear=False
-        # )
+        # Add a 1x1 convolution to break MiGraphX's layout propagation
+        self.skip_conv = nn.Conv2d(
+            in_channels=input_channels,
+            out_channels=output_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            bias=True
+        )
 
-        # Used since epoch 54
         self.perceptual_criterion = PerceptualLoss(
             pixel_loss_type='charbonnier',
             pixel_loss_weight=1.00,
@@ -361,7 +482,7 @@ class ResidualUNet(nn.Module):
         )
 
         # --- Head ---
-        self.head = HeadProcessing(input_channels, base_channels, k_paths_head, onebyone_expansion=3.0, twobytwo_expansion=4.0, preprocessing=not lores_only)
+        self.head = HeadProcessing(input_channels, base_channels, k_paths_head, onebyone_expansion=3.0, twobytwo_expansion=4.0, preprocessing=not lores_only, with_residual=False)
 
         # --- Encoder ---
         self.encoder_blocks = nn.ModuleList()
@@ -384,8 +505,11 @@ class ResidualUNet(nn.Module):
             # Optimized: Use Standard ResidualBlock
             blocks = [ResidualBlock(block_in_ch if i == 0 else out_ch,
                                     int(out_ch * internal_block_channels_ratio),
-                                    out_ch, kernel_size=3)
-                      for i in range(blocks_per_level)]
+                                    out_ch, kernel_size=3,
+                                    activation1='prelu',
+                                    activation1_params={'num_parameters': int(out_ch * internal_block_channels_ratio)},
+                                    activation2=None)
+                      for i in range(blocks_per_level_encoder)]
             self.encoder_blocks.append(nn.Sequential(*blocks))
             in_ch = out_ch
 
@@ -395,17 +519,7 @@ class ResidualUNet(nn.Module):
         if unet_depth > 0:
             bottleneck_ch = get_ch(unet_depth - 1)
             self.bottleneck_ch = bottleneck_ch
-            self.bottleneck = nn.Sequential(
-                kPathResidualFeatureBlock(bottleneck_ch, bottleneck_ch // 2, bottleneck_ch,
-                                          k_paths=k_paths_bottleneck, with_skip_connection=False,
-                                          use_concatenation=True, use_attention=True),
-                ResidualBlock(bottleneck_ch, bottleneck_ch // 2, bottleneck_ch, kernel_size=3)
-            )
-            # Projection from head output to bottleneck input if channels differ
-            if base_channels != bottleneck_ch:
-                self.head_to_bottleneck = nn.Conv2d(base_channels, bottleneck_ch, kernel_size=1, bias=False)
-            else:
-                self.head_to_bottleneck = None
+            self.bottleneck = CrossScanMambaBottleneck(bottleneck_ch, d_state=d_state)
         else:
             # When UNet depth is zero we skip bottleneck processing and propagate head features
             bottleneck_ch = base_channels
@@ -424,11 +538,22 @@ class ResidualUNet(nn.Module):
 
             if d == 0:
                 # Final Stage (No Upsampling)
-                # Final Stage (No Upsampling)
                 in_ch = prev_out_ch + base_channels
-                self.decoder_blocks.append(
-                    nn.Conv2d(in_ch, in_ch, 3, padding=1)
-                )
+                out_ch = current_level_ch + base_channels
+                blocks = [
+                    ResidualBlock(
+                        in_ch if i == 0 else out_ch,
+                        int(out_ch * internal_block_channels_ratio),
+                        out_ch,
+                        kernel_size=3,
+                        activation1='prelu',
+                        activation1_params={'num_parameters': int(out_ch * internal_block_channels_ratio)},
+                        activation2=None
+                    )
+                    for i in range(blocks_per_level_decoder)
+                ]
+                self.decoder_blocks.append(nn.Sequential(*blocks))
+                prev_out_ch = out_ch
             else:
                 # Intermediate Stage (Upsampling via PixelShuffle happens before this block)
                 # Input is: (Prev // 4) + Skip
@@ -441,45 +566,31 @@ class ResidualUNet(nn.Module):
 
                 blocks = [ResidualBlock(in_ch if i == 0 else out_ch,
                                         int(out_ch * internal_block_channels_ratio),
-                                        out_ch, kernel_size=3)
-                          for i in range(blocks_per_level)]
+                                        out_ch, kernel_size=3,
+                                        activation1='prelu',
+                                        activation1_params={'num_parameters': int(out_ch * internal_block_channels_ratio)},
+                                        activation2=None)
+                          for i in range(blocks_per_level_decoder)]
                 self.decoder_blocks.append(nn.Sequential(*blocks))
 
                 prev_out_ch = out_ch
 
         # --- Refinement ---
-        # refine_out_channels = 3 * 16 = 48 (lores) or 3 * 4 = 12 (non-lores)
-
-        if self.unet_depth == 0:
-            proj_ch = refine_out_channels
-            self.refine = RefineWithUnshuffle(
-                res_in_ch=base_channels,
-                res_mid_ch=int(base_channels * 2),
-                proj_ch=proj_ch,
-                unshuffled_ch=self.unshuffled_ch,
-                lores_only=lores_only
-            )
-        else:
-            proj_ch = refine_out_channels
-            self.refine = RefineWithUnshuffle(
-                res_in_ch=prev_out_ch + base_channels,
-                res_mid_ch=int((prev_out_ch + base_channels) * 2),
-                proj_ch=proj_ch,
-                unshuffled_ch=self.unshuffled_ch,
-                lores_only=lores_only
-            )
+        proj_ch = refine_out_channels
+        self.refine = RefineWithUnshuffle(
+            res_in_ch=prev_out_ch,
+            res_mid_ch=int(base_channels * 2),
+            proj_ch=proj_ch,
+            unshuffled_ch=self.unshuffled_ch,
+            lores_only=lores_only
+        )
 
         if self.lores_only:
-            # Non-learnable depthwise convolution that picks the upper-left pixel
-            # of each 2x2 block (kernel = [[1,0],[0,0]]). Use groups=3 to
-            # apply the same 2x2 kernel independently per channel.
+            # Non-learnable depthwise convolution that takes the average of each 2x2 block to create a lores version of the input.
             self.towards_lores = nn.Conv2d(3, 3, kernel_size=2, stride=2, bias=False, groups=3)
             with torch.no_grad():
-                self.towards_lores.weight.zero_()
-                for i in range(3):
-                    self.towards_lores.weight.data[i, 0, 0, 0] = 1.0
-            # Make weights non-learnable
-            self.towards_lores.weight.requires_grad = False
+                self.towards_lores.weight.fill_(0.25)
+            self.towards_lores.weight.requires_grad = False # Make weights non-learnable
 
     def forward(self, x):
         x_in = x
@@ -488,6 +599,8 @@ class ResidualUNet(nn.Module):
         if self.lores_only:
             # Assume input is an Amiga lores image
             x = self.towards_lores(x)
+
+        x_in_protected = self.skip_conv(x_in)  # Protect the original input for the global skip connection
 
         # Analyse different resolutions
         x_head, x_unshuffled = self.head(x)
@@ -542,6 +655,7 @@ class ResidualUNet(nn.Module):
             x = block(x)
 
         x = self.refine(x, x_unshuffled)
+        x = x + x_in_protected  # Global skip connection from input to output
         return x
 
     def criterion(self, output, target):
@@ -580,26 +694,28 @@ def get_model(name: str = 'light', lores_only: bool = False, verbose: bool = Fal
     if name == 'light':
         return ResidualUNet(
             unet_depth=3 if lores_only else 4,
-            blocks_per_level=1,
-            base_channels=32 if lores_only else 28,
+            blocks_per_level_encoder=1,
+            blocks_per_level_decoder=2,
+            base_channels=36,
             max_channels=128,
-            k_paths_head=5 if lores_only else 3,
-            k_paths_bottleneck=5 if lores_only else 3,
+            k_paths_head=4,
             internal_block_channels_ratio=2.0 if lores_only else 1.5,
             lores_only=lores_only,
-            verbose=verbose
+            verbose=verbose,
+            d_state=16 if lores_only else 32
         )
     elif name == 'heavy':
         return ResidualUNet(
             unet_depth=3 if lores_only else 4,
-            blocks_per_level=4 if lores_only else 2,
-            base_channels=72 if lores_only else 32,
+            blocks_per_level_encoder=2 if lores_only else 3,
+            blocks_per_level_decoder=4 if lores_only else 4,
+            base_channels=96 if lores_only else 38,
             max_channels=256,
-            k_paths_head=5 if lores_only else 4,
-            k_paths_bottleneck=5 if lores_only else 4,
+            k_paths_head=8 if lores_only else 6,
             internal_block_channels_ratio=2.0 if lores_only else 1.5,
             lores_only=lores_only,
-            verbose=verbose
+            verbose=verbose,
+            d_state=16 if lores_only else 32
         )
     else:
         raise ValueError(f"Unknown model name: {name}")
@@ -623,6 +739,8 @@ if __name__ == "__main__":
         torch.save(model.state_dict(), args.save_model)
         print("Model saved successfully.")
 
+    if args.verbose:
+        print(f"Model: {model} ")
     model = model.half().eval()
 
     print("Attempting to compile model...")

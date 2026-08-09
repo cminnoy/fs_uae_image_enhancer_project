@@ -2,8 +2,8 @@
 python generator.py \
     --train_images dataset/groundtruth_train \
     --test_images dataset/groundtruth_test \
-    --train_num_crops 10000 \
-    --test_num_crops 1000 \
+    --train_num_crops 16100 \
+    --test_num_crops 200 \
     --destination_dir dataset/dataset_ocs \
     --max_workers 30 \
     --rgb 444 \
@@ -21,6 +21,6 @@ python generator.py \
     --resolution lores lores_laced hires hires_laced \
     --palette_algorithm median_cut \
     --palette 16 24 32 64 128 \
-    --extra_mode EHB HAM6 SHAM DynamicHires \
+    --extra_mode EHB HAM6 SHAM \
     --dither checkerboard floyd-steinberg atkinson sierra2 stucki burkes sierra3 bayer2x2 bayer4x4 bayer8x8 None \
     --verbose 1

@@ -1,6 +1,6 @@
 import torch
 
-def srgb_to_linear(t):    
+def srgb_to_linear(t):
     """
     Perfect function.
     t must be in range 0..1

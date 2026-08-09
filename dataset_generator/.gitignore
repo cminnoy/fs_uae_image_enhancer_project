@@ -2,4 +2,5 @@
 .train_scan_cache/
 .output_scan_cache/
 dataset/
+dataset2/
 __pycache__/

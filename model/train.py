@@ -43,19 +43,23 @@ class EarlyStopping:
         self.should_stop = False
 
     def step(self, val_loss):
+        is_best = False
+
         if self.best_loss is None:
             self.best_loss = val_loss
-            return False
+            is_best = True
+            return False, True
 
         if val_loss < self.best_loss - self.min_delta:
             self.best_loss = val_loss
             self.counter = 0
+            is_best = True
         else:
             self.counter += 1
             if self.counter >= self.patience:
                 self.should_stop = True
-        
-        return self.should_stop
+
+        return self.should_stop, is_best
 
     def state_dict(self):
         return {
@@ -77,10 +81,8 @@ class Visualizer:
         self.device = device
         self.writer = writer
         self.sample_tensors = []
-        
+
         if os.path.exists(sample_dir):
-            import torchvision.transforms.functional as TF
-            from PIL import Image
             files = sorted([f for f in os.listdir(sample_dir) if f.endswith('.png')])
             for f in files:
                 img = Image.open(os.path.join(sample_dir, f)).convert('RGB')
@@ -91,11 +93,14 @@ class Visualizer:
         model.eval()
         comparisons = []
         with torch.no_grad():
-            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                for img_t in self.sample_tensors:
-                    output = model(img_t)                   
-                    combined = torch.cat([img_t, output], dim=3)
-                    comparisons.append(combined.squeeze(0).cpu())
+            for img_t in self.sample_tensors:
+                output = model(img_t)
+
+                # Sanitize for TensorBoard visualization
+                output = torch.nan_to_num(output, nan=0.0).clamp(0, 1)
+
+                combined = torch.cat([img_t, output], dim=3)
+                comparisons.append(combined.squeeze(0).cpu())
 
         grid = make_grid(comparisons, nrow=1)
         self.writer.add_image('Visual_Progress/Samples', grid, epoch)
@@ -111,39 +116,54 @@ class Trainer:
     def __init__(self, args, local_rank):
         self.args = args
         self.local_rank = local_rank
-        
+
         # Set device based on local rank
         self.device = torch.device(f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
-        
+
         # Only rank 0 handles logging and printing
         self.is_master = (self.local_rank == 0)
         if self.is_master:
             self.writer = SummaryWriter(log_dir=args.log_dir)
-        
+
         self.scaler = GradScaler()
         self.current_epoch = 0
         self.start_time = time.time()
-        
+
         # Initialize Early Stopping
         self.early_stopper = EarlyStopping(
             patience=args.early_stop_patience, 
             min_delta=args.early_stop_delta
         )
-        
+
         self.setup_data()
         self.setup_model_and_optimizer()
 
     def setup_data(self):
-        # 1. Gather all unique file pairs from disk
+        # 1. Gather all unique file pairs from all provided directories
+        all_pairs = []
+
+        for d in self.args.data_dir:
+            if self.is_master:
+                try:
+                    print(f"Gathering samples from: {d}")
+                except Exception as e:
+                    print(f"Error occurred while gathering samples from {d}: {e}")
+
+            if d:
+                try:
+                    dir_pairs = gather_all_samples_from_directory(
+                        directory_path=d,
+                        expected_crop_size=self.args.generator_crop_size,
+                        styles_to_include=None,
+                        verbose=2 if self.is_master else 0
+                    )
+                    all_pairs.extend(dir_pairs)
+                except Exception as e:
+                    print(f"Error occurred while gathering samples from {d}: {e}")
+                    raise e
+
         if self.is_master:
-            print(f"Gathering samples from: {self.args.data_dir}")
-        
-        all_pairs = gather_all_samples_from_directory(
-            directory_path=self.args.data_dir,
-            expected_crop_size=self.args.generator_crop_size,
-            styles_to_include=None,
-            verbose=2 if self.is_master else 0
-        )
+            print(f"Total aggregated pairs from {len(self.args.data_dir)} directories: {len(all_pairs)}")
 
         # 2. Deterministic Shuffle and Physical Split
         # We seed here so every DDP rank performs the EXACT same split
@@ -184,7 +204,7 @@ class Trainer:
             print(f"Total pairs: {len(all_pairs)} | Train pool: {len(train_pairs)} | Val pool: {len(val_pairs)}")
             print(f"Epoch configuration -> Train steps: {self.args.samples_per_epoch} | Val steps: {self.args.val_limit} (rotating window)")
 
-        # 5. Distributed Samplers
+        # Train Distributed Sampler
         self.train_sampler = DistributedSampler(
             self.train_dataset,
             num_replicas=dist.get_world_size(),
@@ -192,16 +212,8 @@ class Trainer:
             shuffle=self.args.shuffle_data,
             drop_last=True
         )
-        
-        self.val_sampler = DistributedSampler(
-            self.val_dataset,
-            num_replicas=dist.get_world_size(),
-            rank=dist.get_rank(),
-            shuffle=False,
-            drop_last=False
-        )
 
-        # 6. DataLoaders
+        # Train DataLoader
         self.train_dataloader = DataLoader(
             self.train_dataset,
             batch_size=self.args.batch_size,
@@ -210,16 +222,6 @@ class Trainer:
             pin_memory=True,
             drop_last=True,
             sampler=self.train_sampler
-        )
-        
-        self.val_dataloader = DataLoader(
-            self.val_dataset,
-            batch_size=16,
-            shuffle=False,
-            num_workers=self.args.num_workers,
-            pin_memory=True,
-            drop_last=False,
-            sampler=self.val_sampler
         )
 
     def setup_model_and_optimizer(self):
@@ -232,7 +234,6 @@ class Trainer:
         world_size = dist.get_world_size()
         total_batches_per_epoch = self.args.samples_per_epoch // (self.args.batch_size * world_size)
         self.learning_rate = self.args.learning_rate
-        self.warmup_steps = 500   # About half of one virtual epoch
         self.steps_per_epoch = total_batches_per_epoch
 
         self.optimizer = optim.AdamW(
@@ -255,7 +256,7 @@ class Trainer:
         # Wrap the model with DDP
         self.model = DDP(self.model, device_ids=[self.local_rank], find_unused_parameters=self.args.find_unused_parameters)
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def validate(self):
         """
         Runs validation loop and returns global average validation loss.
@@ -288,9 +289,9 @@ class Trainer:
             drop_last=False
         )
 
-        val_batch_size = getattr(self.val_dataloader, 'batch_size', 16)
-        val_num_workers = getattr(self.val_dataloader, 'num_workers', self.args.num_workers)
-        val_pin_memory = getattr(self.val_dataloader, 'pin_memory', True)
+        val_batch_size = 12
+        val_num_workers = self.args.num_workers
+        val_pin_memory = False
 
         val_loader = DataLoader(
             subset,
@@ -299,7 +300,8 @@ class Trainer:
             num_workers=val_num_workers,
             pin_memory=val_pin_memory,
             drop_last=False,
-            sampler=subset_sampler
+            sampler=subset_sampler,
+            prefetch_factor=2
         )
 
         total_val_loss = 0.0
@@ -307,45 +309,47 @@ class Trainer:
         local_samples_processed = 0
         log_interval = getattr(self.args, 'val_log_interval', 50)
 
-        for batch in val_loader:
-            if isinstance(batch, dict):
-                lr = batch["lr"].to(self.device)
-                hr = batch["hr"].to(self.device)
-            else:
-                lr, hr = batch
-                lr = lr.to(self.device)
-                hr = hr.to(self.device)
-
-            out = self.model(lr)
-            loss = self.model.module.criterion(out, hr)
-            total_val_loss += loss.item()
-            num_batches += 1
-            # Track processed samples for progress logging
-            batch_n = hr.size(0) if hasattr(hr, 'size') else 1
-            local_samples_processed += int(batch_n)
-
-            # Periodically aggregate progress across ranks and log from master
-            if (num_batches % log_interval) == 0 or local_samples_processed >= len(indices):
-                if dist.is_initialized():
-                    proc_tensor = torch.tensor([local_samples_processed], dtype=torch.long, device=self.device)
-                    dist.all_reduce(proc_tensor, op=dist.ReduceOp.SUM)
-                    global_processed = int(proc_tensor.item())
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        with autocast(device_type=self.device.type, dtype=dtype, enabled=self.args.use_amp):
+            for batch in val_loader:
+                if isinstance(batch, dict):
+                    lr = batch["lr"].to(self.device)
+                    hr = batch["hr"].to(self.device)
                 else:
-                    global_processed = local_samples_processed
+                    lr, hr = batch
+                    lr = lr.to(self.device)
+                    hr = hr.to(self.device)
 
-                if self.is_master:
-                    print(f"    Validation progress: {global_processed}/{len(indices)} samples ({(global_processed/ max(1,len(indices)))*100:.1f}%)")
+                out = self.model(lr)
+                loss = self.model.module.criterion(out, hr)
+                total_val_loss += loss.item()
+                num_batches += 1
+                # Track processed samples for progress logging
+                batch_n = hr.size(0) if hasattr(hr, 'size') else 1
+                local_samples_processed += int(batch_n)
 
-        # 1. Calculate local average
-        local_avg_loss = total_val_loss / max(1, num_batches)
+                # Periodically aggregate progress across ranks and log from master
+                if (num_batches % log_interval) == 0 or local_samples_processed >= len(indices):
+                    if dist.is_initialized():
+                        proc_tensor = torch.tensor([local_samples_processed], dtype=torch.long, device=self.device)
+                        dist.all_reduce(proc_tensor, op=dist.ReduceOp.SUM)
+                        global_processed = int(proc_tensor.item())
+                    else:
+                        global_processed = local_samples_processed
 
-        # 2. Aggregate across all GPUs
-        loss_tensor = torch.tensor([local_avg_loss], device=self.device)
-        dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-        global_val_loss = loss_tensor.item() / dist.get_world_size()
+                    if self.is_master:
+                        print(f"    Validation progress: {global_processed}/{len(indices)} samples ({(global_processed/ max(1,len(indices)))*100:.1f}%)")
 
-        # Advance the rotating offset for next epoch (only local update; persisted in checkpoints)
-        self.val_offset = (self.val_offset + self.val_limit) % val_dataset_len
+            # 1. Calculate local average
+            local_avg_loss = total_val_loss / max(1, num_batches)
+
+            # 2. Aggregate across all GPUs
+            loss_tensor = torch.tensor([local_avg_loss], device=self.device)
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+            global_val_loss = loss_tensor.item() / dist.get_world_size()
+
+            # Advance the rotating offset for next epoch (only local update; persisted in checkpoints)
+            self.val_offset = (self.val_offset + self.val_limit) % val_dataset_len
 
         self.model.train()
         return global_val_loss
@@ -355,7 +359,7 @@ class Trainer:
             return
 
         os.makedirs(self.args.checkpoint_dir, exist_ok=True)
-        
+
         checkpoint = {
             'epoch': epoch,
             'loss': loss,
@@ -436,6 +440,9 @@ class Trainer:
         # Calculate steps per rank to reach a global samples_per_epoch
         world_size = dist.get_world_size()
         total_batches_per_epoch = self.args.samples_per_epoch // (self.args.batch_size * world_size)
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        if self.is_master:
+            print(f"Mixed precision training is {'enabled' if self.args.use_amp else 'disabled'}. Using dtype {dtype} for mixed precision training.")
 
         for epoch in range(self.current_epoch, self.args.epochs):
             self.model.train()
@@ -453,8 +460,8 @@ class Trainer:
                 styled_input = styled_input.to(self.device, non_blocking=True)
                 target_hr = target_hr.to(self.device, non_blocking=True)
 
-                self.optimizer.zero_grad(set_to_none=True)
-                dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+                self.optimizer.zero_grad(set_to_none=True) # Zero gradients before forward pass
+
                 with autocast(device_type=self.device.type, dtype=dtype, enabled=self.args.use_amp):
                     output_sr = self.model(styled_input)
 
@@ -485,9 +492,9 @@ class Trainer:
 
                 current_step = (epoch * self.steps_per_epoch) + batch_idx
 
-                if current_step < self.warmup_steps:
+                if current_step < self.args.warmup_steps:
                     # Linear warmup: scale LR from 0 to max_lr
-                    lr = (current_step / self.warmup_steps) * self.learning_rate
+                    lr = (current_step / self.args.warmup_steps) * self.learning_rate
                     for param_group in self.optimizer.param_groups:
                         param_group['lr'] = lr
                 else:
@@ -509,14 +516,19 @@ class Trainer:
             dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
             global_train_loss = loss_tensor.item() / world_size
 
+            # --- Validation & Early Stopping ---
             if self.is_master:
                 print(f"Epoch {epoch+1} training complete. Average Loss: {avg_epoch_loss:.6f}")
+                print("Starting validation...")
 
-            # --- Validation & Early Stopping ---
-            print("Starting validation...")
-            global_val_loss = self.validate()
+            del styled_input, target_hr, output_sr, loss
+            self.optimizer.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
+            print(torch.cuda.memory_allocated() / 1024**3)
+            print(torch.cuda.memory_reserved() / 1024**3)
 
             stop_training_tensor = torch.tensor([0], dtype=torch.int, device=self.device)
+            global_val_loss = self.validate()
 
             if self.is_master:
                 # Log metrics
@@ -526,11 +538,8 @@ class Trainer:
                 self.visualizer.log_epoch(self.model.module, epoch)
                 print(f"Epoch {epoch+1} finished. Train Loss: {global_train_loss:.6f} | Val Loss: {global_val_loss:.6f}")
 
-                # Check for improvement
-                should_stop = self.early_stopper.step(global_val_loss)
-
-                # Determine if this is the best model (based on validation loss)
-                is_best = (global_val_loss == self.early_stopper.best_loss)
+                # Check for improvement; determine if this is the best model (based on validation loss)
+                should_stop, is_best = self.early_stopper.step(global_val_loss)
                 if is_best:
                     self.early_stopper.counter = 0
 
@@ -559,10 +568,10 @@ class Trainer:
 # --------------------------------------------------------------------------------
 def parse_args():
     parser = argparse.ArgumentParser(description="PyTorch Super-Resolution Model Training.")
-    
+
     # Data arguments
-    parser.add_argument('--data_dir', type=str, required=True, 
-                        help='Path to the directory containing generator output crops (e.g., /path/to/train).')
+    parser.add_argument('--data_dir', nargs='+', required=True, 
+                        help='Space-separated list of paths to directories containing generator output.')
     add_size_argument(parser, '--generator_crop_size', default="376 288", 
                       help='The \"W, H\" size of the images produced by generator.py (source crops). Default: 376 288')
     add_size_argument(parser, '--train_crop_size', default="376 288",
@@ -579,6 +588,7 @@ def parse_args():
     parser.add_argument('--epochs', type=int, default=100, help='Number of epochs to train.')
     add_size_argument(parser, '--batch_size', default=16, help='Batch size PER GPU for training.')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='Initial learning rate.')
+    parser.add_argument('--warmup_steps', type=int, default=500, help='Number of warmup steps for learning rate scheduler.')
     parser.add_argument('--adam_beta1', type=float, default=0.9, help='Beta1 for Adam optimizer.')
     parser.add_argument('--adam_beta2', type=float, default=0.999, help='Beta2 for Adam optimizer.')
     parser.add_argument('--num_workers', type=int, default=8, help='Number of DataLoader workers per GPU.')
@@ -589,7 +599,7 @@ def parse_args():
                         help='Log validation progress every N batches (per rank).')
     parser.add_argument("--early-stop-patience", type=int, default=10)
     parser.add_argument("--early-stop-delta", type=float, default=1e-4)
-    parser.add_argument('--find_unused_parameters', action='store_true', default=True,
+    parser.add_argument('--find_unused_parameters', action='store_true', default=False,
                         help='If True, set find_unused_parameters=True in DDP (needed if some model parameters are not used in every forward pass).')
 
     # Checkpointing and logging
@@ -608,7 +618,7 @@ def parse_args():
     parser.add_argument('--use_amp', action='store_true', help='Use Automatic Mixed Precision (AMP).')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose model output.')
     parser.add_argument('--lores_only', action='store_true', help='Use lores only mode.')
-    
+
     return parser.parse_args()
 
 # --------------------------------------------------------------------------------

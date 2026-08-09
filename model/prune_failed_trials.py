@@ -78,7 +78,7 @@ try:
                     raise # Re-raise if it's another type of error
             except Exception as e: # Catch any other unexpected errors
                 print(f"Unexpected error deleting from trial_system_attrs: {e}")
-                
+
             try:
                 cursor.execute("DELETE FROM trial_user_attrs WHERE trial_id IN (SELECT trial_id FROM trials WHERE study_id = ? AND number = ?)", (study_id, trial_number))
             except sqlite3.OperationalError as e:
@@ -109,4 +109,3 @@ try:
     print(f"Study '{study_name}' now has {len(study_after_deletion.trials)} trials after direct database deletion.")
 except Exception as e:
     print(f"Could not reload study to verify: {e}")
-    

@@ -19,7 +19,7 @@ else
     echo "Using FULL model with batch size $BATCH_SIZE"
 fi
 
-DATASET="../dataset_generator/dataset/dataset_aga"
+DATASET="../dataset_generator/dataset/dataset_aga/train"
 MODEL_DIR="${MODEL_TYPE}_aga"
 
 # Prefer the latest epoch checkpoint (highest epoch number). If none, fall back to best_model.pth.

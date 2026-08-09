@@ -9,18 +9,28 @@ fi
 
 MODEL_TYPE="$1"
 EPOCHS_DIGGING="${2:-16}"
+if [ -z "${3:-}" ]; then
+    TRIAL=""
+else
+    TRIAL="_${3}"
+fi
 
 # Set initial batch size based on model type
 if [ "$MODEL_TYPE" = "light" ]; then
-    BATCH_SIZE=22
+    BATCH_SIZE=10
+    LEARNING_RATE=0.0007
+    WARMUP_STEPS=1000
     echo "Using LIGHT model with batch size $BATCH_SIZE"
 else
-    BATCH_SIZE=16
+    BATCH_SIZE=8
+    LEARNING_RATE=0.00045
+    WARMUP_STEPS=2000
     echo "Using FULL model with batch size $BATCH_SIZE"
 fi
 
-DATASET="../dataset_generator/dataset/dataset_ocs"
-MODEL_DIR="${MODEL_TYPE}_ocs"
+DATASET="../dataset_generator/dataset/dataset_ocs/train"
+DATASET2="../dataset_generator/dataset2/dataset_ocs/train"
+MODEL_DIR="${MODEL_TYPE}_ocs${TRIAL}"
 
 # Prefer the latest epoch checkpoint (highest epoch number). If none, fall back to best_model.pth.
 LATEST_EPOCH_CHECKPOINT=$(ls -1 "${MODEL_DIR}"/epoch_*.pth 2>/dev/null | sort -V | tail -n 1)
@@ -32,7 +42,8 @@ else
     CHECKPOINT=""
 fi
 
-SAMPLES_PER_EPOCH=44000
+SAMPLES_PER_EPOCH=46000
+SAMPLES_VALIDATION=4600
 
 # --------------------------------------------------
 # Phase 1: "Stepping on the grass" (ONLY if no checkpoint exists)
@@ -43,17 +54,18 @@ if [ -z "$CHECKPOINT" ] || [[ ! -f "$CHECKPOINT" ]]; then
         --model_type "$MODEL_TYPE" \
         --epochs 1 \
         --batch_size "$BATCH_SIZE" \
-        --learning_rate 0.001 \
-        --data_dir "$DATASET" \
+        --learning_rate "$LEARNING_RATE" \
+        --warmup_steps "$WARMUP_STEPS" \
+        --data_dir "$DATASET" "$DATASET2" \
         --generator_crop_size "752 576" \
         --train_crop_size "752 576" \
         --shuffle_data \
         --samples_per_epoch $SAMPLES_PER_EPOCH \
         --checkpoint_dir "$MODEL_DIR" \
-        --num_workers 12 \
+        --num_workers 4 \
         --use_amp \
-        --log_dir "runs/ocs/${MODEL_TYPE}" \
-        --find_unused_parameters
+        --log_dir "runs/ocs/${MODEL_TYPE}${TRIAL}" \
+        --val_limit $SAMPLES_VALIDATION
 else
     echo "Found checkpoint ($CHECKPOINT). Skipping initial training step."
 fi
@@ -78,30 +90,34 @@ if [ -n "$CHECKPOINT" ] && [[ -f "$CHECKPOINT" ]]; then
         --model_type "$MODEL_TYPE" \
         --epochs "$EPOCHS_DIGGING" \
         --batch_size "$BATCH_SIZE" \
-        --learning_rate 0.0004 \
-        --data_dir "$DATASET" \
+        --learning_rate "$LEARNING_RATE" \
+        --warmup_steps "$WARMUP_STEPS" \
+        --data_dir "$DATASET1" "$DATASET2" \
         --generator_crop_size "752 576" \
         --train_crop_size "752 576" \
         --samples_per_epoch $SAMPLES_PER_EPOCH \
         --checkpoint_dir "$MODEL_DIR" \
-        --num_workers 12 \
+        --num_workers 4 \
         --use_amp \
-        --log_dir "runs/ocs/${MODEL_TYPE}" \
-        --find_unused_parameters
+        --log_dir "runs/ocs/${MODEL_TYPE}${TRIAL}" \
+        --val_limit $SAMPLES_VALIDATION \
+        --early-stop-patience 30 
 else
     echo "No checkpoint to load for Phase 2 — starting without --load_checkpoint"
     torchrun --nproc_per_node 2 train.py \
         --model_type "$MODEL_TYPE" \
         --epochs "$EPOCHS_DIGGING" \
         --batch_size "$BATCH_SIZE" \
-        --learning_rate 0.0004 \
-        --data_dir "$DATASET" \
+        --learning_rate "$LEARNING_RATE" \
+        --warmup_steps "$WARMUP_STEPS" \
+        --data_dir "$DATASET1" "$DATASET2" \
         --generator_crop_size "752 576" \
         --train_crop_size "752 576" \
         --samples_per_epoch $SAMPLES_PER_EPOCH \
         --checkpoint_dir "$MODEL_DIR" \
-        --num_workers 12 \
+        --num_workers 4 \
         --use_amp \
-        --log_dir "runs/ocs/${MODEL_TYPE}" \
-        --find_unused_parameters
+        --log_dir "runs/ocs/${MODEL_TYPE}${TRIAL}" \
+        --val_limit $SAMPLES_VALIDATION \
+        --early-stop-patience 30
 fi

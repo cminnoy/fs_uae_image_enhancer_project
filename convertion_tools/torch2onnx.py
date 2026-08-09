@@ -1,3 +1,5 @@
+from pyexpat import model
+
 import torch
 import torch.nn as nn
 import torch.onnx
@@ -20,11 +22,11 @@ class ONNXConverter:
     and then modifying the ONNX graph for chunky (HWC) RGBA input/output and
     optimized input data type handling.
     """
-    def __init__(self, pytorch_model_path, output_onnx_path, model_type, crop_width=True, use_fp16=True, insert_model=True, apply_gamma=True, args=None):
+    def __init__(self, pytorch_model_path, output_onnx_path, model_type, crop_width=True, precision="fp16", insert_model=True, apply_gamma=True, args=None):
         self.pytorch_model_path = pytorch_model_path
         self.output_onnx_path = output_onnx_path
         self.crop_width = crop_width
-        self.use_fp16 = use_fp16
+        self.precision = precision
         self.insert_model = insert_model
         self.apply_gamma = apply_gamma
         self.model_type = model_type
@@ -42,9 +44,15 @@ class ONNXConverter:
         try:
             # Load the full checkpoint dictionary
             model_checkpoint = torch.load(self.pytorch_model_path, map_location='cpu')
-            
+
             # Instantiate the model architecture
             self.model = get_model(self.model_type, self.args.lores_only, False)
+
+            # Enable ONNX export mode for Mamba blocks
+            for m in self.model.modules():
+                if hasattr(m, 'export_mode'):
+                    m.export_mode = True
+                    print(f"Set {type(m).__name__} to export mode.")
 
             # Check if the checkpoint contains the expected 'model_state_dict' key
             if "model_state_dict" in model_checkpoint:
@@ -53,7 +61,7 @@ class ONNXConverter:
             else:
                 # If not a checkpoint, assume it's the raw state_dict
                 state_dict_to_load = model_checkpoint
-                
+
             # Load the state dictionary into the model
             self.model.load_state_dict(state_dict_to_load) # Line 38 (was line 37)
             print("PyTorch model loaded successfully.")
@@ -76,13 +84,13 @@ class ONNXConverter:
         self.model.to(self.device)
         print(f"Model moved to device: {self.device}")
 
-        if self.use_fp16 and self.device.type == 'cuda':
-            self.model.half()
-            print("Model parameters converted to Half precision (FP16) for export.")
-        elif self.use_fp16 and self.device.type == 'cpu':
-            print("Warning: FP16 conversion requested but running on CPU. Skipping FP16 conversion for model parameters.")
-        else: # Line 81
-            print("Skipping FP16 conversion for model parameters as requested or not on CUDA.")
+        if self.precision == 'bf16':
+            self.model = self.model.to(torch.bfloat16)
+            print("Model parameters converted to BFloat16 (BF16).")
+        elif self.precision == 'fp16' and self.device.type == 'cuda':
+            print("Model parameters kept in Float32 (FP16 will be handled via Autocast during export).")
+        else:
+            print("Model parameters kept in Float32 precision.")
 
         # Attempt to fuse layers
         if hasattr(self.model, 'fuse_layers') and callable(self.model.fuse_layers):
@@ -106,42 +114,73 @@ class ONNXConverter:
         print(f"\n--- Step 2: Exporting PyTorch Model to ONNX in memory ---")
         # Dummy input is now 3 channels (RGB) to match the trained model's expectation.
         # The range 0-1 is typical for normalized float inputs for models.
-        
+
         # Adjust dummy input width based on cropping option
         input_width_for_model = 736 if self.crop_width else 752
         print(f"Dummy input width for model export: {input_width_for_model}")
 
-        dummy_input_dtype = torch.float16 if self.use_fp16 else torch.float32
+        if self.precision == 'bf16':
+            dummy_input_dtype = torch.bfloat16
+        elif self.precision == 'fp16':
+            dummy_input_dtype = torch.float16
+        else:
+            dummy_input_dtype = torch.float32
         print(f"Dummy input dtype for model export: {dummy_input_dtype}")
 
         dummy_input = torch.rand((1, 3, 576, input_width_for_model), dtype=dummy_input_dtype).to(self.device)
         print(f"Created dummy input tensor with shape {dummy_input.shape} and dtype {dummy_input.dtype} on device {self.device}")
 
-        # Use generic names for input/output of the internal PyTorch model
+        # Check for NaNs within the proper precision context
+        if self.precision == 'fp16':
+            with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                output = self.model(dummy_input)
+        elif self.precision == 'bf16':
+            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                output = self.model(dummy_input)
+        else:
+            output = self.model(dummy_input)
+
+        print(f"PyTorch Output Range: {output.min().item()} to {output.max().item()}")
+        if torch.isnan(output).any():
+            print("WARNING: NaNs detected in PyTorch before export!")
         input_names = ["model_input_rgb_float_planar"]
         output_names = ["model_output_rgb_float_scaled"]
 
         print("Exporting model to ONNX format in memory...")
         try:
-            f = io.BytesIO() # Use a BytesIO object as a file-like object
-            torch.onnx.export(
-                self.model,
-                dummy_input,
-                f, # Export to in-memory buffer
-                input_names=input_names,
-                output_names=output_names,
-                dynamo=False,
-                opset_version=18,
-                export_params=True,
-                verbose=False
-            )
+            f = io.BytesIO()
+
+            if self.precision == 'fp16':
+                # Tracing inside autocast generates mixed-precision nodes natively
+                with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                    torch.onnx.export(
+                        self.model,
+                        dummy_input,
+                        f,
+                        input_names=input_names,
+                        output_names=output_names,
+                        dynamo=False,
+                        opset_version=18,
+                        export_params=True,
+                        verbose=True
+                    )
+            else:
+                torch.onnx.export(
+                    self.model,
+                    dummy_input,
+                    f,
+                    input_names=input_names,
+                    output_names=output_names,
+                    dynamo=False,
+                    opset_version=18,
+                    export_params=True,
+                    verbose=False
+                )
+
             print("Model exported successfully to ONNX format in memory!")
 
-            # Load the ONNX model from the in-memory buffer
-            f.seek(0) # Rewind the buffer to the beginning
+            f.seek(0)
             onnx_model = onnx.load(f)
-            # DEBUG: Initial ONNX Graph Input Name: model_input_rgb_float_planar
-            # DEBUG: Initial ONNX Graph Output Name: model_output_rgb_float_scaled
             print(f"DEBUG: Initial ONNX Graph Input Name: {onnx_model.graph.input[0].name}")
             print(f"DEBUG: Initial ONNX Graph Output Name: {onnx_model.graph.output[0].name}")
 
@@ -150,6 +189,159 @@ class ONNXConverter:
         except Exception as e:
             print(f"An error occurred during ONNX export: {e}")
             sys.exit(1)
+
+    def upcast_sensitive_activations(self, model):
+        """
+        Scans the ONNX model graph for sensitive operators, wrapping them 
+        in Float32 Cast loops while maintaining strict topological sort order.
+        """
+        print("\n--- Step 3.5: Upcasting sensitive activations to Float32 ---")
+        graph = model.graph
+        new_nodes = []
+        cast_count = 0
+
+        for node in graph.node:
+            if node.op_type in ["Exp", "Softplus", "Sigmoid", "Tanh"]:
+                orig_input = node.input[0]
+                orig_output = node.output[0]
+
+                fp32_input = f"{orig_input}_upcast_fp32_{cast_count}"
+                fp32_output = f"{orig_output}_upcast_fp32_{cast_count}"
+                cast_count += 1
+
+                # Insert Cast to FP32 immediately before the node
+                cast_in = onnx.helper.make_node(
+                    "Cast",
+                    inputs=[orig_input],
+                    outputs=[fp32_input],
+                    name=f"Cast_In_{node.name}_{cast_count}",
+                    to=onnx.TensorProto.DataType.FLOAT
+                )
+                new_nodes.append(cast_in)
+
+                # Route the sensitive node to use the FP32 tensors
+                node.input[0] = fp32_input
+                node.output[0] = fp32_output
+                new_nodes.append(node)
+
+                # Insert Cast back to FP16 immediately after the node
+                cast_out = onnx.helper.make_node(
+                    "Cast",
+                    inputs=[fp32_output],
+                    outputs=[orig_output],
+                    name=f"Cast_Out_{node.name}_{cast_count}",
+                    to=onnx.TensorProto.DataType.FLOAT16
+                )
+                new_nodes.append(cast_out)
+            else:
+                new_nodes.append(node)
+
+        # Re-assign the completely sorted sequential node list
+        del graph.node[:]
+        graph.node.extend(new_nodes)
+        print(f"Successfully stabilized {cast_count} nodes with sequential execution loops.")
+        return model
+
+    def downcast_before_specific_nodes(self, model):
+        """
+        Scans the ONNX model graph for specific operations that benefit from downcasting
+        to Float16 before their execution, while maintaining strict topological sort order.
+        """
+        print("\n--- Step 3.6: Downcasting before specific operations to Float16 ---")
+        graph = model.graph
+        new_nodes = []
+        downcast_count = 0
+
+        for node in graph.node:
+            new_nodes.append(node)
+            if node.name in ["/ups.0/DepthToSpace"]:
+                orig_output = node.output[0]
+                fp16_output = f"{orig_output}_downcast_fp16_{downcast_count}"
+                downcast_count += 1
+
+                # Insert Cast to FP16 immediately before the node
+                cast_in = onnx.helper.make_node(
+                    "Cast",
+                    inputs=[orig_output],
+                    outputs=[fp16_output],
+                    name=f"Cast_Down_{node.name}_{downcast_count}",
+                    to=onnx.TensorProto.DataType.FLOAT16
+                )
+                new_nodes.append(cast_in)
+
+                # Update subsequent nodes to use the downcasted output
+                for subsequent_node in graph.node:
+                    for i, input_name in enumerate(subsequent_node.input):
+                        if input_name == orig_output:
+                            subsequent_node.input[i] = fp16_output
+
+        # Re-assign the completely sorted sequential node list
+        del graph.node[:]
+        graph.node.extend(new_nodes)
+        print(f"Successfully downcasted {downcast_count} nodes to Float16 before execution.")
+        return model
+
+    def downcast_after_specific_nodes(self, model):
+        """
+        Scans the ONNX model graph for specific operations that benefit from downcasting
+        to Float16 after their execution, while maintaining strict topological sort order.
+        """
+        print("\n--- Step 3.8: Downcasting after specific operations to Float16 ---")
+        graph = model.graph
+        new_nodes = []
+        downcast_count = 0
+
+        for node in graph.node:
+            new_nodes.append(node)
+            if node.name in ["/Cast"]:
+                orig_output = node.output[0]
+                fp16_output = f"{orig_output}_downcast_fp16_{downcast_count}"
+                downcast_count += 1
+
+                # Insert Cast to FP16 immediately after the node
+                cast_out = onnx.helper.make_node(
+                    "Cast",
+                    inputs=[orig_output],
+                    outputs=[fp16_output],
+                    name=f"Cast_Down_After_{node.name}_{downcast_count}",
+                    to=onnx.TensorProto.DataType.FLOAT16
+                )
+                new_nodes.append(cast_out)
+
+                # Update subsequent nodes to use the downcasted output
+                for subsequent_node in graph.node:
+                    for i, input_name in enumerate(subsequent_node.input):
+                        if input_name == orig_output:
+                            subsequent_node.input[i] = fp16_output
+
+        # Re-assign the completely sorted sequential node list
+        del graph.node[:]
+        graph.node.extend(new_nodes)
+        print(f"Successfully downcasted {downcast_count} nodes to Float16 after execution.")
+        return model
+
+    def remove_specific_nodes(self, model):
+        """
+        Scans the ONNX model graph for specific nodes that should be removed,
+        while maintaining strict topological sort order.
+        """
+        print("\n--- Step 3.7: Removing specific nodes from the ONNX graph ---")
+        graph = model.graph
+        new_nodes = []
+        removed_count = 0
+
+        for node in graph.node:
+            if node.name in ["/Cast"]:
+                print(f"Removing node: {node.name}")
+                removed_count += 1
+                continue  # Skip adding this node to new_nodes
+            new_nodes.append(node)
+
+        # Re-assign the completely sorted sequential node list
+        del graph.node[:]
+        graph.node.extend(new_nodes)
+        print(f"Successfully removed {removed_count} specific nodes from the ONNX graph.")
+        return model
 
     def verify_onnx_model(self, onnx_model, is_modified=False):
         """
@@ -294,7 +486,6 @@ class ONNXConverter:
         finally:
             print(f"\n{model_type.capitalize()} ONNX model verification finished.")
 
-
     def modify_onnx_graph_for_chunky(self, model):
         """
         Modifies the ONNX graph (in-memory) to accept chunky (HWC) RGBA input
@@ -320,7 +511,7 @@ class ONNXConverter:
         # This is now "model_input_rgb_float_planar" from the initial torch.onnx.export
         orig_input_name = orig_input.name 
         print(f"Original model input name: {orig_input_name}")
-        
+
         # We need the original dimensions from the exported model's input
         # Note: orig_shape will be [N, 3, H, W] because dummy_input was 3-channel.
         orig_shape = []
@@ -344,10 +535,18 @@ class ONNXConverter:
 
         # Determine target input width after processing based on self.crop_width
         processed_input_width = 736 if self.crop_width else 752
-        
+
         # Determine the data type for the internal model operations
-        internal_data_type = onnx.TensorProto.DataType.FLOAT16 if self.use_fp16 else onnx.TensorProto.DataType.FLOAT
-        np_internal_data_type = np.float16 if self.use_fp16 else np.float32
+        # If bf16, we use FP32 for the ONNX wrapper math (Gamma, Denorm) 
+        # to bypass missing numpy bfloat16 support, casting at model boundaries.
+        if self.precision == 'fp16':
+            wrapper_data_type = onnx.TensorProto.DataType.FLOAT16
+            np_wrapper_data_type = np.float16
+        else: # fp32 or bf16
+            wrapper_data_type = onnx.TensorProto.DataType.FLOAT
+            np_wrapper_data_type = np.float32
+        internal_data_type = wrapper_data_type
+        np_internal_data_type = np_wrapper_data_type
 
         # 1. Define the new external input to the ONNX model (chunky uint8 RGBA)
         new_external_input_name = "input_rgba_chunky"
@@ -481,7 +680,7 @@ class ONNXConverter:
             outputs=[sliced_rgb_input_name_uint8], # Output is 3-channel UINT8
             name="Slice_RGBA_to_RGB_Uint8"
         )
-        
+
         # Conditional Cropping Logic: cropping is now performed pre-transpose on the chunky NHWC input
         # to avoid slicing width in NCHW which caused tensor name mismatches. Keep the current
         # NCHW RGB input name as the sliced result, but set cropped width for downstream shapes.
@@ -500,7 +699,7 @@ class ONNXConverter:
             inputs=[current_rgb_input_name_uint8], # Input is now 3-channel UINT8, potentially cropped
             outputs=[cast_to_float_input_name], # Output is 3-channel FloatX, potentially cropped
             name="Cast_Uint8_To_Float",
-            to=internal_data_type # Use determined internal data type # Line 438
+            to=internal_data_type # Use determined internal data type
         )
 
         # 5. Create Div node: Normalize (divide by 255.0, operates on 3 channels, potentially cropped width)
@@ -525,7 +724,7 @@ class ONNXConverter:
             outputs=[normalized_rgb_input_name], # Output is 3-channel FloatX, potentially cropped
             name="Div_Input_By_255"
         )
-        
+
         # 6. sRGB to Linear Gamma Correction (Pow(x, 2.2), operates on 3 channels, potentially cropped width)
         if self.apply_gamma:
             gamma_srgb_to_linear_exp_name = "gamma_srgb_to_linear_exponent_in"
@@ -552,6 +751,22 @@ class ONNXConverter:
         else:
             # Skip gamma conversion: use normalized values as 'linear' directly
             linear_rgb_input_name = normalized_rgb_input_name
+
+        # Insert BF16 Cast if needed before feeding original model
+        final_model_input_name = linear_rgb_input_name
+        if self.precision == 'bf16':
+            final_model_input_name = "input_rgb_bfloat16_planar"
+            cast_to_bf16_node = onnx.helper.make_node(
+                "Cast",
+                inputs=[linear_rgb_input_name],
+                outputs=[final_model_input_name],
+                name="Cast_Wrapper_To_BFloat16",
+                to=onnx.TensorProto.DataType.BFLOAT16
+            )
+            graph.value_info.append(onnx.helper.make_tensor_value_info(
+               final_model_input_name, onnx.TensorProto.DataType.BFLOAT16, 
+               [batch_dim, 3, height_dim, cropped_width]
+            ))
 
         # IMPORTANT CHANGE: Iterate through all nodes to redirect any reference to the original input.
         # This handles skip connections where the original input might be used later in the graph.
@@ -590,7 +805,7 @@ class ONNXConverter:
         # 5. Div
         # 6. Constant (gamma_srgb_to_linear_exp)
         # 7. Pow
-        
+
         insert_idx = 0
         if self.crop_width:
             graph.node.insert(insert_idx, crop_chunky_starts_node); insert_idx += 1
@@ -603,13 +818,6 @@ class ONNXConverter:
         graph.node.insert(insert_idx, slice_axes_node); insert_idx += 1
         graph.node.insert(insert_idx, slice_rgb_node); insert_idx += 1
 
-        # If crop was handled pre-transpose, don't insert the older post-transpose crop nodes
-        if self.crop_width and False:
-            graph.node.insert(insert_idx, crop_starts_node); insert_idx += 1
-            graph.node.insert(insert_idx, crop_ends_node); insert_idx += 1
-            graph.node.insert(insert_idx, crop_axes_node); insert_idx += 1
-            graph.node.insert(insert_idx, crop_node); insert_idx += 1
-
         graph.node.insert(insert_idx, cast_to_float_node); insert_idx += 1
         graph.node.insert(insert_idx, div_by_255_constant_node); insert_idx += 1
         graph.node.insert(insert_idx, div_node); insert_idx += 1
@@ -621,6 +829,9 @@ class ONNXConverter:
         else:
             # No gamma nodes to insert
             pass
+
+        if self.precision == 'bf16':
+            graph.node.insert(insert_idx, cast_to_bf16_node); insert_idx += 1
 
         # If requested, bypass inserting the original model: remove original model nodes
         # and insert an Identity node that maps `linear_rgb_input_name` -> original model output name.
@@ -700,9 +911,23 @@ class ONNXConverter:
         orig_out_dtype = orig_output.type.tensor_type.elem_type
         if orig_out_dtype != internal_data_type:
             print(f"Warning: Original output dtype is not {onnx.helper.tensor_dtype_to_np_dtype(internal_data_type).name} but "
-                  f"{onnx.mapping.TENSOR_TYPE_TO_NP_TYPE[orig_out_dtype].name}")
+                  f"{onnx._mapping.TENSOR_TYPE_MAP[orig_out_dtype].name}")
 
         graph.output.remove(orig_output)
+
+        # Read from model, cast back to wrapper type (FP32) if BF16
+        model_raw_output_name = orig_output_name
+        out_nodes = []
+        if self.precision == 'bf16':
+            model_raw_output_name = "output_rgb_float32_from_bf16"
+            cast_from_bf16_node = onnx.helper.make_node(
+                "Cast",
+                inputs=[orig_output_name],
+                outputs=[model_raw_output_name],
+                name="Cast_Model_To_Wrapper",
+                to=onnx.TensorProto.DataType.FLOAT
+            )
+            out_nodes.append(cast_from_bf16_node)
 
         # 1. Linear to sRGB Gamma Correction (Pow(x, 1/2.2), operates on 3 channels, potentially cropped width)
         if self.apply_gamma:
@@ -808,7 +1033,7 @@ class ONNXConverter:
         batch_o, model_out_channel_o, height_o, cropped_width = orig_out_shape
         # The output from the Cast_To_Uint8 node is: [1, 3, H, W] NCHW UINT8
         current_rgb_output_name_uint8 = cast_uint8_output_name
-        
+
         # --- 1. Channel Padding (RGB to RGBA) using Concat (Axis=1) ---
 
         # Constant Alpha Channel: [N, A, H, W] = [1, 1, 576, W] filled with 255 (UINT8)
@@ -854,16 +1079,15 @@ class ONNXConverter:
         )
         print("Replaced Pad_RGB_to_RGBA with Concat/Constant for channel padding (GPU accelerated).")
 
-        
         # --- 2. Width Padding (Left 16 black pixels) using Concat (Axis=3) ---
-        
+
         current_output_name_for_transpose = rgba_output_name_unpadded_width # Default if no width padding
         new_output_nodes_after_cast = [
             alpha_shape_node,
             alpha_channel_constant_node,
             concat_rgba_node
         ]
-        
+
         if self.crop_width:
             # Constant Black Pad: [N, C, H, W] = [1, 4, 576, 16] filled with [0,0,0,255]
             # NCHW order for RGBA channels: R, G, B, A. Alpha must be 255 (opaque).
@@ -872,7 +1096,7 @@ class ONNXConverter:
             ones = np.ones(num_pixels, dtype=np.uint8) * 255
             # Values are concatenated channel-wise (R, G, B, A)
             black_pad_nchw_values = np.concatenate([zeros, zeros, zeros, ones])
-            
+
             black_pad_constant_name = "black_pad_constant"
             black_pad_node = onnx.helper.make_node(
                 "Constant",
@@ -896,7 +1120,7 @@ class ONNXConverter:
                 axis=3 # Width dimension
             )
             print("Replaced Pad_Output_Left_16_Pixels_Black with Concat/Constant for width padding (GPU accelerated).")
-            
+
             # Update names and nodes
             current_output_name_for_transpose = final_padded_output_name_uint8
             new_output_nodes_after_cast.extend([black_pad_node, concat_width_node])
@@ -921,7 +1145,7 @@ class ONNXConverter:
             out_nodes.extend([gamma_linear_to_srgb_exp_node, linear_to_srgb_node])
         out_nodes.extend([denorm_255_constant_node, denormalize_node, clip_min_node, clip_max_node, clip_node, cast_node])
         graph.node.extend(out_nodes)
-        
+
         # Insert the new Concat-based padding nodes
         graph.node.extend(new_output_nodes_after_cast) 
 
@@ -950,7 +1174,7 @@ class ONNXConverter:
             onnx.TensorProto.DataType.UINT8,
             [batch_o, 4, height_o, cropped_width] # 4 channels, unpadded width (736 or 752)
         ))
-        
+
         if self.crop_width:
             graph.value_info.append(onnx.helper.make_tensor_value_info(
                 final_padded_output_name_uint8, 
@@ -998,17 +1222,18 @@ def main():
         default="conv6_chunky.onnx", # This will be the final output path
         help="Path to save the final modified ONNX model with chunky input/output"
     )
-    parser.add_argument( # Line 906
+    parser.add_argument(
         "--crop_width",
         action=argparse.BooleanOptionalAction, # Enables --crop-width and --no-crop-width
         default=True,
         help="Whether to crop 16 pixels from the left of the input image and pad 16 black pixels to the left of the output. Default: True"
     )
-    parser.add_argument( # Line 913
-        "--use_fp16",
-        action=argparse.BooleanOptionalAction, # Enables --use-fp16 and --no-use-fp16
-        default=True,
-        help="Whether to convert the model to FP16 precision during export and use FP16 for internal graph operations. Default: True"
+    parser.add_argument(
+        "--precision",
+        type=str,
+        default="fp16",
+        choices=["fp32", "fp16", "bf16"],
+        help="Precision to use for the ONNX model. Default: fp16"
     )
     parser.add_argument(
         "--insert_model",
@@ -1019,8 +1244,8 @@ def main():
     parser.add_argument(
         "--apply_gamma",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Whether to apply sRGB<->linear gamma conversion in the ONNX preprocessing/postprocessing. Default: True"
+        default=False,
+        help="Whether to apply sRGB<->linear gamma conversion in the ONNX preprocessing/postprocessing. Default: False"
     )
     parser.add_argument(
         "--model_type",
@@ -1038,7 +1263,7 @@ def main():
         output_onnx_path=args.onnx_path,
         model_type=args.model_type,
         crop_width=args.crop_width,
-        use_fp16=args.use_fp16,
+        precision=args.precision,
         insert_model=args.insert_model,
         apply_gamma=args.apply_gamma,
         args=args
@@ -1051,12 +1276,17 @@ def main():
     # Modify the ONNX graph for chunky input/output (in memory)
     modified_onnx_model = converter.modify_onnx_graph_for_chunky(intermediate_onnx_model)
 
+    # Downcast specific operations to Float16
+    # intermediate_onnx_model = converter.downcast_before_specific_nodes(intermediate_onnx_model)
+    # intermediate_onnx_model = converter.downcast_after_specific_nodes(intermediate_onnx_model)
+    # intermediate_onnx_model = converter.remove_specific_nodes(intermediate_onnx_model)
+
     # Simplify the ONNX model (including constant folding)
     print("\nAttempting to simplify the ONNX model (including constant folding) ---\n")
     try:
         import onnxsim
         print("onnx-simplifier found. Proceeding with simplification.")
-        simplified_model, check = onnxsim.simplify(modified_onnx_model)
+        simplified_model, check = onnxsim.simplify(modified_onnx_model, perform_optimization=True)
 
         if check:
             print("ONNX model simplified successfully!")
@@ -1064,7 +1294,6 @@ def main():
         else:
             print("Warning: ONNX model simplification failed. Using the unsimplified modified model.")
             final_onnx_model = modified_onnx_model
-
     except ImportError:
         print("Warning: onnx-simplifier not found. Please install it (`pip install onnx-simplifier`) to enable graph simplification.")
         print("Skipping simplification. Using the unsimplified modified model.")

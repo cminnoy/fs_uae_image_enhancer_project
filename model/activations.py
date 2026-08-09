@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 # --- Custom Activation Modules ---
 
@@ -30,7 +31,7 @@ class SinLU(nn.Module):
         self.b = nn.Parameter(torch.ones(1))
     def forward(self,x):
         return torch.sigmoid(x)*(x+self.a*torch.sin(self.b*x))
-    
+
 class BiasedReLU(nn.Module):
     """
     ReLU with a learnable bias per channel (if num_parameters > 1).
@@ -63,7 +64,60 @@ class BiasedPReLU(nn.Module):
         else:
             bias = self.bias
         return self.prelu(x - bias)
-    
+
+class APReLU(nn.Module):
+    def __init__(self, channels, reduction=4):
+        super().__init__()
+        hidden = max(channels // reduction, 4)
+
+        # Squeeze → Excite → output two slope vectors
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Linear(channels, hidden)
+        self.fc2 = nn.Linear(hidden, channels * 2)
+
+    def forward(self, x):
+        N, C, H, W = x.shape
+
+        # Squeeze
+        s = self.gap(x).view(N, C)
+
+        # Excitation
+        s = F.relu(self.fc1(s))
+        slopes = torch.sigmoid(self.fc2(s))  # outputs 2C channels
+        alpha, beta = slopes[:, :C], slopes[:, C:]
+
+        # Reshape
+        alpha = alpha.view(N, C, 1, 1)
+        beta  =  beta.view(N, C, 1, 1)
+
+        # Compute output
+        pos = F.relu(x)
+        neg = (x - x.abs()) * 0.5  # negative part
+
+        return alpha * pos + beta * neg
+
+class ConvReLU(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+
+        # 1x1 conv predicts spatially adaptive slopes
+        self.param_conv = nn.Conv2d(channels, channels * 2, kernel_size=1)
+        nn.init.zeros_(self.param_conv.weight)
+        nn.init.zeros_(self.param_conv.bias)
+
+    def forward(self, x):
+        N, C, H, W = x.shape
+
+        # Predict parameters
+        params = torch.sigmoid(self.param_conv(x))  # shape = N, 2C, H, W
+        alpha, beta = params[:, :C], params[:, C:]
+
+        pos = F.relu(x)
+        neg = (x - x.abs()) * 0.5
+
+        # Spatially adaptive slopes
+        return alpha * pos + beta * neg
+
 # --- Activation Function Registry ---
 
 ACTIVATION_REGISTRY = {
@@ -91,7 +145,9 @@ ACTIVATION_REGISTRY = {
     'telu': TeLU,
     'sinlu': SinLU,
     'biased_relu': BiasedReLU,
-    'biased_prelu': BiasedPReLU
+    'biased_prelu': BiasedPReLU,
+    'apprelu': APReLU,
+    'conv_relu': ConvReLU,
 }
 
 # --- Activation Factory Function ---

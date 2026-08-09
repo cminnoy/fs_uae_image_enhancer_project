@@ -1,470 +1,661 @@
-import os
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from torchvision.transforms import ToPILImage
-from torch.optim import lr_scheduler
-from torchvision.utils import save_image
-from torchvision.transforms import ToTensor
-from torch.utils.tensorboard import SummaryWriter
-from PIL import Image
-from torchsummary import summary
-from torchviz import make_dot
-import argparse
-import csv
-import time
-import sys
-import glob
-import random
+import torch.optim as optim
+from torch.utils.data import DataLoader
 from torch.amp import autocast, GradScaler
+from torch.utils.tensorboard import SummaryWriter
+from torchvision.utils import make_grid
+import argparse
+import os
+import sys
+import time
 import shutil
-import warnings
-import numpy as np
-from srdataset import SRDataset, gather_all_samples_from_directory
-from gamma import srgb_to_linear_approx, linear_to_srgb_approx
+import random
 
-import model_conv3
-import model_conv5
-import model_pix_shuffle
-import model_residual_unet
+import torchvision.transforms.functional as TF
+from torchvision.utils import make_grid
+from PIL import Image
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 
-scaler = GradScaler(device='cuda')
+# --------------------------------------------------------------------------------
+# Path Setup
+# --------------------------------------------------------------------------------
+current_file_path = os.path.abspath(__file__)
+project_root = os.path.dirname(os.path.dirname(current_file_path)) 
+if project_root not in sys.path:
+    sys.path.append(project_root)
+from model_residual_unet import get_model
+from srdataset import SRDataset, gather_all_samples_from_directory, add_size_argument 
+from loss_vgg import PerceptualLoss
+import gamma
 
-def inference_on_directory(model, input_dir, output_dir, device):
-    """
-    Performs inference on RGB images in input_dir and saves model output to output_dir.
-    Assumes:
-    - Input: sRGB PNGs → converted to linear RGB [0, 1], upscaled to [0, 255]
-    - Model input: float32 linear RGB [0, 255]
-    - Model output: float32 linear RGB [0, 255]
-    - Output saved as sRGB PNG
-    """
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+# ------------------------------------------------------------
+# Early stopping helper (Enhanced for Serialization)
+# ------------------------------------------------------------
+class EarlyStopping:
+    def __init__(self, patience=10, min_delta=1e-4):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best_loss = None
+        self.counter = 0
+        self.should_stop = False
 
-    to_tensor = ToTensor()
-    to_pil = ToPILImage(mode='RGB')
+    def step(self, val_loss):
+        is_best = False
 
-    model.eval()
-    with torch.no_grad():
-        for img_path in glob.glob(os.path.join(input_dir, "*.png")):
-            try:
-                img_pil = Image.open(img_path).convert('RGB')
-            except Exception as e:
-                print(f"Error loading image {img_path}: {e}. Skipping.")
-                continue
+        if self.best_loss is None:
+            self.best_loss = val_loss
+            is_best = True
+            return False, True
 
-            # Convert to float32 tensor in [0,1]
-            img_tensor = to_tensor(img_pil)  # (3, H, W)
+        if val_loss < self.best_loss - self.min_delta:
+            self.best_loss = val_loss
+            self.counter = 0
+            is_best = True
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.should_stop = True
 
-            # Convert to linear RGB and downsample
-            img_linear = srgb_to_linear_approx(img_tensor)# [:, ::2, ::2] # (3, H/2, W/2), linear RGB in [0,1]
+        return self.should_stop, is_best
 
-            # Prepare input tensor
-            input_tensor = img_linear.unsqueeze(0).to(device)
+    def state_dict(self):
+        return {
+            'best_loss': self.best_loss,
+            'counter': self.counter,
+            'should_stop': self.should_stop
+        }
 
-            # Inference
-            output_tensor = model(input_tensor).squeeze(0).cpu() # (3, H, W), linear RGB in [0,1]
+    def load_state_dict(self, state_dict):
+        self.best_loss = state_dict.get('best_loss')
+        self.counter = state_dict.get('counter', 0)
+        self.should_stop = state_dict.get('should_stop', False)
 
-            # Convert back to sRGB
-            output_srgb = linear_to_srgb_approx(output_tensor).clamp(0.0, 1.0)
+# ------------------------------------------------------------
+# Sample Visualizer for TensorBoard
+# ------------------------------------------------------------
+class Visualizer:
+    def __init__(self, sample_dir, device, writer):
+        self.device = device
+        self.writer = writer
+        self.sample_tensors = []
 
-            # Save image
-            output_img = to_pil(output_srgb)
-            output_path = os.path.join(output_dir, os.path.basename(img_path))
-            output_img.save(output_path)
-            print(f"Saved predicted image: {output_path}")
+        if os.path.exists(sample_dir):
+            files = sorted([f for f in os.listdir(sample_dir) if f.endswith('.png')])
+            for f in files:
+                img = Image.open(os.path.join(sample_dir, f)).convert('RGB')
+                t = TF.to_tensor(img).unsqueeze(0).to(self.device)
+                self.sample_tensors.append(t)
 
-def save_training_stats(epoch, train_loss, val_loss, epochs_no_improve, learning_rate, checkpoint_path, csv_file='training_stats.csv'):
-    file_exists = os.path.isfile(csv_file)
-    with open(csv_file, mode='a') as file:
-        writer = csv.writer(file)
-        if not file_exists:
-            writer.writerow(['Epoch', 'Train Loss', 'Validation Loss', 'EpochsNoImprove', 'LearningRate', 'Checkpoint Path'])
-        writer.writerow([epoch, train_loss, val_loss, epochs_no_improve, learning_rate, checkpoint_path])
-
-def load_last_epoch_and_checkpoint(lr, csv_file='training_stats.csv'):
-    # Returns last epoch, best validation loss, best_epoch, epochs_no_improve, learning_rate, checkpoint path
-    if not os.path.isfile(csv_file):
-        return 0, float('inf'), 0, 0, lr, None
-
-    with open(csv_file, mode='r') as file:
-        reader = csv.reader(file)
-        next(reader)  # Skip header
-        rows = list(reader)
-        if not rows:
-            return 0, float('inf'), 0, 0, lr, None
-
-        # Initialize variables to track the best validation loss
-        best_val_loss = float('inf')
-        best_epoch = 0
-        last_epoch = int(rows[-1][0])
-        epochs_no_improve = int(rows[-1][3])
-        learning_rate = float(rows[-1][4])
-        checkpoint_path = rows[-1][5]
-
-        # Find the best validation loss and corresponding epoch
-        for row in rows:
-            val_loss = float(row[2])
-            epoch = int(row[0])
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_epoch = epoch
-
-        return last_epoch, best_val_loss, best_epoch, epochs_no_improve, learning_rate, checkpoint_path
-
-# TensorBoard writer
-writer = SummaryWriter(log_dir='runs/transformer_experiment')
-average_inference_time = 0.0
-
-def train_model(model, train_loader, val_loader,
-                num_epochs=100,
-                lr=0.1,
-                checkpoint_interval=5,
-                early_stopping_patience=10,
-                device='cpu',
-                accumulation_steps=16,
-                checkpoint_dir='.',
-                batch_size=1,
-                inference_always=False):
-    global average_inference_time
-    model.to(device)
-
-    # ----------------------------- 
-    if not os.path.exists(checkpoint_dir):
-        os.makedirs(checkpoint_dir)
-
-    stats_file = os.path.join(checkpoint_dir, f'training_stats_{args.model_type}.csv')
-    start_epoch, best_val_loss, best_epoch, epochs_no_improve, lr, checkpoint_path = load_last_epoch_and_checkpoint(lr, stats_file)
-    print(f"Starting training from epoch {start_epoch + 1} with best validation loss {best_val_loss:.4f}, epochs no improvement {epochs_no_improve}, learning rate {lr}")
-
-    scaler = GradScaler()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
-    scheduler = lr_scheduler.ExponentialLR(optimizer, gamma = 0.955)
-
-    if checkpoint_path is not None and os.path.isfile(checkpoint_path):
-        model.load_state_dict(torch.load(checkpoint_path))
-        ## TODO Move outside this function into main
-        print(f"Loaded model from checkpoint: {checkpoint_path}")
-    # ----------------------------- 
-
-    for epoch in range(start_epoch + 1, num_epochs + 1):
-        model.train()
-        epoch_train_loss = 0.0
-        new_best = False
-
-        optimizer.zero_grad(set_to_none=True)
-        num_batches = len(train_loader)
-        print(f"Epoch {epoch}/{num_epochs} - Training...")
-
-        # Train
-        for i, (lr_batch, hr_batch) in enumerate(train_loader):
-            lr_batch = lr_batch.to(device)
-            hr_batch = hr_batch.to(device)
-
-            with autocast(device_type=device.type, enabled=(device.type == 'cuda')):
-                # Forward pass
-                sr_batch = model(lr_batch)
-                batch_loss = model.criterion(sr_batch, hr_batch)
-
-                # Scale and backpropagate the total loss
-                scaled_loss = scaler.scale(batch_loss)
-                scaled_loss.backward()
-               # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-
-                # Accumulate losses for reporting
-                with torch.no_grad():                    
-                    epoch_train_loss += batch_loss.item() * lr_batch.size(0)
-
-            # Perform optimizer steps after scaling
-            if (i + 1) % accumulation_steps == 0:
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-
-            if (i + 1) % (num_batches // 10) == 0:
-                print(f"Epoch [{epoch}/{num_epochs}] - {((i + 1) / num_batches) * 100:.2f}% batches processed")
-                time.sleep(5)
-
-        # Perform any remaining optimizer steps
-        if (i + 1) % accumulation_steps != 0:
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
-
-        print(f"Epoch [{epoch}/{num_epochs}] - Done")
-        time.sleep(5)
-
-        # Average the losses
-        epoch_train_loss = epoch_train_loss / len(train_loader.dataset)
-
-        # Validation
-        print(f"Validating...")
+    def log_epoch(self, model, epoch):
         model.eval()
-        epoch_val_loss = 0.0
+        comparisons = []
         with torch.no_grad():
-            for lr_batch, hr_batch in val_loader:
-                lr_batch = lr_batch.to(device)
-                hr_batch = hr_batch.to(device)
-                sr_batch = model(lr_batch)
-                batch_loss = model.criterion(sr_batch, hr_batch)
-                epoch_val_loss += batch_loss.item() * lr_batch.size(0)
-            epoch_val_loss /= len(val_loader.dataset)
+            for img_t in self.sample_tensors:
+                output = model(img_t)
 
-        # Step learning rate scheduler
-        scheduler.step()
-        time.sleep(5)
+                # Sanitize for TensorBoard visualization
+                output = torch.nan_to_num(output, nan=0.0).clamp(0, 1)
 
-        # Update CSV and print
-        writer.add_scalar('Loss/Train', epoch_train_loss, epoch)
-        writer.add_scalar('Loss/Validation', epoch_val_loss, epoch)
-        if best_val_loss == 0 or not torch.isfinite(torch.tensor(best_val_loss)):
-            difference_with_best = float('inf')
+                combined = torch.cat([img_t, output], dim=3)
+                comparisons.append(combined.squeeze(0).cpu())
+
+        grid = make_grid(comparisons, nrow=1)
+        self.writer.add_image('Visual_Progress/Samples', grid, epoch)
+        model.train()
+
+# --------------------------------------------------------------------------------
+# Trainer Class Definition
+# --------------------------------------------------------------------------------
+class Trainer:
+    """
+    Handles the DDP training and checkpointing logic for the ResidualUNet model.
+    """
+    def __init__(self, args, local_rank):
+        self.args = args
+        self.local_rank = local_rank
+
+        # Set device based on local rank
+        self.device = torch.device(f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
+
+        # Only rank 0 handles logging and printing
+        self.is_master = (self.local_rank == 0)
+        if self.is_master:
+            self.writer = SummaryWriter(log_dir=args.log_dir)
+
+        self.scaler = GradScaler()
+        self.current_epoch = 0
+        self.start_time = time.time()
+
+        # Initialize Early Stopping
+        self.early_stopper = EarlyStopping(
+            patience=args.early_stop_patience, 
+            min_delta=args.early_stop_delta
+        )
+
+        self.setup_data()
+        self.setup_model_and_optimizer()
+
+    def setup_data(self):
+        # 1. Gather all unique file pairs from all provided directories
+        all_pairs = []
+
+        for d in self.args.data_dir:
+            if self.is_master:
+                try:
+                    print(f"Gathering samples from: {d}")
+                except Exception as e:
+                    print(f"Error occurred while gathering samples from {d}: {e}")
+
+            if d:
+                try:
+                    dir_pairs = gather_all_samples_from_directory(
+                        directory_path=d,
+                        expected_crop_size=self.args.generator_crop_size,
+                        styles_to_include=None,
+                        verbose=2 if self.is_master else 0
+                    )
+                    all_pairs.extend(dir_pairs)
+                except Exception as e:
+                    print(f"Error occurred while gathering samples from {d}: {e}")
+                    raise e
+
+        if self.is_master:
+            print(f"Total aggregated pairs from {len(self.args.data_dir)} directories: {len(all_pairs)}")
+
+        # 2. Deterministic Shuffle and Physical Split
+        # We seed here so every DDP rank performs the EXACT same split
+        random.seed(42)
+        random.shuffle(all_pairs)
+
+        val_count = int(len(all_pairs) * self.args.val_fraction)
+        val_pairs = all_pairs[:val_count]
+        train_pairs = all_pairs[val_count:]
+
+        # 3. Handle training crop size tuple conversion
+        if isinstance(self.args.train_crop_size, int):
+            crop_size = (self.args.train_crop_size, self.args.train_crop_size)
         else:
-            difference_with_best = ((best_val_loss - epoch_val_loss) / best_val_loss) * 100
-        print(f"Epoch [{epoch}/{num_epochs}]  Train Loss: {epoch_train_loss:.4f}, Val Loss: {epoch_val_loss:.4f}  Patience: {early_stopping_patience-epochs_no_improve} Difference with best: {difference_with_best:.4f}%, Learning Rate: {optimizer.param_groups[0]['lr']}")
+            crop_size = self.args.train_crop_size
 
-        # Save best model checkpoint based on validation loss
-        apply_inference = inference_always
-        if epoch_val_loss < best_val_loss:
-            best_val_loss = epoch_val_loss
-            best_epoch = epoch
-            epochs_no_improve = 0
-            apply_inference = True
-            new_best = True
-            checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_best_{args.model_type}.pth") 
-            torch.save(model.state_dict(), checkpoint_path)
-            full_model_path = os.path.join(checkpoint_dir, f"best_{args.model_type}.pt")
-            torch.save(model, full_model_path)
-            print('New best model saved.')
+        # 4. Initialize separate Dataset instances
+        # Train dataset uses your virtual epoch length (samples_per_epoch)
+        self.train_dataset = SRDataset(
+            sample_pairs_list=train_pairs,
+            generator_output_crop_size=self.args.generator_crop_size,
+            train_crop_size=crop_size
+        )
+
+        # Validation dataset uses all available validation samples.
+        # A rotating validation window limits how many are checked per epoch.
+        self.val_dataset = SRDataset(
+            sample_pairs_list=val_pairs, 
+            generator_output_crop_size=self.args.generator_crop_size, 
+            train_crop_size=crop_size 
+        )
+
+        # Rotating validation window: start offset and per-epoch max samples (configurable)
+        self.val_limit = min(int(self.args.val_limit), len(val_pairs)) if len(val_pairs) > 0 else 0
+        self.val_offset = 0
+
+        if self.is_master:
+            print(f"Total pairs: {len(all_pairs)} | Train pool: {len(train_pairs)} | Val pool: {len(val_pairs)}")
+            print(f"Epoch configuration -> Train steps: {self.args.samples_per_epoch} | Val steps: {self.args.val_limit} (rotating window)")
+
+        # Train Distributed Sampler
+        self.train_sampler = DistributedSampler(
+            self.train_dataset,
+            num_replicas=dist.get_world_size(),
+            rank=dist.get_rank(),
+            shuffle=self.args.shuffle_data,
+            drop_last=True
+        )
+
+        # Train DataLoader
+        self.train_dataloader = DataLoader(
+            self.train_dataset,
+            batch_size=self.args.batch_size,
+            shuffle=False, # Sampler handles shuffling
+            num_workers=self.args.num_workers,
+            pin_memory=True,
+            drop_last=True,
+            sampler=self.train_sampler
+        )
+
+    def setup_model_and_optimizer(self):
+        if self.is_master:
+            print(f"Initializing model: {self.args.model_type}")
+        self.model = get_model(self.args.model_type, lores_only=self.args.lores_only, verbose=self.args.verbose).to(self.device)
+        if self.is_master and self.args.print_model_layers:
+            print(self.model)
+
+        world_size = dist.get_world_size()
+        total_batches_per_epoch = self.args.samples_per_epoch // (self.args.batch_size * world_size)
+        self.learning_rate = self.args.learning_rate
+        self.steps_per_epoch = total_batches_per_epoch
+
+        self.optimizer = optim.AdamW(
+            self.model.parameters(), 
+            lr=self.learning_rate, # The scheduler will override this
+            betas=(self.args.adam_beta1, self.args.adam_beta2)
+        )
+
+        self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            self.optimizer, 
+            T_0=self.steps_per_epoch * 5,
+            T_mult=2,
+            eta_min=1e-7
+        )
+
+        # Load checkpoint if specified
+        if self.args.load_checkpoint:
+            self.load_checkpoint(self.args.load_checkpoint)
+
+        # Wrap the model with DDP
+        self.model = DDP(self.model, device_ids=[self.local_rank], find_unused_parameters=self.args.find_unused_parameters)
+
+    @torch.inference_mode()
+    def validate(self):
+        """
+        Runs validation loop and returns global average validation loss.
+        """
+        self.model.eval()
+
+        # If there are no validation samples, return 0.0
+        val_dataset_len = len(self.val_dataset)
+        if val_dataset_len == 0 or self.val_limit == 0:
+            self.model.train()
+            return 0.0
+
+        # Build the rotating slice of indices for this validation run
+        start = int(self.val_offset) % val_dataset_len
+        end = start + int(self.val_limit)
+        if end <= val_dataset_len:
+            indices = list(range(start, end))
         else:
-            epochs_no_improve += 1
+            # Wrap around
+            indices = list(range(start, val_dataset_len)) + list(range(0, end - val_dataset_len))
 
-        # Save checkpoint and sample outputs every checkpoint_interval epochs
-        if epoch % checkpoint_interval == 0 or new_best or epochs_no_improve > early_stopping_patience or epoch == num_epochs:
-            checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch}_{args.model_type}.pth")
-            torch.save(model.state_dict(), checkpoint_path)
-            print(f"Saved checkpoint: {checkpoint_path}")
+        # Create a Subset and DataLoader for this validation slice, using DistributedSampler
+        from torch.utils.data import Subset
+        subset = Subset(self.val_dataset, indices)
+        subset_sampler = DistributedSampler(
+            subset,
+            num_replicas=dist.get_world_size(),
+            rank=dist.get_rank(),
+            shuffle=False,
+            drop_last=False
+        )
 
-            # Save training statistics
-            stats_file = os.path.join(checkpoint_dir, f'training_stats_{args.model_type}.csv')
-            save_training_stats(epoch, epoch_train_loss, epoch_val_loss, epochs_no_improve, optimizer.param_groups[0]['lr'], checkpoint_path=checkpoint_path, csv_file=stats_file)
+        val_batch_size = 12
+        val_num_workers = self.args.num_workers
+        val_pin_memory = False
 
-        if epochs_no_improve > early_stopping_patience:
-            print("Early stopping triggered.")
-            break
+        val_loader = DataLoader(
+            subset,
+            batch_size=val_batch_size,
+            shuffle=False,
+            num_workers=val_num_workers,
+            pin_memory=val_pin_memory,
+            drop_last=False,
+            sampler=subset_sampler,
+            prefetch_factor=2
+        )
 
-        # Perform inference on some amiga samples and save predicted results
-        if apply_inference:
-            original_dir = 'samples'
-            predicted_dir = os.path.join(checkpoint_dir, 'predicted')
+        total_val_loss = 0.0
+        num_batches = 0
+        local_samples_processed = 0
+        log_interval = getattr(self.args, 'val_log_interval', 50)
 
-            # Measure inference time
-            start_time = time.time()
-            inference_on_directory(model, original_dir, predicted_dir, device)
-            end_time = time.time()
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        with autocast(device_type=self.device.type, dtype=dtype, enabled=self.args.use_amp):
+            for batch in val_loader:
+                if isinstance(batch, dict):
+                    lr = batch["lr"].to(self.device)
+                    hr = batch["hr"].to(self.device)
+                else:
+                    lr, hr = batch
+                    lr = lr.to(self.device)
+                    hr = hr.to(self.device)
 
-            num_inference_images = len(glob.glob(os.path.join(original_dir, "*.png")))
-            if num_inference_images > 0:
-                inference_time = end_time - start_time
-                average_inference_time = inference_time / num_inference_images
+                out = self.model(lr)
+                loss = self.model.module.criterion(out, hr)
+                total_val_loss += loss.item()
+                num_batches += 1
+                # Track processed samples for progress logging
+                batch_n = hr.size(0) if hasattr(hr, 'size') else 1
+                local_samples_processed += int(batch_n)
+
+                # Periodically aggregate progress across ranks and log from master
+                if (num_batches % log_interval) == 0 or local_samples_processed >= len(indices):
+                    if dist.is_initialized():
+                        proc_tensor = torch.tensor([local_samples_processed], dtype=torch.long, device=self.device)
+                        dist.all_reduce(proc_tensor, op=dist.ReduceOp.SUM)
+                        global_processed = int(proc_tensor.item())
+                    else:
+                        global_processed = local_samples_processed
+
+                    if self.is_master:
+                        print(f"    Validation progress: {global_processed}/{len(indices)} samples ({(global_processed/ max(1,len(indices)))*100:.1f}%)")
+
+            # 1. Calculate local average
+            local_avg_loss = total_val_loss / max(1, num_batches)
+
+            # 2. Aggregate across all GPUs
+            loss_tensor = torch.tensor([local_avg_loss], device=self.device)
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+            global_val_loss = loss_tensor.item() / dist.get_world_size()
+
+            # Advance the rotating offset for next epoch (only local update; persisted in checkpoints)
+            self.val_offset = (self.val_offset + self.val_limit) % val_dataset_len
+
+        self.model.train()
+        return global_val_loss
+
+    def save_checkpoint(self, is_best: bool, epoch: int, loss: float, val_loss: float):
+        if not self.is_master:
+            return
+
+        os.makedirs(self.args.checkpoint_dir, exist_ok=True)
+
+        checkpoint = {
+            'epoch': epoch,
+            'loss': loss,
+            'val_loss': val_loss,
+            'early_stopping_state': self.early_stopper.state_dict(),
+            'val_offset': getattr(self, 'val_offset', 0),
+            'model_state_dict': self.model.module.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'scaler_state_dict': self.scaler.state_dict(),
+            'args': self.args.__dict__,
+            'time_elapsed': time.time() - self.start_time
+        }
+
+        filepath = os.path.join(self.args.checkpoint_dir, f'epoch_{epoch:04d}.pth')
+        torch.save(checkpoint, filepath)
+
+        if is_best:
+            best_filepath = os.path.join(self.args.checkpoint_dir, 'best_model.pth')
+            shutil.copyfile(filepath, best_filepath)
+            print(f"Saved best model (Val Loss: {val_loss:.6f}) to {best_filepath}")
+
+        print(f"Saved checkpoint to {filepath}")
+
+    def load_checkpoint(self, checkpoint_path: str):
+        """Loads a checkpoint and resumes training."""
+        if not os.path.exists(checkpoint_path):
+            if self.is_master:
+                print(f"Warning: Checkpoint file not found at {checkpoint_path}")
+            return
+
+        if self.is_master:
+            print(f"Loading checkpoint from {checkpoint_path}...")
+        try:
+            # Note: Load model onto CPU first if loading happens before DDP wrapping
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+
+            # Use the model's load_state_dict *before* DDP wrapping
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+
+            if not self.args.reset_optimizer:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+                self.current_epoch = checkpoint['epoch'] + 1
+                self.start_time -= checkpoint.get('time_elapsed', 0.0)
+                if 'scheduler_state_dict' in checkpoint:
+                    self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                # Restore Early Stopping State
+                if 'early_stopping_state' in checkpoint:
+                    self.early_stopper.load_state_dict(checkpoint['early_stopping_state'])
+                    self.early_stopper.patience = self.args.early_stop_patience
+                    self.early_stopper.min_delta = self.args.early_stop_delta
+                    self.early_stopper.should_stop = False
+                    # Restore validation offset if present
+                    self.val_offset = checkpoint.get('val_offset', getattr(self, 'val_offset', 0))
+                else:
+                    # Backward compatibility for older checkpoints
+                    old_best = checkpoint.get('best_loss')
+                    if old_best: self.early_stopper.best_loss = old_best
+
+                if self.is_master:
+                    print(f"Resuming from epoch {self.current_epoch}.")
             else:
-                 average_inference_time = 0.0
-                 print(f"Warning: No images found for inference in {original_dir}.") 
+                if self.is_master:
+                    print("Loaded model weights, but reset optimizer and epoch count.")
 
-            print(f"Inference completed for epoch {epoch}. Results saved to {predicted_dir}") # Line 212
-            print(f"Average inference time per image: {average_inference_time:.4f} seconds") # Line 213
+        except Exception as e:
+            if self.is_master:
+                print(f"Error loading checkpoint: {e}")
+                print("Starting training from scratch.")
 
-            # Save internals (optional; will be influenced by inference step)
-            modules_to_check = []
-            modules_to_check.append((model, 'basic'))
+    def train_model(self):
+        """Main training loop using virtual epochs and DDP."""
+        if self.is_master:
+            print(f"\nStarting DDP training for {self.args.epochs} epochs on device {self.device}")
+            self.visualizer = Visualizer('samples', self.device, self.writer)
 
-            # Iterate through the identified modules and save their internal images
-            for module, prefix in modules_to_check:
-                if hasattr(module, 'save') and isinstance(module.save, dict):
-                    map = module.save
-                    for key, item in map.items():
-                        if item is not None and item.numel() > 0: # Check if tensor is not None and not empty
-                            # Ensure item is a single image tensor before saving
-                            if item.dim() == 4 and item.size(0) == 1:
-                                image = item[0].cpu().clone().detach()
-                                # Clamp values to [0, 1] before normalization and saving
-                                image = torch.clamp(image, image.min(), image.max()) # Clamp before norm
-                                # Normalize to [0, 1] for saving as image
-                                image = (image - image.min()) / (image.max() - image.min() + 1e-8)
-                                # Save with epoch_prefix_key format
-                                save_filename = os.path.join(checkpoint_dir, f"epoch_{epoch}_{prefix}_{key}.png")
-                                save_image(image, save_filename)
-                            else:
-                                 print(f"Warning: Skipping saving internal '{key}' from '{prefix}' as it's not a single image tensor (shape: {item.shape}).")
-                        else:
-                             print(f"Warning: Skipping saving internal '{key}' from '{prefix}' as it's None or empty.")
+        # Calculate steps per rank to reach a global samples_per_epoch
+        world_size = dist.get_world_size()
+        total_batches_per_epoch = self.args.samples_per_epoch // (self.args.batch_size * world_size)
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        if self.is_master:
+            print(f"Mixed precision training is {'enabled' if self.args.use_amp else 'disabled'}. Using dtype {dtype} for mixed precision training.")
 
-        time.sleep(10)
+        for epoch in range(self.current_epoch, self.args.epochs):
+            self.model.train()
+            epoch_loss = 0.0
+            self.train_sampler.set_epoch(epoch)
 
-    return best_val_loss, best_epoch, average_inference_time
+            if self.is_master:
+                print(f"\n--- Epoch {epoch+1}/{self.args.epochs} ---")
 
-# Main Function: Prepare Data and Start Training
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Train an image enhancement model.')
-    parser.add_argument('--model_type', type=str, required=True, choices=['conv3', 'conv3_heavy', 'conv5', 'conv5_heavy', 'pix_shuffle', 'pix_shuffle_heavy', 'residual_unet'],
-                        help='Type of model to train: "conv3, conv3_heavy, conv5, conv5_heavy, conv6".')
-    parser.add_argument('--edge_checkpoint_path', type=str, default=None,
-                        help='Path to the trained checkpoint (.pth) to load for combined training.')
-    parser.add_argument('--epochs', type=int, default=10, help='Number of epochs to train')
-    parser.add_argument('--batch_size', type=int, default=1, help='Batch size for training')
-    parser.add_argument('--checkpoint_interval', type=int, default=5, help='Interval for saving checkpoints')
-    parser.add_argument('--accumulation_steps', type=int, default=16, help='Gradient accumulation steps')
-    parser.add_argument('--checkpoint_dir', type=str, default='.', help='Directory to load/store checkpoints')
-    parser.add_argument('--early_stopping_patience', type=int, default=10, help='Early stopping patience')
-    parser.add_argument('--generator_train_dir', type=str, required=True, help='Output directory of the generator\'s train split (e.g., path/to/dataset_quantized/train).')
-    parser.add_argument('--train_samples', type=int, default=10000, help='Declared number of samples to use for training per epoch (epoch size).')
-    parser.add_argument('--val_samples', type=int, default=1000, help='Declared number of samples to use for validation per epoch (epoch size).')
-    parser.add_argument('--val_split_ratio', type=float, default=0.1, help='Ratio of the available sample pool to use for validation (0.0 to 1.0).')
-    parser.add_argument("--crop_size", type=int, nargs=2, default=[752, 576], help="Expected crop size as W H (e.g., 752 576) for images in the dataset. Defaults to 752x576.")
-    parser.add_argument("--styles_to_include", type=str, nargs='*', help="Optional list of specific style names (e.g., 'lores_rgb888_pNone_none') to include as inputs. If omitted, all styles are included.")
-    parser.add_argument('--verbose', type=int, default=1, help='Verbosity level for warnings/messages (0: no warnings, 1: basic, 2: detailed).')
-    parser.add_argument('--inference_always', action='store_true', help='Run inference on the Amiga sample directory after training, regardless of training improvement.')
-    parser.add_argument('--learning_rate', type=float, default=0.001, help='Start learning rate (default 0.001)')
+            for batch_idx, (styled_input, target_hr) in enumerate(self.train_dataloader):
+                # Break early to respect the virtual epoch limit
+                if batch_idx >= total_batches_per_epoch:
+                    break
 
-    args = parser.parse_args()
+                styled_input = styled_input.to(self.device, non_blocking=True)
+                target_hr = target_hr.to(self.device, non_blocking=True)
 
-    # Set device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                self.optimizer.zero_grad(set_to_none=True) # Zero gradients before forward pass
 
-    print(f"Selected model type for training: {args.model_type}")
-    if args.model_type == 'conv3':
-        model = model_conv3.get_model('lightweight')
-        print("Using Conv2D model with 3 layers; lightweight.")
-    elif args.model_type == 'conv3_heavy':
-        model = model_conv3.get_model('heavyweight')
-        print("Using Conv2D model with 3 layers; heavyweight.")
-    elif args.model_type == "conv5":
-        model = model_conv5.get_model('lightweight')
-        print("Using Conv2D model with 5 layers; lightweight.")
-    elif args.model_type == "conv5_heavy":
-        model = model_conv5.get_model('heavyweight')
-        print("Using Conv2D model with 5 layers; heavyweight.")
-    elif args.model_type == "pix_shuffle":
-        model = model_pix_shuffle.get_model('lightweight')
-        print("Based on CRN and ESPCN; lightweight.")
-    elif args.model_type == "pix_shuffle_heavy":
-        model = model_pix_shuffle.get_model('heavyweight')
-        print("Based on CRN and ESPCN; heavyweight.")
-    elif args.model_type == "residual_unet":
-        model = model_residual_unet.get_model('lightweight')
-        print("Based on Unet, ResNet, CRN and ESPCN; lightweight.")
+                with autocast(device_type=self.device.type, dtype=dtype, enabled=self.args.use_amp):
+                    output_sr = self.model(styled_input)
+
+                    # if not torch.isfinite(output_sr).all():
+                    #     if self.is_master:
+                    #         print(f"!!! NaN activations detected at batch {batch_idx}")
+                    #     self.optimizer.zero_grad(set_to_none=True)
+                    #     continue
+
+                    loss = self.model.module.criterion(output_sr.float(), target_hr.float()) 
+
+                    # if not torch.isfinite(loss):
+                    #     if self.is_master:
+                    #         print(f"!!! NaN loss at batch {batch_idx}. Model output finite: {torch.isfinite(output_sr).all()}")
+                    #     # Skip this batch to prevent weight corruption
+                    #     continue
+
+                if self.args.use_amp:
+                    self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.optimizer.step()
+
+                current_step = (epoch * self.steps_per_epoch) + batch_idx
+
+                if current_step < self.args.warmup_steps:
+                    # Linear warmup: scale LR from 0 to max_lr
+                    lr = (current_step / self.args.warmup_steps) * self.learning_rate
+                    for param_group in self.optimizer.param_groups:
+                        param_group['lr'] = lr
+                else:
+                    # After warmup, let the Cosine scheduler take over
+                    self.scheduler.step(current_step)
+
+                epoch_loss += loss.item()
+
+                if self.is_master and (batch_idx + 1) % self.args.log_interval == 0:
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                    print(f"    Batch {batch_idx+1}/{self.steps_per_epoch} | Loss: {loss.item():.6f} | LR: {current_lr:.8f}")
+                    global_step = epoch * total_batches_per_epoch + batch_idx
+                    self.writer.add_scalar('Loss/train_batch', loss.item(), global_step)
+                    self.writer.add_scalar('LearningRate/batch', current_lr, global_step)
+
+            # --- End of Epoch Training Aggregation ---
+            avg_epoch_loss = epoch_loss / total_batches_per_epoch
+            loss_tensor = torch.tensor([avg_epoch_loss], device=self.device)
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+            global_train_loss = loss_tensor.item() / world_size
+
+            # --- Validation & Early Stopping ---
+            if self.is_master:
+                print(f"Epoch {epoch+1} training complete. Average Loss: {avg_epoch_loss:.6f}")
+                print("Starting validation...")
+
+            del styled_input, target_hr, output_sr, loss
+            self.optimizer.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
+            print(torch.cuda.memory_allocated() / 1024**3)
+            print(torch.cuda.memory_reserved() / 1024**3)
+
+            stop_training_tensor = torch.tensor([0], dtype=torch.int, device=self.device)
+            global_val_loss = self.validate()
+
+            if self.is_master:
+                # Log metrics
+                self.writer.add_scalar('Loss/train_epoch', global_train_loss, epoch)
+                self.writer.add_scalar('Loss/val_epoch', global_val_loss, epoch)
+                self.writer.add_scalar('LearningRate/epoch', self.optimizer.param_groups[0]['lr'], epoch)
+                self.visualizer.log_epoch(self.model.module, epoch)
+                print(f"Epoch {epoch+1} finished. Train Loss: {global_train_loss:.6f} | Val Loss: {global_val_loss:.6f}")
+
+                # Check for improvement; determine if this is the best model (based on validation loss)
+                should_stop, is_best = self.early_stopper.step(global_val_loss)
+                if is_best:
+                    self.early_stopper.counter = 0
+
+                self.save_checkpoint(is_best, epoch, global_train_loss, global_val_loss)
+
+                if should_stop:
+                    print(f"Early stopping triggered after {self.args.early_stop_patience} epochs with no improvement.")
+                    stop_training_tensor[0] = 1
+
+            # Rank 1 will wait until Rank 0 finishes log_epoch.
+            if dist.is_initialized():
+                dist.barrier()
+
+            # Broadcast stopping decision to all GPUs
+            dist.broadcast(stop_training_tensor, src=0)
+
+            if stop_training_tensor.item() == 1:
+                break
+
+        if self.is_master:
+            self.writer.close()
+            print("Training completed.")
+
+# --------------------------------------------------------------------------------
+# Argument Parsing
+# --------------------------------------------------------------------------------
+def parse_args():
+    parser = argparse.ArgumentParser(description="PyTorch Super-Resolution Model Training.")
+
+    # Data arguments
+    parser.add_argument('--data_dir', nargs='+', required=True, 
+                        help='Space-separated list of paths to directories containing generator output.')
+    add_size_argument(parser, '--generator_crop_size', default="376 288", 
+                      help='The \"W, H\" size of the images produced by generator.py (source crops). Default: 376 288')
+    add_size_argument(parser, '--train_crop_size', default="376 288",
+                      help='The \"W, H\" size of the random sub-crops used for actual training. Default: 376 288')
+    parser.add_argument('--samples_per_epoch', type=int, default=50000, 
+                        help='The number of samples the dataset reports for one epoch.')
+    parser.add_argument('--shuffle_data', action='store_true', default=False,
+                        help='Whether to shuffle data before splitting into train/val sets.')
+    parser.add_argument('--print_model_layers', action='store_true', default=False,
+                        help='If set, prints the model architecture layers.')
+
+    # Model and training arguments
+    parser.add_argument('--model_type', type=str, default='light', choices=['light', 'heavy'], help='Type of ResidualUNet model to use.')
+    parser.add_argument('--epochs', type=int, default=100, help='Number of epochs to train.')
+    add_size_argument(parser, '--batch_size', default=16, help='Batch size PER GPU for training.')
+    parser.add_argument('--learning_rate', type=float, default=1e-4, help='Initial learning rate.')
+    parser.add_argument('--warmup_steps', type=int, default=500, help='Number of warmup steps for learning rate scheduler.')
+    parser.add_argument('--adam_beta1', type=float, default=0.9, help='Beta1 for Adam optimizer.')
+    parser.add_argument('--adam_beta2', type=float, default=0.999, help='Beta2 for Adam optimizer.')
+    parser.add_argument('--num_workers', type=int, default=8, help='Number of DataLoader workers per GPU.')
+    parser.add_argument('--val_fraction', type=float, default=0.1)
+    parser.add_argument('--val_limit', type=int, default=2000,
+                        help='Maximum number of validation images to evaluate per epoch (rotating window).')
+    parser.add_argument('--val_log_interval', type=int, default=50,
+                        help='Log validation progress every N batches (per rank).')
+    parser.add_argument("--early-stop-patience", type=int, default=10)
+    parser.add_argument("--early-stop-delta", type=float, default=1e-4)
+    parser.add_argument('--find_unused_parameters', action='store_true', default=False,
+                        help='If True, set find_unused_parameters=True in DDP (needed if some model parameters are not used in every forward pass).')
+
+    # Checkpointing and logging
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints', 
+                        help='Directory to save model checkpoints.')
+    parser.add_argument('--load_checkpoint', type=str, default=None, 
+                        help='Path to a checkpoint file to resume training from.')
+    parser.add_argument('--reset_optimizer', action='store_true', 
+                        help='If loading a checkpoint, only load weights and reset optimizer state/epoch count.')
+    parser.add_argument('--log_dir', type=str, default='runs/sr_training', 
+                        help='TensorBoard log directory.')
+    parser.add_argument('--log_interval', type=int, default=50, 
+                        help='How many batches to wait before logging training status.')
+
+    # Performance arguments
+    parser.add_argument('--use_amp', action='store_true', help='Use Automatic Mixed Precision (AMP).')
+    parser.add_argument('--verbose', action='store_true', help='Enable verbose model output.')
+    parser.add_argument('--lores_only', action='store_true', help='Use lores only mode.')
+
+    return parser.parse_args()
+
+# --------------------------------------------------------------------------------
+# Main Execution (DDP Launch Block)
+# --------------------------------------------------------------------------------
+def run_ddp_process(local_rank, args):
+    """Initializes and runs a single DDP process."""
+    # 1. Initialize Distributed Process
+    # 'env://' uses the environment variables set by torchrun
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl", init_method="env://", device_id=local_rank)
+
+    # Instantiate and Run Trainer
+    try:
+        trainer = Trainer(args, local_rank)
+        trainer.train_model()
+    except Exception as e:
+        if local_rank == 0:
+            print(f"A fatal error occurred on rank {local_rank}: {e}")
+            import traceback
+            traceback.print_exc()
+    dist.destroy_process_group()
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    # DDP Launch Check (Checks for environment variables set by torchrun)
+    if 'LOCAL_RANK' in os.environ:
+        local_rank = int(os.environ['LOCAL_RANK']) # Defined by torchrun
+        run_ddp_process(local_rank, args)
     else:
-        print(f"Error: Unknown model type '{args.model_type}'.")
-        sys.exit(1)
-    
-    # Move model to GPU
-    model = model.to(device)
-
-    # --- Gather all available samples from the generator's train output directory ---
-    expected_crop_size_tuple = tuple(args.crop_size)
-    styles_set = set(args.styles_to_include) if args.styles_to_include is not None else None
-
-    print(f"Gathering all available sample pairs from {args.generator_train_dir}...")
-    all_available_samples = gather_all_samples_from_directory(
-        directory_path=args.generator_train_dir,
-        expected_crop_size=expected_crop_size_tuple,
-        styles_to_include=styles_set,
-        verbose=args.verbose
-    )
-    print(f"Found {len(all_available_samples)} total available sample pairs matching criteria.")
-
-    # Check if any samples were found
-    if not all_available_samples:
-        print(f"Error: No sample pairs found in {args.generator_train_dir} matching the criteria. Check --generator_train_dir, --crop_size, and --styles_to_include.")
-        sys.exit(1)
-
-    # --- Perform Train/Validation Split Programmatically ---
-    # Shuffle the list of all available samples before splitting
-    random.shuffle(all_available_samples)
-
-    # Calculate the number of samples for validation based on the ratio
-    # Ensure val_split_ratio is between 0.0 and 1.0
-    val_split_ratio = max(0.0, min(1.0, args.val_split_ratio))
-    num_total_available = len(all_available_samples)
-    num_val_available = int(num_total_available * val_split_ratio)
-    num_train_available = num_total_available - num_val_available
-
-    # Adjust split sizes to ensure at least one sample in each split if the total pool allows
-    if num_total_available > 0:
-        if num_train_available == 0:
-            warnings.warn(f"Validation split ratio {val_split_ratio} results in 0 training samples. Adjusting to have 1 training sample.")
-            num_train_available = 1
-            num_val_available = num_total_available - 1
-        if num_val_available == 0 and val_split_ratio > 0: # Only ensure val sample if ratio > 0 was requested
-             warnings.warn(f"Validation split ratio {val_split_ratio} results in 0 validation samples. Adjusting to have 1 validation sample.")
-             num_val_available = 1
-             num_train_available = num_total_available - 1
-
-    # Final check after potential adjustments
-    if num_train_available <= 0: # Need at least one sample for training
-        print("Error: Not enough samples available for the training split after applying validation ratio.")
-        sys.exit(1)
-    if num_val_available < 0: # Should not happen with previous logic, but defensive
-         num_val_available = 0
-
-    print(f"Splitting {num_total_available} available samples: {num_train_available} for train pool, {num_val_available} for validation pool.")
-
-
-    # Split the shuffled list of sample pairs into train and validation pools
-    train_pool_list = all_available_samples[:num_train_available]
-    val_pool_list = all_available_samples[num_train_available:]
-
-
-    # --- Create dataset instances using the split lists ---
-    train_dataset = SRDataset(
-        sample_pairs_list=train_pool_list,
-        expected_crop_size=expected_crop_size_tuple,
-        num_samples=args.train_samples
-    )
-    val_dataset = SRDataset(
-        sample_pairs_list=val_pool_list,
-        expected_crop_size=expected_crop_size_tuple,
-        num_samples=args.val_samples
-    )
-
-    # Check if the resulting datasets' pools are empty
-    if len(train_dataset.available_samples_pool) == 0:
-        print("Error: Training dataset pool is empty after splitting. Cannot create DataLoader.")
-        sys.exit(1)
-    if len(val_dataset.available_samples_pool) == 0 and val_split_ratio > 0:
-        print("Warning: Validation dataset pool is empty after splitting. Validation during training will use 0 samples.")
-
-
-    # Create data loaders using the dataset objects
-    # num_workers depends on available CPU cores and system
-    # persistent_workers=True is good practice with num_workers > 0
-    # Pin_memory=True can speed up data transfer to GPU
-    num_dataloader_workers = min(os.cpu_count() // 2, 4)
-    if num_dataloader_workers > 0:
-         print(f"Using {num_dataloader_workers} workers for DataLoaders.")
-    else:
-         print("Using main process for DataLoaders (num_workers=0).")
-
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_dataloader_workers, pin_memory=True, persistent_workers=(num_dataloader_workers > 0))
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=num_dataloader_workers, pin_memory=True, persistent_workers=(num_dataloader_workers > 0))
-
-    # Start training (assuming train_model function is defined elsewhere and accepts these loaders)
-    best_val, best_epoch, average_inference_time = train_model(
-                          model=model,
-                          train_loader=train_loader,
-                          val_loader=val_loader,
-                          num_epochs=args.epochs,
-                          lr=args.learning_rate,
-                          checkpoint_interval=args.checkpoint_interval,
-                          early_stopping_patience=args.early_stopping_patience,
-                          device=device,
-                          accumulation_steps=args.accumulation_steps,
-                          checkpoint_dir=args.checkpoint_dir,
-                          batch_size=args.batch_size,
-                          inference_always=args.inference_always)
-
-    print(f"Average inference time: {average_inference_time:.4f} seconds")
-    print(f"Best validation loss: {best_val:.4f} at epoch {best_epoch}")
-    writer.close()
-    sys.exit(0)
+        # Fallback for single process (for debugging or single-GPU use)
+        # This requires manually setting the necessary environment variables
+        print("Single GPU/CPU mode detected. Falling back to single-process DDP setup.")
+        os.environ['MASTER_ADDR'] = 'localhost'
+        os.environ['MASTER_PORT'] = '12355'
+        os.environ['WORLD_SIZE'] = '1'
+        os.environ['RANK'] = '0'
+        os.environ['LOCAL_RANK'] = '0' 
+        run_ddp_process(0, args)

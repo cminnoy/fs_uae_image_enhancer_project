@@ -1,42 +1,87 @@
 import numpy as np
 from PIL import Image
 from sklearn.cluster import KMeans
+from sklearn.cluster import MiniBatchKMeans
 import numba as nb
 import time # For timing the Numba parts
 
 # --- Median Cut Palette Generator ---
 def generate_palette_median_cut(image_np: np.ndarray, num_colors: int) -> np.ndarray:
-    pixels = image_np.reshape(-1, 3)
+    """
+    Generates a color palette using a robust median cut algorithm.
+    This version correctly handles low-color and low-variance inputs.
+    """
+    pixels = image_np.reshape(-1, 3).astype(np.float32)
 
-    class ColorBox:
-        def __init__(self, pixels):
-            self.pixels = pixels
-            self.bounds = [
-                (np.min(pixels[:, i]), np.max(pixels[:, i])) for i in range(3)
-            ]
+    # Handle edge case of an empty input image
+    if pixels.shape[0] == 0:
+        return np.zeros((num_colors, 3), dtype=np.uint8)
 
-        def longest_color_range_axis(self):
-            ranges = [hi - lo for lo, hi in self.bounds]
-            return int(np.argmax(ranges))
+    # Start with a single "box" containing all pixels
+    boxes = [pixels]
 
-        def split(self):
-            axis = self.longest_color_range_axis()
-            sorted_pixels = self.pixels[self.pixels[:, axis].argsort()]
-            median_idx = len(sorted_pixels) // 2
-            return ColorBox(sorted_pixels[:median_idx]), ColorBox(sorted_pixels[median_idx:])
-
-        def average_color(self):
-            return np.mean(self.pixels, axis=0)
-
-    boxes = [ColorBox(pixels)]
     while len(boxes) < num_colors:
-        boxes.sort(key=lambda box: np.prod([hi - lo for lo, hi in box.bounds]), reverse=True)
-        largest_box = boxes.pop(0)
-        box1, box2 = largest_box.split()
-        boxes.extend([box1, box2])
+        # Find the box with the greatest color range to split next
+        box_to_split_idx = -1
+        max_range = -1
 
-    palette = np.array([box.average_color() for box in boxes], dtype=np.uint8)
-    return palette
+        for i, box in enumerate(boxes):
+            # A box must have at least 2 pixels to be splittable
+            if box.shape[0] < 2:
+                continue
+
+            # Find the largest color channel range (R, G, or B) within this box
+            box_min = np.min(box, axis=0)
+            box_max = np.max(box, axis=0)
+            ranges = box_max - box_min
+            current_max_range = np.max(ranges)
+
+            if current_max_range > max_range:
+                max_range = current_max_range
+                box_to_split_idx = i
+        
+        # If no splittable boxes were found, we're done.
+        if box_to_split_idx == -1:
+            break
+
+        # Split the chosen box
+        box_to_split = boxes.pop(box_to_split_idx)
+        
+        # Find the channel (0=R, 1=G, 2=B) with the greatest range in this box
+        ranges = np.max(box_to_split, axis=0) - np.min(box_to_split, axis=0)
+        split_channel = np.argmax(ranges)
+        
+        # Sort the pixels in the box according to the split channel
+        box_to_split = box_to_split[box_to_split[:, split_channel].argsort()]
+        
+        # Split at the median index
+        median_index = box_to_split.shape[0] // 2
+        
+        # Add the two new boxes to our list
+        boxes.append(box_to_split[:median_index])
+        boxes.append(box_to_split[median_index:])
+
+    # --- Create the final palette ---
+    # Average the colors in each box to get the representative palette color.
+    # We must handle cases where a box might be empty after a split.
+    palette = []
+    for box in boxes:
+        if box.shape[0] > 0:
+            palette.append(np.mean(box, axis=0))
+
+    # If we couldn't generate enough colors, pad the palette
+    palette = np.array(palette, dtype=np.uint8)
+    num_generated = len(palette)
+    if num_generated < num_colors:
+        if num_generated == 0: # Handle case of 1-pixel image
+             return np.tile(pixels[0].astype(np.uint8), (num_colors, 1))
+
+        padded_palette = np.zeros((num_colors, 3), dtype=np.uint8)
+        padded_palette[:num_generated] = palette
+        padded_palette[num_generated:] = palette[-1] # Pad with the last available color
+        palette = padded_palette
+
+    return palette[:num_colors] # Ensure correct size
 
 # --- Octree Palette Generator (Simple Averaging Variant) ---
 def generate_palette_octree(image_np: np.ndarray, num_colors: int) -> np.ndarray:
@@ -135,99 +180,66 @@ def _apply_palette_dithering_numba(image_float: np.ndarray, diff_map_list: list,
 
 @nb.njit(cache=True)
 def _apply_checkerboard_dithering_numba_optimized(
-    image_float_input: np.ndarray,  # (H, W, 3) float64
-    palette_float: np.ndarray,      # (N, 3) float64, for distance calculations
-    palette_uint8: np.ndarray,      # (N, 3) uint8, for assignment
-    output_image_uint8: np.ndarray  # (H, W, 3) uint8, to be filled
+    image_float: np.ndarray,    # (H, W, 3) float64
+    palette_float: np.ndarray,  # (N, 3) float64, for distance calculations
+    palette_uint8: np.ndarray,  # (N, 3) uint8, for assignment
+    output_uint8: np.ndarray    # (H, W, 3) uint8, to be filled
 ):
     """
-    Numba-accelerated checkerboard dithering using a specified palette.
-    For each pixel in the input image, it finds the two closest colors
-    from the palette and alternates them in a checkerboard pattern.
-    Modifies output_image_uint8 in place.
+    Applies checkerboard dithering with a distance-ratio gate to prevent 
+    noise in solid/pure color areas.
     """
-    height, width, _ = image_float_input.shape
-    num_palette_colors = palette_float.shape[0]
+    height, width, _ = image_float.shape
+    num_colors = palette_float.shape[0]
 
-    if num_palette_colors == 0: # Should ideally be caught by caller
-        for y_idx in range(height):
-            for x_idx in range(width):
-                output_image_uint8[y_idx, x_idx, 0] = 0
-                output_image_uint8[y_idx, x_idx, 1] = 0
-                output_image_uint8[y_idx, x_idx, 2] = 0
-        return
+    for y in range(height):
+        for x in range(width):
+            px = image_float[y, x]
+            
+            # Find the two closest palette colors
+            d1, d2 = 1e20, 1e20
+            idx1, idx2 = 0, 0
 
-    if num_palette_colors == 1: # Only one color in palette
-        color_val_r = palette_uint8[0, 0]
-        color_val_g = palette_uint8[0, 1]
-        color_val_b = palette_uint8[0, 2]
-        for y_idx in range(height):
-            for x_idx in range(width):
-                output_image_uint8[y_idx, x_idx, 0] = color_val_r
-                output_image_uint8[y_idx, x_idx, 1] = color_val_g
-                output_image_uint8[y_idx, x_idx, 2] = color_val_b
-        return
-
-    # Main logic for num_palette_colors >= 2
-    for y_idx in range(height):
-        for x_idx in range(width):
-            current_pixel_float_r = image_float_input[y_idx, x_idx, 0]
-            current_pixel_float_g = image_float_input[y_idx, x_idx, 1]
-            current_pixel_float_b = image_float_input[y_idx, x_idx, 2]
-
-            # Find 1st closest color index
-            min_dist_sq1 = np.inf
-            idx1 = 0
-            for i in range(num_palette_colors):
-                d_r1 = current_pixel_float_r - palette_float[i, 0]
-                d_g1 = current_pixel_float_g - palette_float[i, 1]
-                d_b1 = current_pixel_float_b - palette_float[i, 2]
-                dist_sq = d_r1**2 + d_g1**2 + d_b1**2
-                if dist_sq < min_dist_sq1:
-                    min_dist_sq1 = dist_sq
+            for i in range(num_colors):
+                pal_c = palette_float[i]
+                dist_sq = (px[0] - pal_c[0])**2 + \
+                          (px[1] - pal_c[1])**2 + \
+                          (px[2] - pal_c[2])**2
+                
+                if dist_sq < d1:
+                    d2 = d1
+                    idx2 = idx1
+                    d1 = dist_sq
                     idx1 = i
-            
-            # Find 2nd closest color index (must be different from idx1)
-            min_dist_sq2 = np.inf
-            idx2 = 0 # Default initialization
-            # Ensure idx2 starts as a different index if possible, otherwise will find it in loop
-            if num_palette_colors > 1 and idx1 == 0:
-                idx2 = 1 
-            elif num_palette_colors > 1 and idx1 != 0:
-                idx2 = 0
-            # If num_palette_colors is 1, this block is skipped, and idx2 will remain 0 (same as idx1)
-            # which is fine, as single color case is handled above.
-
-            found_second = False
-            for i in range(num_palette_colors):
-                if i == idx1:
-                    continue
-                d_r2 = current_pixel_float_r - palette_float[i, 0]
-                d_g2 = current_pixel_float_g - palette_float[i, 1]
-                d_b2 = current_pixel_float_b - palette_float[i, 2]
-                dist_sq = d_r2**2 + d_g2**2 + d_b2**2
-                if dist_sq < min_dist_sq2:
-                    min_dist_sq2 = dist_sq
+                elif dist_sq < d2:
+                    d2 = dist_sq
                     idx2 = i
-                    found_second = True
-            
-            # If the closest colour is an exact match (error is zero), always choose that one
-            if min_dist_sq1 == 0.0:
-                chosen_idx = idx1
-            elif not found_second and num_palette_colors > 1:
-                # Fallback if only one distinct color found despite num_palette_colors > 1
-                # This can happen if all other colors are much further away.
-                chosen_idx = idx1
-            else: # Otherwise alternate between closest and second closest colour
-                chosen_idx = idx1 if (x_idx + y_idx) % 2 == 0 else idx2
-            
-            chosen_color_r = palette_uint8[chosen_idx, 0]
-            chosen_color_g = palette_uint8[chosen_idx, 1]
-            chosen_color_b = palette_uint8[chosen_idx, 2]
-            output_image_uint8[y_idx, x_idx, 0] = chosen_color_r
-            output_image_uint8[y_idx, x_idx, 1] = chosen_color_g
-            output_image_uint8[y_idx, x_idx, 2] = chosen_color_b
 
+            # Calculate distance ratio: 0.0 (at idx1) to 0.5 (midpoint)
+            dist1 = np.sqrt(d1)
+            dist2 = np.sqrt(d2)
+            denom = dist1 + dist2
+            
+            if denom < 1e-7:
+                fraction = 0.0
+            else:
+                fraction = dist1 / denom
+
+            # TECHNIQUE: Distance-Ratio Gating
+            # We only apply the pattern if we are significantly away from a pure color.
+            # A threshold of 0.25 means the checkerboard only appears when the color 
+            # is in the middle 50% of the transition between two palette entries.
+            gate_threshold = 0.25
+            
+            if fraction > gate_threshold:
+                # Checkerboard pattern: alternate idx1 and idx2
+                if (x + y) % 2 == 0:
+                    output_uint8[y, x] = palette_uint8[idx2]
+                else:
+                    output_uint8[y, x] = palette_uint8[idx1]
+            else:
+                # Solid color: stay with the closest match
+                output_uint8[y, x] = palette_uint8[idx1]
 
 @nb.njit(cache=True)
 def _apply_ordered_dithering_numba_optimized(
@@ -330,6 +342,376 @@ def _apply_ordered_dithering_numba_optimized(
             output_image_uint8[y_idx, x_idx, 1] = palette_uint8[chosen_idx, 1]
             output_image_uint8[y_idx, x_idx, 2] = palette_uint8[chosen_idx, 2]
 
+# This is the core, high-performance HAM6 processing loop.
+# By using Numba, this Python code is compiled to fast machine code.
+@nb.njit(cache=True)
+def _convert_to_ham6_numba(
+    quantized_img_12bit: np.ndarray,
+    palette_12bit: np.ndarray,
+    output_img_12bit: np.ndarray
+) -> np.ndarray:
+    """
+    Numba-accelerated function to apply HAM6 encoding to a 12-bit image.
+    Modifies and returns output_img_12bit.
+    """
+    height, width, _ = quantized_img_12bit.shape
+
+    for y in range(height):
+        # 1. Start each scanline with a SET operation from the base palette
+        target_pixel = quantized_img_12bit[y, 0]
+
+        # Find the closest color in the palette for the first pixel
+        min_dist_sq = np.inf
+        best_idx = 0
+        for i in range(palette_12bit.shape[0]):
+            dist_sq = np.sum((target_pixel - palette_12bit[i])**2)
+            if dist_sq < min_dist_sq:
+                min_dist_sq = dist_sq
+                best_idx = i
+
+        previous_color = palette_12bit[best_idx]
+        output_img_12bit[y, 0] = previous_color
+
+        # 2. Process the rest of the scanline
+        for x in range(1, width):
+            target_pixel = quantized_img_12bit[y, x]
+
+            # --- Option 1: SET operation ---
+            # Find the closest color in the base palette
+            min_dist_set_sq = np.inf
+            best_palette_color = palette_12bit[0]
+            for i in range(palette_12bit.shape[0]):
+                dist = np.sum((target_pixel - palette_12bit[i])**2)
+                if dist < min_dist_set_sq:
+                    min_dist_set_sq = dist
+                    best_palette_color = palette_12bit[i]
+
+            # --- Options 2-4: MODIFY operations ---
+            # Modify Red
+            mod_r_color = np.array([target_pixel[0], previous_color[1], previous_color[2]])
+            dist_mod_r_sq = np.sum((target_pixel - mod_r_color)**2)
+
+            # Modify Green
+            mod_g_color = np.array([previous_color[0], target_pixel[1], previous_color[2]])
+            dist_mod_g_sq = np.sum((target_pixel - mod_g_color)**2)
+
+            # Modify Blue
+            mod_b_color = np.array([previous_color[0], previous_color[1], target_pixel[2]])
+            dist_mod_b_sq = np.sum((target_pixel - mod_b_color)**2)
+
+            # --- Find the best operation (the one with the minimum color error) ---
+            costs = np.array([min_dist_set_sq, dist_mod_r_sq, dist_mod_g_sq, dist_mod_b_sq])
+            best_op_idx = np.argmin(costs)
+
+            # Apply the best operation and update the state for the next pixel
+            if best_op_idx == 0:
+                output_img_12bit[y, x] = best_palette_color
+            elif best_op_idx == 1:
+                output_img_12bit[y, x] = mod_r_color
+            elif best_op_idx == 2:
+                output_img_12bit[y, x] = mod_g_color
+            else: # best_op_idx == 3
+                output_img_12bit[y, x] = mod_b_color
+
+            previous_color = output_img_12bit[y, x]
+
+    return output_img_12bit
+
+def apply_ham6_conversion(
+    image_np: np.ndarray,
+    palette_generator_func,
+    verbose: int = 1
+) -> np.ndarray:
+    """
+    Main wrapper function to convert an 8-bit RGB image to HAM6.
+
+    Args:
+        image_np: The input image as a NumPy array (H, W, 3) of type uint8.
+        palette_generator_func: A function (e.g., generate_palette_median_cut)
+                                that takes an image and num_colors and returns a palette.
+        verbose: Verbosity level.
+
+    Returns:
+        The HAM6 converted image as a NumPy array (H, W, 3) of type uint8.
+    """
+    if verbose > 1:
+        print("Applying HAM6 conversion...")
+
+    # Convert RGB888 to RGB444 with rounding, ensuring no overflow.
+    quantized_img_12bit = (image_np >> 4).astype(np.uint8)
+
+    # 2. Generate a 16-color base palette using the provided generator
+    # The palette is also generated from the 12-bit color space.
+    if verbose > 1:
+        print("Generating 16-color base palette for HAM6...")
+    palette_8bit = palette_generator_func(quantized_img_12bit, num_colors=16)
+    palette_12bit = (palette_8bit).astype(np.uint8) # Ensure palette is also 4-bit per channel
+
+    # 3. Prepare an output buffer and run the fast Numba conversion
+    output_img_12bit = np.zeros_like(quantized_img_12bit)
+
+    # The first run will compile the Numba function, subsequent runs will be faster.
+    ham_image_12bit = _convert_to_ham6_numba(
+        quantized_img_12bit, palette_12bit, output_img_12bit
+    )
+
+    # 4. De-quantize the 4-bit result back to 8-bit (0-255) for display/saving.
+    # We multiply by 17, which correctly maps the 4-bit range [0, 15] to the
+    # 8-bit range [0, 255] (since 15 * 17 = 255).
+    final_image_data_8bit = ham_image_12bit * 17
+
+    return final_image_data_8bit
+
+def apply_ehb_conversion(
+    image_np: np.ndarray,
+    verbose: int = 1
+) -> np.ndarray:
+    """
+    Converts an image to Amiga Extra Half-Brite (EHB) mode.
+    This involves creating an optimal 32-color palette and its 32 half-bright
+    counterparts, for a total of 64 colors. (Corrected Version)
+    """
+    if verbose > 1:
+        print("Applying EHB conversion...")
+    
+    h, w, _ = image_np.shape
+    pixels = image_np.reshape(-1, 3)
+
+    # 1. --- Optimal Palette Generation ---
+    # This part of the logic was correct. We create an augmented color set
+    # to help K-Means find a palette that works well for both bright and dark colors.
+    if verbose > 2:
+        print("  - Creating augmented color set for EHB palette optimization...")
+    
+    pixels_float = pixels.astype(np.float32)
+    doubled_pixels_float = np.clip(pixels_float * 2.0, 0, 255)
+    augmented_colors = np.vstack((pixels_float, doubled_pixels_float))
+
+    if verbose > 2:
+        print(f"  - Running MiniBatchKMeans on {len(augmented_colors)} candidate colors...")
+    
+    kmeans = MiniBatchKMeans(
+        n_clusters=32,
+        random_state=42,
+        batch_size=8192,
+        n_init='auto'
+    )
+    kmeans.fit(augmented_colors)
+    base_palette_32 = kmeans.cluster_centers_.astype(np.uint8)
+
+    # 2. --- Create the full 64-color EHB palette ---
+    half_brite_palette_32 = (base_palette_32 >> 1)
+    full_ehb_palette_64 = np.vstack((base_palette_32, half_brite_palette_32))
+
+    # 3. --- Map the original image to the final 64-color palette ---
+    if verbose > 2:
+        print("  - Mapping original image to the 64-color EHB palette...")
+
+    # The original pixels and the final palette MUST be cast to a float or
+    # signed integer type before subtraction to prevent uint8 "wrap-around" errors.
+    palette_float = full_ehb_palette_64.astype(np.float32)
+    # The `pixels_float` variable from the palette generation can be reused here.
+
+    # This calculation is now mathematically correct.
+    distances_sq = np.sum((pixels_float[:, np.newaxis, :] - palette_float)**2, axis=2)
+    
+    best_palette_indices = np.argmin(distances_sq, axis=1)
+    
+    # Create the final image by indexing into the original uint8 palette.
+    final_image_np = full_ehb_palette_64[best_palette_indices].reshape(h, w, 3)
+
+    return final_image_np
+
+@nb.njit(cache=True)
+def _convert_scanline_to_ham_numba(
+    scanline_12bit: np.ndarray,
+    palette_12bit: np.ndarray,
+    output_scanline_12bit: np.ndarray
+) -> np.ndarray:
+    """
+    Numba-accelerated function to apply HAM encoding to a single scanline.
+    This is the core logic reused by both HAM6 and SHAM.
+    """
+    width, _ = scanline_12bit.shape
+
+    # 1. Start scanline with a SET operation from the per-scanline palette
+    target_pixel = scanline_12bit[0]
+    min_dist_sq = np.inf
+    best_idx = 0
+    for i in range(palette_12bit.shape[0]):
+        dist_sq = np.sum((target_pixel - palette_12bit[i])**2)
+        if dist_sq < min_dist_sq:
+            min_dist_sq = dist_sq
+            best_idx = i
+    
+    previous_color = palette_12bit[best_idx]
+    output_scanline_12bit[0] = previous_color
+
+    # 2. Process the rest of the scanline
+    for x in range(1, width):
+        target_pixel = scanline_12bit[x]
+
+        # Find best SET operation
+        min_dist_set_sq = np.inf
+        best_palette_color = palette_12bit[0]
+        for i in range(palette_12bit.shape[0]):
+            dist = np.sum((target_pixel - palette_12bit[i])**2)
+            if dist < min_dist_set_sq:
+                min_dist_set_sq = dist
+                best_palette_color = palette_12bit[i]
+
+        # Calculate MODIFY costs
+        mod_r_color = np.array([target_pixel[0], previous_color[1], previous_color[2]])
+        dist_mod_r_sq = np.sum((target_pixel - mod_r_color)**2)
+        mod_g_color = np.array([previous_color[0], target_pixel[1], previous_color[2]])
+        dist_mod_g_sq = np.sum((target_pixel - mod_g_color)**2)
+        mod_b_color = np.array([previous_color[0], previous_color[1], target_pixel[2]])
+        dist_mod_b_sq = np.sum((target_pixel - mod_b_color)**2)
+
+        # Find the best operation
+        costs = np.array([min_dist_set_sq, dist_mod_r_sq, dist_mod_g_sq, dist_mod_b_sq])
+        best_op_idx = np.argmin(costs)
+        
+        # Apply and update state
+        if best_op_idx == 0:
+            output_scanline_12bit[x] = best_palette_color
+        elif best_op_idx == 1:
+            output_scanline_12bit[x] = mod_r_color
+        elif best_op_idx == 2:
+            output_scanline_12bit[x] = mod_g_color
+        else:
+            output_scanline_12bit[x] = mod_b_color
+        previous_color = output_scanline_12bit[x]
+            
+    return output_scanline_12bit
+
+def apply_sham_conversion(
+    image_np: np.ndarray,
+    palette_generator_func,
+    verbose: int = 1
+) -> np.ndarray:
+    """
+    Converts an image to Sliced HAM (SHAM) mode. A 16-color palette is
+    generated for each scanline before applying HAM logic.
+    """
+    if verbose > 1:
+        print("Applying SHAM conversion...")
+    
+    h, w, _ = image_np.shape
+    image_12bit = (image_np >> 4).astype(np.uint8)
+    output_image_12bit = np.zeros_like(image_12bit)
+
+    for y in range(h):
+        scanline_for_palette_gen = image_12bit[y].reshape(1, w, 3)
+        palette_12bit = palette_generator_func(scanline_for_palette_gen, num_colors=16)        
+        scanline_12bit = image_12bit[y]
+        output_scanline_12bit = np.zeros_like(scanline_12bit)
+        output_image_12bit[y] = _convert_scanline_to_ham_numba(
+            scanline_12bit, palette_12bit, output_scanline_12bit
+        )
+        
+    final_image_data_8bit = output_image_12bit * 17
+    return final_image_data_8bit
+
+# Insert this new Numba helper function right after _convert_scanline_to_ham_numba
+@nb.njit(cache=True)
+def _map_scanline_to_palette_numba(
+    scanline_12bit: np.ndarray,
+    palette_12bit: np.ndarray,
+    output_scanline_12bit: np.ndarray
+) -> np.ndarray:
+    """
+    Numba-accelerated function to map a single scanline's pixels to the
+    closest color in a small, per-scanline palette (Direct Color Mapping).
+    This is the core logic for the 'Dynamic Hires' mode.
+    """
+    width, _ = scanline_12bit.shape
+    num_palette_colors = palette_12bit.shape[0]
+
+    # Pre-calculate squared palette colors (since we're working in the 12-bit space)
+    # The palette is in the 12-bit space (0-15 per channel).
+    
+    for x in range(width):
+        target_pixel = scanline_12bit[x]
+        
+        min_dist_sq = np.inf
+        best_idx = 0
+        
+        # Find the closest color in the palette
+        for i in range(num_palette_colors):
+            # Calculate squared Euclidean distance in the 12-bit space
+            dist_sq = (target_pixel[0] - palette_12bit[i, 0])**2 + \
+                      (target_pixel[1] - palette_12bit[i, 1])**2 + \
+                      (target_pixel[2] - palette_12bit[i, 2])**2
+            
+            if dist_sq < min_dist_sq:
+                min_dist_sq = dist_sq
+                best_idx = i
+        
+        # Assign the best color (which is already in 12-bit format)
+        output_scanline_12bit[x] = palette_12bit[best_idx]
+            
+    return output_scanline_12bit
+
+# Insert this main conversion function right after apply_sham_conversion
+def apply_dynamic_hires_conversion(
+    image_np: np.ndarray,
+    palette_generator_func,
+    verbose: int = 1
+) -> np.ndarray:
+    """
+    Converts an image using the Dynamic Hires technique (NewTek-style).
+    A 16-color palette is generated for each scanline using stable K-Means,
+    and then the scanline is directly mapped (quantized) to that palette.
+    """
+    from sklearn.cluster import MiniBatchKMeans
+    
+    if verbose > 1:
+        print("Applying Dynamic Hires conversion (Per-scanline 16-color direct map) with stable K-Means...")
+    
+    h, w, _ = image_np.shape
+    # Convert RGB888 to the working 12-bit color space (RGB444) by right-shifting
+    image_12bit = (image_np >> 4).astype(np.uint8)
+    output_image_12bit = np.zeros_like(image_12bit)
+
+    for y in range(h):
+        # 1. Use the full 8-bit color data of the scanline for stable palette generation.
+        scanline_for_palette_gen_8bit = image_np[y].reshape(-1, 3) # (W, 3)
+
+        # Force use of MiniBatchKMeans for stability and speed, which overrides 
+        # the potential instability of the passed-in palette_generator_func.
+        kmeans = MiniBatchKMeans(
+            n_clusters=16,
+            random_state=42, # Use a fixed seed for max stability and deterministic results
+            batch_size=min(w, 8192),
+            n_init='auto'
+        )
+        # Handle the case where the scanline has fewer than 16 unique colors
+        try:
+            kmeans.fit(scanline_for_palette_gen_8bit)
+            
+            # Quantize the resulting palette centers to the 4-bit per channel range [0-15]
+            palette_centers_8bit = kmeans.cluster_centers_.astype(np.uint8)
+            palette_12bit = (palette_centers_8bit >> 4).astype(np.uint8)
+        except ValueError:
+            # If K-Means fails (e.g., fewer than 16 samples), fall back to a simple palette
+            # This is likely the warning you saw. We fall back to Median Cut on the 12-bit data.
+            palette_12bit_full = palette_generator_func(image_12bit[y].reshape(1, w, 3), num_colors=16)
+            palette_12bit = (palette_12bit_full >> 4).astype(np.uint8) # Ensure it's 4-bit effective range
+        
+        # 2. Map the current scanline to its per-line 16-color palette
+        scanline_12bit = image_12bit[y]
+        output_scanline_12bit = np.zeros_like(scanline_12bit)
+        
+        output_image_12bit[y] = _map_scanline_to_palette_numba(
+            scanline_12bit, 
+            palette_12bit, 
+            output_scanline_12bit
+        )
+        
+    # 3. De-quantize the 4-bit result back to 8-bit (0-255) for display/saving.
+    final_image_data_8bit = output_image_12bit * 17
+    return final_image_data_8bit
 
 # --- Dither Matrices (Module-level constants) ---
 
@@ -396,8 +778,8 @@ def reduce_color_depth_and_dither(
     image_np: np.ndarray,
     color_space: str,
     target_palette_size: int = None,
-    dithering_method: str = 'none',
-    palette_algorithm: str = 'kmeans',  # New parameter
+    dithering_method: str = 'None',
+    palette_algorithm: str = 'kmeans',
     verbose: int = 1
 ) -> np.ndarray:
     """
@@ -409,11 +791,11 @@ def reduce_color_depth_and_dither(
         color_space: Target color space for initial grid quantization ('RGB888', 'RGB565', 'RGB444', 'RGB555' or 'RGB666').
                      If 'RGB888', no initial grid quantization is applied when generating palette.
                      This argument primarily affects palette generation if target_palette_size is set.
-        target_palette_size: Optional. The number of colors in the final palette (16, 32, 64, 128, 256, 512, 1024, 2048, 4096).
+        target_palette_size: Optional. The number of colors in the final palette (16, 24, 32, 64, 128, 256, 512, 1024, 2048, 4096).
                              If None, the palette is determined by the color_space grid (for 444/565/666 if dither='none')
                              or the full RGB888 space (if color_space is RGB888 and dither='none').
                              Note: Dithering (error diffusion, checkerboard, or ordered) requires target_palette_size to be specified.
-        dithering_method: The dithering method ('none', 'checkerboard', 'bayer2x2', 'bayer4x4', 'bayer8x8', 'floyd-steinberg', etc.).
+        dithering_method: The dithering method ('None', 'checkerboard', 'bayer2x2', 'bayer4x4', 'bayer8x8', 'floyd-steinberg', etc.).
 
     Returns:
         A NumPy array representing the processed image (height, width, 3)
@@ -426,11 +808,11 @@ def reduce_color_depth_and_dither(
     if color_space not in valid_color_spaces:
         raise ValueError(f"color_space must be one of {valid_color_spaces}.")
 
-    valid_palette_sizes = [None, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+    valid_palette_sizes = [None, 2, 4, 8, 16, 24, 32, 64, 128, 256, 512, 1024, 2048, 4096]
     if target_palette_size not in valid_palette_sizes:
         raise ValueError(f"target_palette_size must be one of {valid_palette_sizes}.")
 
-    valid_methods = ['none', 'checkerboard', 'bayer2x2', 'bayer4x4', 'bayer8x8'] + list(DIFFUSION_MAPS.keys())
+    valid_methods = ['None', 'checkerboard', 'bayer2x2', 'bayer4x4', 'bayer8x8'] + list(DIFFUSION_MAPS.keys())
     if dithering_method not in valid_methods:
         raise ValueError(f"dithering_method must be one of {valid_methods}.")
 
@@ -446,7 +828,7 @@ def reduce_color_depth_and_dither(
     palette_float = None
 
     # Dithering methods (checkerboard, error diffusion, ordered) require a specific palette size
-    if dithering_method != 'none' and target_palette_size is None:
+    if dithering_method != 'None' and target_palette_size is None:
         raise ValueError(f"Dithering method '{dithering_method}' requires 'target_palette_size' to be specified.")
 
     if target_palette_size is not None:
@@ -496,12 +878,18 @@ def reduce_color_depth_and_dither(
         if verbose > 1:
             print(f"Palette calculation took {end_time - start_time:.2f} seconds.")
 
+        # Here we make sure that the palette always hold the pure black colour.
+        # If it is not already in the palette we add it extra to the palette.
+        black_pixel = np.array([0, 0, 0], dtype=np.uint8)
+        if not np.any(np.all(target_palette_8bit == black_pixel, axis=1)):
+            target_palette_8bit = np.vstack((target_palette_8bit, black_pixel))
+  
         palette_float = target_palette_8bit.astype(np.float64)
 
     # --- Apply Dithering or direct mapping ---
     img_output_np = np.zeros_like(image_np) # Initialize output image
 
-    if dithering_method == 'none':
+    if dithering_method == 'None':
         if target_palette_size is None:
             if color_space == 'RGB888':
                  if verbose > 1: print("No color reduction, palette, or dithering. Returning original image.")
@@ -533,7 +921,7 @@ def reduce_color_depth_and_dither(
         if target_palette_8bit is None or palette_float is None: # Should be caught by earlier check
             raise ValueError("Checkerboard dithering requires a target_palette_size to be specified, "
                              "which defines the palette for dithering.")
-        
+
         if verbose > 1:
             print(f"Applying checkerboard dithering with {target_palette_8bit.shape[0]}-color palette.")
 
@@ -550,7 +938,7 @@ def reduce_color_depth_and_dither(
     elif dithering_method.startswith('bayer'):
         if target_palette_8bit is None or palette_float is None: # Should be caught by earlier check
             raise ValueError(f"Bayer dithering ('{dithering_method}') requires a target_palette_size to be specified.")
-        
+
         dither_matrix = None
         if dithering_method == 'bayer2x2':
             dither_matrix = BAYER_MATRIX_2X2
@@ -558,7 +946,7 @@ def reduce_color_depth_and_dither(
             dither_matrix = BAYER_MATRIX_4X4
         elif dithering_method == 'bayer8x8':
             dither_matrix = BAYER_MATRIX_8X8
-        
+
         if dither_matrix is None:
             raise ValueError(f"Unknown Bayer dithering method: {dithering_method}")
 
@@ -568,7 +956,7 @@ def reduce_color_depth_and_dither(
 
         if verbose > 1:
             print(f"Applying {dithering_method} dithering with {target_palette_8bit.shape[0]}-color palette.")
-        
+
         img_output_np = np.zeros_like(image_np, dtype=np.uint8)
         image_for_dither_float = image_np.astype(np.float64)
 
@@ -584,7 +972,7 @@ def reduce_color_depth_and_dither(
         if target_palette_8bit is None or palette_float is None: # Should be caught by earlier check
              raise RuntimeError(f"Error diffusion dithering ('{dithering_method}') requires a palette. "
                                 "Ensure target_palette_size is specified.")
-        
+
         diff_map_list = DIFFUSION_MAPS[dithering_method]
         img_float_dither = image_np.astype(np.float64).copy() # Numba function modifies this copy
 
@@ -596,7 +984,7 @@ def reduce_color_depth_and_dither(
         if verbose > 1:
             print(f"Dithering took {end_time - start_time:.2f} seconds.")
         img_output_np = np.clip(img_float_dither, 0, 255).astype(np.uint8)
-    
+
     return img_output_np.astype(np.uint8)
 
 

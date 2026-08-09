@@ -21,7 +21,6 @@ except ImportError:
 #   dithering_method: String, 'None' or a key from DIFFUSION_MAPS.
 try:
     from quantize import DIFFUSION_MAPS, reduce_color_depth_and_dither
-    # Add 'None' as a valid dithering method string if your quantize doesn't handle it explicitly
     _all_dither_methods = ['None', 'checkerboard', 'bayer2x2', 'bayer4x4', 'bayer8x8'] + list(DIFFUSION_MAPS.keys())
 except ImportError:
     warnings.warn("Could not import quantization module (quantize.py). Quantization and dithering styles will not work.")
@@ -160,7 +159,7 @@ def get_crop_and_pad(image_pil: Image.Image, crop_x: int, crop_y: int, crop_w: i
 def apply_rotation(image_pil: Image.Image, angle_degrees: int, supersample_factor: int = 2, pil_filter=Image.Resampling.BICUBIC) -> Image.Image:
     """
     Rotates a PIL image by a specified angle in degrees.
-    Uses the LANCZOS resampling filter for quality.
+    Uses the NEAREST resampling filter for quality.
     Applies Anti-Aliasing using the super_sample factor.
     The canvas is expanded to include the entire rotated image without cropping.
     Returns a new PIL Image object.
@@ -281,7 +280,7 @@ def apply_resolution_style(image_pil: Image.Image, style: str) -> Image.Image:
 
     return output_pil
 
-def pre_apply_resolution_style(image_pil: Image.Image, style: str) -> Image.Image:
+def pre_apply_resolution_style(image_pil: Image.Image, style: str, pil_filter=Image.Resampling.BICUBIC) -> Image.Image:
     """
     Applies resolution style effects (like pixel simulation or interlacing) to a PIL image.
     The input image is expected to be the size of the target crop (W x H).
@@ -301,15 +300,15 @@ def pre_apply_resolution_style(image_pil: Image.Image, style: str) -> Image.Imag
     if style == 'lores':
         # Simulate 2x2 source pixels mapping to 1 visual pixel (blocky 2x2 pixels).
         # Downscale by 2x2
-        output_pil = output_pil.resize((w // 2, h // 2), Image.Resampling.BICUBIC)
+        output_pil = output_pil.resize((w // 2, h // 2), pil_filter)
     elif style == 'lores_laced':
         # Simulate 2x1 source pixels mapping to 1 visual pixel width (blocky 2x1 pixels) + interlacing.
         # Downscale width by 2
-        output_pil = output_pil.resize((w // 2, h), Image.Resampling.BICUBIC)
+        output_pil = output_pil.resize((w // 2, h), pil_filter)
     elif style == 'hires':
         # Simulate 1x2 source pixels mapping to 1 visual pixel height (blocky 1x2 pixels) + interlacing.
         # Downscale height by 2
-        output_pil = output_pil.resize((w, h // 2), Image.Resampling.BICUBIC)
+        output_pil = output_pil.resize((w, h // 2), pil_filter)
     elif style == 'hires_laced':
         pass
 

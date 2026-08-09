@@ -6,6 +6,7 @@ from diskcache import Cache
 
 DEFAULT_TRAIN_CACHE_FILE = '.train_scan_cache'
 DEFAULT_TEST_CACHE_FILE = '.test_scan_cache'
+DEFAULT_OUTPUT_CACHE_FILE = '.output_scan_cache'
 
 class ScanCache:
     """

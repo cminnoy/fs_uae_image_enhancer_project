@@ -9,11 +9,21 @@ import time
 from datetime import timedelta 
 import warnings
 import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import math
 import re
-from quantize import reduce_color_depth_and_dither, DIFFUSION_MAPS
-from cache import ScanCache, DEFAULT_TRAIN_CACHE_FILE, DEFAULT_TEST_CACHE_FILE
+from quantize import (
+    reduce_color_depth_and_dither,
+    generate_palette_median_cut,
+    generate_palette_octree,
+    apply_ham6_conversion,
+    apply_ehb_conversion,
+    apply_sham_conversion,
+    DIFFUSION_MAPS
+)
+from cache import ScanCache, DEFAULT_TRAIN_CACHE_FILE, DEFAULT_TEST_CACHE_FILE, DEFAULT_OUTPUT_CACHE_FILE
 import signal
+from sklearn.cluster import KMeans
 
 stop_processing = False
 
@@ -33,6 +43,195 @@ except ImportError:
     print("Please ensure util.py is in the same directory.")
     exit(1)
 
+class DatasetScannerMixin:
+    """
+    Mixin class containing the optimized scanning operations. 
+    Inherit this in your main dataset generator class.
+    """
+
+    def _scan_output_directory(self):
+        """
+        Scans output directory using multithreading and fast tuple matching.
+        Delegates directory processing to a ThreadPoolExecutor.
+        """
+        if self.verbose >= 1:
+            print(f"Scanning output directory for existing files: {self.dest_dir}")
+
+        overall_start_time = time.time()
+
+        for split in ['train', 'test']:
+            split_dir = os.path.join(self.dest_dir, split)
+            if not os.path.isdir(split_dir):
+                continue
+
+            split_start_time = time.time()
+
+            # 1. Fast traversal: Grab subdirectories immediately via os.scandir
+            print(f"Scanning split '{split}' for existing files...")
+            scandir_start = time.time()
+            try:
+                subdirs = [
+                    (entry.path, entry.name) 
+                    for entry in os.scandir(split_dir) 
+                    if entry.is_dir()
+                ]
+            except OSError:
+                continue
+            scandir_time = time.time() - scandir_start
+
+            if self.verbose >= 1:
+                print(f"Found {len(subdirs)} subdirectories in split '{split}' to scan for existing files.")
+            if self.verbose >= 2:
+                print(f"  [TIMING] os.scandir took {scandir_time:.2f}s for {len(subdirs)} directories")
+
+            # 2. Parallel Processing: Use Threads instead of Processes to share 
+            # the massive 181M memory footprint of self.full_valid_output_specs
+            max_threads = min(32, (os.cpu_count() or 4) * 2)
+            if self.verbose >= 1:
+                print(f"Processing subdirectories in parallel with up to {max_threads} threads...")
+
+            thread_submit_start = time.time()
+            with ThreadPoolExecutor(max_workers=max_threads) as executor:
+                # Submit worker tasks for each subdirectory
+                futures = {
+                    executor.submit(self._process_single_directory, path, name, split): path 
+                    for path, name in subdirs
+                }
+            thread_submit_time = time.time() - thread_submit_start
+
+            if self.verbose >= 2:
+                print(f"  [TIMING] Created {len(futures)} thread tasks in {thread_submit_time:.2f}s")
+
+            # Process futures as they complete and collect timing data
+            processing_start = time.time()
+            processed_count = 0
+            merge_times = []
+
+            for future in as_completed(futures):
+                if getattr(self, 'stop_requested', False):
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    return
+
+                merge_start = time.time()
+                # Merge the isolated results back into the main state
+                local_invalid, local_targets, local_styles = future.result()
+
+                if local_invalid:
+                    self.invalid_files[split].extend(local_invalid)
+                if local_targets:
+                    self.existing_target_specs[split].update(local_targets)
+                if local_styles:
+                    self.existing_output_specs[split].update(local_styles)
+
+                merge_time = time.time() - merge_start
+                merge_times.append(merge_time)
+                processed_count += 1
+
+                if self.verbose >= 2 and processed_count % max(1, len(futures) // 10) == 0:
+                    elapsed = time.time() - processing_start
+                    print(f"  [TIMING] Processed {processed_count}/{len(futures)} directories in {elapsed:.2f}s ({elapsed/processed_count:.3f}s per dir)")
+
+            processing_time = time.time() - processing_start
+            split_time = time.time() - split_start_time
+
+            if self.verbose >= 2:
+                avg_merge_time = sum(merge_times) / len(merge_times) if merge_times else 0
+                print(f"  [TIMING] Split '{split}' processing: {processing_time:.2f}s ({processing_time/len(futures):.3f}s/dir)")
+                print(f"  [TIMING] Average merge time per result: {avg_merge_time*1000:.2f}ms")
+                print(f"  [TIMING] Total split '{split}' time: {split_time:.2f}s")
+                print(f"    - Directory listing: {scandir_time:.2f}s")
+                print(f"    - Worker processing: {processing_time:.2f}s")
+
+        overall_time = time.time() - overall_start_time
+        if self.verbose >= 2:
+            print(f"  [TIMING] Total _scan_output_directory time: {overall_time:.2f}s")
+
+    def _process_single_directory(self, root, folder_name, split):
+        """
+        Worker method to process files within a single subdirectory.
+        Optimized to recognize all valid files regardless of target existence.
+        """
+        if self.verbose >= 2:
+            dir_start_time = time.time()
+
+        local_invalid = []
+        local_targets = set()
+        local_styles = set()
+
+        # O(1) reverse lookup of the source image path
+        original_img_path = self._resolve_source_path(folder_name, split)
+        if not original_img_path:
+            return local_invalid, local_targets, local_styles
+
+        try:
+            # os.scandir is significantly faster than os.listdir/os.walk
+            entries = os.scandir(root)
+        except OSError:
+            return local_invalid, local_targets, local_styles
+
+        entry_count = 0
+        parse_time = 0
+        lookup_time = 0
+        verify_time = 0
+
+        for entry in entries:
+            if getattr(self, 'stop_requested', False): break
+            if not entry.is_file():
+                continue
+
+            entry_count += 1
+
+            parse_start = time.time()
+            parsed = parse_generated_filename(entry.name, verbose=False)
+            parse_time += time.time() - parse_start
+
+            if not parsed:
+                continue
+
+            lookup_start = time.time()
+            # Case 1: Processing a target file
+            if parsed['type'] == 'target':
+                spec = (original_img_path, parsed['crop_x'], parsed['crop_y'], 
+                        parsed['rot_deg'], parsed['scale_perc'])
+
+                if spec in self.full_valid_target_specs[split]:
+                    verify_start = time.time()
+                    if self._verify_file_dimensions(entry.path):
+                        local_targets.add(spec)
+                    else:
+                        local_invalid.append(entry.path)
+                    verify_time += time.time() - verify_start
+                else:
+                    # File exists but isn't in the current configuration plan
+                    local_invalid.append(entry.path)
+
+            # Case 2: Processing a styled output file
+            elif parsed['type'] == 'style':
+                spec = (original_img_path, parsed['crop_x'], parsed['crop_y'], 
+                        parsed['rot_deg'], parsed['scale_perc'], parsed['rgb'], 
+                        parsed['pal'], parsed['dither'], parsed['resolution'])
+
+                # FIX: We no longer check if a physical 'target_' file exists. 
+                # If the style file matches the valid spec and dimensions, it's recognized.
+                if spec in self.full_valid_output_specs[split]:
+                    verify_start = time.time()
+                    if self._verify_file_dimensions(entry.path):
+                        local_styles.add(spec)
+                    else:
+                        local_invalid.append(entry.path)
+                    verify_time += time.time() - verify_start
+                else:
+                    local_invalid.append(entry.path)
+
+            lookup_time += time.time() - lookup_start
+
+        if self.verbose >= 2:
+            total_time = time.time() - dir_start_time
+            if entry_count > 0:
+                print(f"  [TIMING] Worker {folder_name}: processed {entry_count} files in {total_time:.3f}s ({parse_time*1000:.1f}ms parse, {lookup_time*1000:.1f}ms lookup, {verify_time*1000:.1f}ms verify)")
+
+        return local_invalid, local_targets, local_styles
+
 # --- Helper to Construct Filenames ---
 # This is the reverse of parsing, must match exactly for scan/match to work
 def construct_filename(params: dict, is_target: bool) -> str:
@@ -43,7 +242,6 @@ def construct_filename(params: dict, is_target: bool) -> str:
     # Check for mandatory parameters regardless of type
     if 'crop_x' not in params or 'crop_y' not in params or 'scale_perc' not in params or 'rot_deg' not in params:
          raise ValueError("Missing mandatory crop/pre-processing parameters for filename construction.")
-
 
     if is_target:
         # Target filename format: target_<X>_<Y>_s<scale>_r<rot>.png
@@ -56,7 +254,7 @@ def construct_filename(params: dict, is_target: bool) -> str:
 
         # Format palette size and dither method for filename string
         pal_str = str(params['pal']) if params['pal'] is not None else 'None'
-        dither_str = str(params['dither']) # Assuming dither name doesn't need special encoding
+        dither_str = str(params['dither'])
 
         return (
             f"{params['resolution']}_{params['crop_x']}_{params['crop_y']}_s{params['scale_perc']}_r{params['rot_deg']}"
@@ -246,9 +444,9 @@ def save_single_target_worker(target_spec, crop_w, crop_h, dest_dir, split_sourc
         with Image.open(img_path) as img_pil_full:
             img_pil_full = img_pil_full.convert("RGB")
 
-            # Apply rotation (pre-processing)
+            # Apply rotation for target (pre-processing)
             if rot_deg != 0:
-                rotated_img_pil = apply_rotation(img_pil_full, rot_deg, supersample_factor=2)
+                rotated_img_pil = apply_rotation(img_pil_full, rot_deg, supersample_factor=4, pil_filter=Image.Resampling.BICUBIC)
             else:
                 rotated_img_pil = img_pil_full.copy() # Work on a copy if no rotation
 
@@ -274,9 +472,11 @@ def save_single_target_worker(target_spec, crop_w, crop_h, dest_dir, split_sourc
             # Save the target file
             # Use a high quality PNG save
             crop_pil.save(output_path, format='PNG', quality=100)
+            mtime = os.path.getmtime(output_path)
+            size = crop_pil.size  # (width, height)
 
             # Return success status and the original target spec
-            return (target_spec, True, "")
+            return (target_spec, True, "", (mtime, size, output_path))
 
     except Exception as e:
         # Return failure status, original target spec, and error message
@@ -338,8 +538,20 @@ def parse_generated_filename(filename: str, verbose: int = 1) -> dict | None:
             dither_name = style_match.group('dither_name')
 
             # Convert palette string 'None' to actual None object
-            pal = int(pal_str) if pal_str.lower() != 'none' else None
-            if dither_name == "none": dither_name = "None"
+            if pal_str.lower() == 'none':
+                pal = None
+            elif pal_str.upper() == 'HAM6':
+                pal = 'HAM6'
+            elif pal_str.upper() == 'EHB':
+                pal = 'EHB'
+            elif pal_str.upper() == 'SHAM':
+                pal = 'SHAM'
+            elif pal_str.upper() == 'DYNAMICHIRES':
+                pal = 'DynamicHires'
+            else:
+                pal = int(pal_str)
+            if dither_name == "none":
+                dither_name = "None"
 
             # Perform basic validation on parsed values against supported constants
             if resolution not in SUPPORTED_RESOLUTION_STYLES:
@@ -359,7 +571,7 @@ def parse_generated_filename(filename: str, verbose: int = 1) -> dict | None:
                 'rot_deg': rot_deg,     # Pre-processing rotation angle
                 'resolution': resolution, # Resolution style
                 'rgb': f"RGB{rgb_val}", # Color format value
-                'pal': pal,             # Palette size (int or None)
+                'pal': pal,             # Palette size (int, HAM6, EHB, SHAM, DynamicHires or None)
                 'dither': dither_name,  # Dither method name
                 'full_filename': filename # Store the original filename
             }
@@ -407,11 +619,9 @@ def generate_and_save_styled_worker(styled_spec, crop_w_worker, crop_h_worker, d
             img_pil_full = img_pil_full.convert("RGB") # Ensure RGB mode
             # print_image_info(img_pil_full, "Initial Load/Convert", spec_info_str) # Uncomment for verbosity
 
-            # NOTE: Amiga games have a mix of images which use Anti-Aliasing, not clear yet if styled images should use AA or not.
-            #       For maximum quality, we should combine the rotation and downscaling, so the downscale of the AA does the final downscale in one step.
-
             # Apply pre-processing (rotation, scaling, cropping) resulting in a PIL Image
-            if rot_deg != 0: rotated_img_pil = apply_rotation(img_pil_full, rot_deg, supersample_factor=2) # MAYBE SET TO 1 and USE Image.Resampling.NEAREST
+            # We disable AA here use NEAREST to get closer to real Amiga images in games
+            if rot_deg != 0: rotated_img_pil = apply_rotation(img_pil_full, rot_deg, supersample_factor=1, pil_filter=Image.Resampling.NEAREST)
             else: rotated_img_pil = img_pil_full.copy()
             # print_image_info(rotated_img_pil, "Rotation", spec_info_str) # Uncomment for verbosity
 
@@ -425,7 +635,7 @@ def generate_and_save_styled_worker(styled_spec, crop_w_worker, crop_h_worker, d
             # Apply resolution style (expects PIL, assuming returns PIL)
             # Error 'mode' was previously reported here if the input was wrong.
             try:
-                processed_res_pil = pre_apply_resolution_style(crop_pil, res)
+                processed_res_pil = pre_apply_resolution_style(crop_pil, res, Image.Resampling.NEAREST)
                 if verbose_worker >= 3: print_image_info(processed_res_pil, "Resolution Styling", spec_info_str)
             except Exception as e:
                 # This is a likely spot for the 'mode' error if the input was wrong or the function returned NumPy
@@ -441,40 +651,80 @@ def generate_and_save_styled_worker(styled_spec, crop_w_worker, crop_h_worker, d
                 if verbose_worker >= 1: warnings.warn(f"Worker error converting to NumPy before quantization for {spec_info_str}: {e}", stacklevel=2)
                 return (styled_spec, False, f"Failed conversion to NumPy: {e}")
 
-
             # --- Apply quantization/palette/dither using the reduce_color_depth_and_dither function ---
-            # This function is designed to expect NumPy and return NumPy.
-            try:
-                # Arguments for reduce_color_depth_and_dither:
-                # image_np, color_space, target_palette_size=None, dithering_method='None', verbose=1
-
-                color_space_str = cs # Already a string like 'RGB888', 'RGB444'
-                palette_size_param = pal # Already int or None
-
-                # --- Correctly map the dither parameter (dm) to the string 'None' if it's None ---
-                # The styled_spec might contain None object or the string 'None'.
-                # The reduce_color_depth_and_dither function expects a string like 'None'.
-                dithering_method_param = 'None' if (dm is None or (isinstance(dm, str) and dm.lower() == 'None')) else dm.lower()
-
-                if verbose_worker >= 3: print(f"DEBUG WORKER [{spec_info_str}]: Calling reduce_color_depth_and_dither with color_space='{color_space_str}', palette={palette_size_param}, dither='{dithering_method_param}'.")
-
-                # Call the function from quantize.py (ensure you have the import)
-                processed_quantized_np = reduce_color_depth_and_dither(
-                    image_np=processed_res_np, # Pass the NumPy array input
-                    color_space=color_space_str, # Pass the color space string
-                    target_palette_size=palette_size_param, # Pass the palette size (int or None)
-                    dithering_method=dithering_method_param, # Pass the corrected dither method string ('None' or a DIFFUSION_MAPS key)
-                    palette_algorithm=palette_algorithm, # Pass the palette algorithm
-                    verbose=verbose_worker >= 2 # Pass verbosity level
+            if str(pal) == 'HAM6':
+                from quantize import apply_ham6_conversion, generate_palette_median_cut, generate_palette_octree
+                # This is a HAM6 job. Call the dedicated HAM6 converter.
+                # The HAM6 function needs a palette generator function.
+                if palette_algorithm == 'median_cut':
+                    palette_func = generate_palette_median_cut
+                elif palette_algorithm == 'octree':
+                    palette_func = generate_palette_octree
+                else: # Default to k-means logic
+                    def kmeans_palette_func(img, num_colors):
+                        pixels = img.reshape(-1, 3)
+                        kmeans = KMeans(n_clusters=num_colors, random_state=42, n_init='auto')
+                        kmeans.fit(pixels)
+                        return kmeans.cluster_centers_.astype(np.uint8)
+                    palette_func = kmeans_palette_func
+                processed_quantized_np = apply_ham6_conversion(
+                    image_np=processed_res_np,
+                    palette_generator_func=palette_func,
+                    verbose=verbose_worker
                 )
-                if verbose_worker >= 3: print_image_info(processed_quantized_np, "After reduce_color_depth_and_dither", spec_info_str)
-
-            except Exception as e:
-                # This catches errors specifically from the reduce_color_depth_and_dither call.
-                # The 'mode' error is reported as happening here.
-                if verbose_worker >= 1: warnings.warn(f"Worker error during quantization/dither ({color_space_str}, {palette_size_param}, {dithering_method_param}) for {spec_info_str}: {e}", stacklevel=2)
-                return (styled_spec, False, f"Quantization/dither failed: {e}")
-
+            elif str(pal) == 'EHB':
+                from quantize import apply_ehb_conversion
+                processed_quantized_np = apply_ehb_conversion(
+                    image_np=processed_res_np,
+                    verbose=verbose_worker
+                )
+            elif str(pal) == 'SHAM':
+                from quantize import apply_sham_conversion, generate_palette_median_cut, generate_palette_octree
+                # (Reusing the palette function selection from your ham6 logic)
+                if palette_algorithm == 'median_cut':
+                    palette_func = generate_palette_median_cut
+                elif palette_algorithm == 'octree':
+                    palette_func = generate_palette_octree
+                else: # Default to k-means logic
+                    def kmeans_palette_func(img, num_colors):
+                        pixels = img.reshape(-1, 3)
+                        kmeans = KMeans(n_clusters=num_colors, random_state=42, n_init='auto')
+                        kmeans.fit(pixels)
+                        return kmeans.cluster_centers_.astype(np.uint8)
+                    palette_func = kmeans_palette_func
+                processed_quantized_np = apply_sham_conversion(
+                    image_np=processed_res_np,
+                    palette_generator_func=palette_func,
+                    verbose=verbose_worker
+                )
+            elif str(pal) == 'DynamicHires':
+                from quantize import apply_dynamic_hires_conversion, generate_palette_median_cut, generate_palette_octree
+                if palette_algorithm == 'median_cut':
+                    palette_func = generate_palette_median_cut
+                elif palette_algorithm == 'octree':
+                    palette_func = generate_palette_octree
+                else: # Default to k-means logic
+                    def kmeans_palette_func(img, num_colors):
+                        pixels = img.reshape(-1, 3)
+                        kmeans = KMeans(n_clusters=num_colors, random_state=42, n_init='auto')
+                        kmeans.fit(pixels)
+                        return kmeans.cluster_centers_.astype(np.uint8)
+                    palette_func = kmeans_palette_func
+                processed_quantized_np = apply_dynamic_hires_conversion(
+                    image_np=processed_res_np,
+                    palette_generator_func=palette_func,
+                    verbose=verbose_worker
+                )
+            else:
+                # This is a standard palette/dither job. Call the original function.
+                processed_quantized_np = reduce_color_depth_and_dither(
+                    image_np=processed_res_np,
+                    color_space=cs,
+                    target_palette_size=pal,
+                    dithering_method=dm,
+                    palette_algorithm=palette_algorithm,
+                    verbose=verbose_worker >= 2
+                )
 
             # --- Convert NumPy array back to PIL Image for resolution styling ---
             try:
@@ -495,7 +745,8 @@ def generate_and_save_styled_worker(styled_spec, crop_w_worker, crop_h_worker, d
             # The object to save is final_output_obj. It should be a PIL Image at this point.
             styled_params_for_filename = {
                 'crop_x': crop_x, 'crop_y': crop_y, 'scale_perc': ds_perc, 'rot_deg': rot_deg,
-                'rgb': int(cs.replace('RGB', '')), 'pal': pal, 'dither': dm, 'resolution': res
+                'rgb': int(cs.replace('RGB', '')) if cs else None, 
+                'pal': pal, 'dither': dm, 'resolution': res            
             }
             styled_filename = construct_filename(styled_params_for_filename, is_target=False)
             output_path = get_output_path(dest_dir_worker, split_source_worker, original_base_filename, styled_filename)
@@ -519,13 +770,14 @@ def generate_and_save_styled_worker(styled_spec, crop_w_worker, crop_h_worker, d
             # Error 'mode' could also originate from inside save() if it receives wrong type
             try:
                 final_output_pil_for_save.save(output_path, format='PNG', quality=100)
+                mtime = os.path.getmtime(output_path)
+                size = final_output_pil_for_save.size
                 if verbose_worker >= 3: print(f"DEBUG WORKER [{spec_info_str}]: Successfully saved {output_path}")
             except Exception as e:
                  if verbose_worker >= 1: warnings.warn(f"Worker error saving styled output {output_path} for {spec_info_str}: {e}", stacklevel=2)
-                 return (styled_spec, False, f"Save failed: {e}")
+                 return (styled_spec, False, f"Save failed: {e}", (0, 0, output_path))
 
-
-            return (styled_spec, True, "") # Success result tuple
+            return (styled_spec, True, "", (mtime, size, output_path)) # Success result tuple
 
     except Exception as e:
         # This is the general exception catcher for any unhandled errors in the try block.
@@ -537,7 +789,7 @@ def generate_and_save_styled_worker(styled_spec, crop_w_worker, crop_h_worker, d
         return (styled_spec, False, message)
 
 # --- Main Generator Class ---
-class DatasetGenerator:
+class DatasetGenerator(DatasetScannerMixin):
     def __init__(self, args):
         # Store arguments and initialize instance variables
         self.args = args
@@ -566,6 +818,7 @@ class DatasetGenerator:
         # We instantiate the ScanCache even if the path is None; the class handles it.
         self.train_cache = ScanCache(cache_path=train_cache_path, verbose=self.verbose)
         self.test_cache = ScanCache(cache_path=test_cache_path, verbose=self.verbose)
+        self.output_cache = ScanCache(cache_path=os.path.join(self.dest_dir, DEFAULT_OUTPUT_CACHE_FILE), verbose=self.verbose)
 
         # --- Internal State (populated by methods) ---
         self.train_image_paths = []
@@ -696,19 +949,18 @@ class DatasetGenerator:
         # Sets self.active_style_characteristics and self.active_style_combinations
 
         if self.verbose >= 1: print("Determining active style combinations...")
+        from itertools import product
 
         # Assume SUPPORTED_RGB_FORMATS and SUPPORTED_DITHER_METHODS are accessible
         # from .quantize import SUPPORTED_DITHER_METHODS, SUPPORTED_RGB_FORMATS # Example if needed
 
         # Define supported values based on your quantize.py
         supported_rgb_formats = [888, 555, 565, 444, 666] # As per your quantize.py code
-        supported_palette_sizes = [0, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096] # 0 means all colours
+        supported_palette_sizes = [0, 2, 4, 8, 16, 24, 32, 64, 128, 256, 512, 1024, 2048, 4096] # 0 means all colours
         # Get supported dither methods keys + 'None' from your quantize.py DIFFUSION_MAPS
         SUPPORTED_DITHER_METHODS_KEYS = list(DIFFUSION_MAPS.keys()) + ['None', 'checkerboard', 'bayer2x2', 'bayer4x4', 'bayer8x8']
 
-
         # --- 1. Determine requested values from args, with validation and defaults ---
-
         requested_rgb_formats = []
         if self.args.rgb is not None: # Check if arg was provided
             for rgb_val in self.args.rgb:
@@ -721,7 +973,6 @@ class DatasetGenerator:
              if self.verbose >= 2: print("Debug: No valid RGB formats specified, defaulting to 888.")
              requested_rgb_formats = [888]
         requested_rgb_formats = sorted(list(set(requested_rgb_formats))) # Remove duplicates and sort
-
 
         requested_palette_sizes = []
         if self.args.palette is not None: # Check if arg was provided
@@ -775,11 +1026,12 @@ class DatasetGenerator:
             raise ValueError(f"Unsupported resolution styles requested: {unsupported}. Supported: {SUPPORTED_RESOLUTION_STYLES}.")
         self.requested_resolutions = sorted(list(set(self.requested_resolutions)))
 
-
         # --- 2. Determine the set of active style characteristics (color_space, target_palette_size, dithering_method) ---
         self.active_style_characteristics = set() # Set of (cs, ps, dm) tuples
         from itertools import product # Need product for combinations
 
+        requested_extra_modes = self.args.extra_mode or []
+    
         # Case A: No palette size was requested (--palette was not used) # FIXME checkerboard should work both on palette as pure RGB
         if not requested_palette_sizes:
             if self.verbose >= 2: print("Debug: No palette sizes requested (--palette not used). Generating non-paletted outputs.")
@@ -789,9 +1041,9 @@ class DatasetGenerator:
                 cs_name = f'RGB{rgb_val}'                
                 # For non-paletted outputs, only the 'None' dither method is valid.
                 if len(requested_dither_methods) == 0 or requested_dither_methods.count("None") == 1:
-                    self.active_style_characteristics.add((cs_name, None, 'None'))
+                    self.active_style_characteristics.add((cs_name, None, 'None', None))
                 elif 'checkerboard' in requested_dither_methods:
-                    self.active_style_characteristics.add((cs_name, None, 'checkerboard'))
+                    self.active_style_characteristics.add((cs_name, None, 'checkerboard', None))
 
         # Case B: Palette sizes *were* requested (--palette was used)
         else:
@@ -801,13 +1053,14 @@ class DatasetGenerator:
             # Since requested_rgb_formats defaults to [888] if args.rgb is None, we can just use requested_rgb_formats
             rgb_formats_for_palette = requested_rgb_formats
 
-            # Combine RGB formats, requested palette sizes, AND requested dithering methods
+            # Combine RGB formats, requested palette sizes, requested dithering methods and extra modes
             # This is where the --dither argument controls which dither methods are included for paletted outputs
             for cs_val, pal_size, dither_method in product(rgb_formats_for_palette, requested_palette_sizes, requested_dither_methods):
                 cs_name = f'RGB{cs_val}'
                 if pal_size == None and dither_method == 'checkerboard':
-                    self.active_style_characteristics.add((cs_name, pal_size, 'None'))
-                    continue # FIXME checkerboard should also work on pure RGB
+                    dither_method = 'None'
+                    #self.active_style_characteristics.add((cs_name, pal_size, 'None', None))
+                    #continue # FIXME checkerboard should also work on pure RGB
                 # Add this characteristic combination. Filtering for invalid dither/palette will happen later.
                 self.active_style_characteristics.add((cs_name, pal_size, dither_method))
 
@@ -817,6 +1070,20 @@ class DatasetGenerator:
         # --- 3. Determine the set of active style combinations including resolution style ---
         self.active_style_combinations = set() # Set of (res, cs, ps, dm) tuples
 
+        # Add style combinations for extra modes for specific resolutions
+        for res, mode in product(self.requested_resolutions, requested_extra_modes):
+            if res in ['lores', 'lores_laced']:
+                if mode.upper() == 'HAM6':
+                    self.active_style_combinations.add((res, 'RGB444', 'HAM6', 'None'))
+                elif mode.upper() == 'EHB':
+                    # Should check here for other RGB modes
+                    self.active_style_combinations.add((res, 'RGB888', 'EHB', 'None'))
+                elif mode.upper() == 'SHAM':
+                    self.active_style_combinations.add((res, 'RGB444', 'SHAM', 'None'))
+            if res in ['hires', 'hires_laced']:
+                if mode.upper() == 'DYNAMICHIRES':
+                    self.active_style_combinations.add((res, 'RGB444', 'DynamicHires', 'None'))
+
         # Combine requested resolutions with the determined style characteristics
         for res in self.requested_resolutions:
             for cs, ps, dm in self.active_style_characteristics: # dm is already the validated string
@@ -824,9 +1091,9 @@ class DatasetGenerator:
                 # --- Final Filtering of invalid combinations before adding to final set ---
                 # Rule: Dithering (methods other than 'None') requires a specified palette size (ps is not None)
                 if dm != 'None' and dm != 'checkerboard' and ps is None:
-                     if self.verbose >= 2:
-                          print(f"Debug: Skipping invalid final style combination (dither method '{dm}' requires a palette): Resolution='{res}', ColorSpace='{cs}', PaletteSize={ps}, DitherMethod='{dm}'")
-                     continue # Skip this combination
+                    if self.verbose >= 2:
+                        print(f"Debug: Skipping invalid final style combination (dither method '{dm}' requires a palette): Resolution='{res}', ColorSpace='{cs}', PaletteSize={ps}, DitherMethod='{dm}'")
+                    continue
 
                 # Add the valid combination to the final set
                 self.active_style_combinations.add((res, cs, ps, dm)) # dm is already the correct string ('None' or a key)
@@ -834,14 +1101,16 @@ class DatasetGenerator:
         if not self.active_style_combinations:
              raise ValueError("No valid style combinations were generated after filtering.")
 
-
         # Print the total number of active style combinations generated
         if self.verbose >= 1:
             print(f"Generated {len(self.active_style_combinations)} active style combinations.")
             if self.verbose >= 2:
                  print("  Active style combinations:")
                  # Sort for consistent output in debug prints
-                 sorted_combinations = sorted(list(self.active_style_combinations))
+                 sorted_combinations = sorted(
+                    list(self.active_style_combinations),
+                    key=lambda x: tuple(str(e) if e is not None else "" for e in x)
+                 )
                  for combo in sorted_combinations:
                       # Format Palette Size and Dither Method for clear printing
                       ps_str = 'None' if combo[2] is None else str(combo[2])
@@ -864,7 +1133,7 @@ class DatasetGenerator:
         }
         
         # Prepare a ThreadPoolExecutor for parallel scanning
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers * 2) as executor: # Double of max-workers for I/O bound
             futures = []
 
             for split, image_paths in all_image_paths.items():
@@ -874,10 +1143,10 @@ class DatasetGenerator:
                     for rot_deg in self.valid_rotations:
                         for ds_perc in self.valid_downscales:
                             if self.stop_requested: return
-                            cache_key = f"{img_path}_rot{rot_deg}_ds{ds_perc}"
+                            cache_key = f"{img_path}_w{self.crop_w}_h{self.crop_h}_rot{rot_deg}_ds{ds_perc}"
                             cached_data = cache.get_image_cache(cache_key)
                             if self.verbose >= 2:
-                                print(f"Cached data for {img_path} (rot: {rot_deg}°, scale: {ds_perc}%) : {cached_data}")
+                                print(f"Cached data for {img_path} ({self.crop_w}x{self.crop_h}, rot: {rot_deg}°, scale: {ds_perc}%) : {cached_data}")
 
                             # If cache is valid, skip scanning
                             if cached_data and cached_data['mtime'] == os.path.getmtime(img_path):
@@ -902,7 +1171,7 @@ class DatasetGenerator:
                 if self.stop_requested: return
                 try:
                     img_path, crop_w, crop_h, rot_deg, ds_perc, valid_coords, total_coords = future.result()
-                    cache_key = f"{img_path}_rot{rot_deg}_ds{ds_perc}"
+                    cache_key = f"{img_path}_w{crop_w}_h{crop_h}_rot{rot_deg}_ds{ds_perc}"
 
                     # Determine the split (train/test) based on the image path
                     split = 'train' if img_path in self.train_image_paths else 'test'
@@ -949,7 +1218,6 @@ class DatasetGenerator:
              if self.verbose >= 3:
                   print(f"Debug: Active style combinations: {self.active_style_combinations}")
 
-
         for split in ['train', 'test']:
              if self.verbose >= 2: print(f"Debug: Processing split: {split}")
              if self.verbose >= 2: print(f"Debug: Possible target operations for {split} count: {len(self.possible_target_crop_operations[split])}")
@@ -995,8 +1263,6 @@ class DatasetGenerator:
                       if i < 5: # Print for first few targets
                            print(f"Debug: Finished adding styled specs for target operation {i+1} in {split}. Final styled specs count for this target iteration: {len(self.full_valid_output_specs[split])}")
 
-
-
         if self.verbose >= 1:
             print(f"Full valid train target specs: {len(self.full_valid_target_specs['train'])}")
             print(f"Full valid test target specs: {len(self.full_valid_target_specs['test'])}")
@@ -1004,128 +1270,68 @@ class DatasetGenerator:
             print(f"Full valid test output specs (styled): {len(self.full_valid_output_specs['test'])}")
         if self.verbose >= 2: print(f"Debug: Exiting _build_full_valid_specs")
 
-    def _scan_output_directory(self):
-        # Implements Step 4 logic: Scan Output Directory and Identify Existing/Invalid Files
+    def _resolve_source_path(self, folder_name, split):
+        """
+        Resolves the original image path from a folder name (base filename).
+        Uses a reverse lookup of self.base_filenames for O(1) performance.
+        """
+        # Create reverse mapping once if it doesn't exist
+        if not hasattr(self, '_reverse_base_filenames'):
+            self._reverse_base_filenames = {v: k for k, v in self.base_filenames.items()}
+        
+        return self._reverse_base_filenames.get(folder_name)
 
-        if self.verbose >= 1: print(f"Scanning output directory {self.dest_dir} for existing files...")
+    def _print_mismatch_reason(self, filename, spec, split):
+        """Diagnoses why a parsed file doesn't match the current config."""
+        path, x, y, r, s, cs, pal, dit, res = spec
+        
+        # Check if the crop/rotation is in the plan
+        is_requested_crop = any(s_val[:5] == spec[:5] for s_val in self.full_valid_output_specs[split])
+        
+        if not is_requested_crop:
+            print(f"  [Invalid] {filename}: Crop ({x},{y}, s{s}, r{r}) is not in current target list.")
+        else:
+            # If the crop is valid, it's a parameter mismatch (RGB, Palette, Dither, or Res)
+            print(f"  [Invalid] {filename}: Parameter mismatch for valid crop.")
+            print(f"    - Found: Res={res}, CS={cs}, Pal={pal}, Dither={dit}")
 
-        # Need access to train_image_paths and test_image_paths to determine the split source for existing files
-        # These are instance attributes
+    def _verify_file_dimensions(self, file_path):
+        """
+        Checks if the file at file_path matches (self.crop_w, self.crop_h).
+        Uses self.output_cache (diskcache) to store/retrieve size by mtime.
+        """
+        try:
+            mtime = os.path.getmtime(file_path)
+            # Cache key is the relative path (to keep cache portable/clean)
+            rel_path = os.path.relpath(file_path, self.dest_dir)
+            
+            cached = self.output_cache.get_image_cache(rel_path)
+            if cached and cached.get('mtime') == mtime:
+                w, h = cached['size']
+            else:
+                # Cache miss or file changed: Open with PIL (Lazy read of header)
+                with Image.open(file_path) as img:
+                    w, h = img.size
+                self.output_cache.update_image_cache(rel_path, {'mtime': mtime, 'size': (w, h)})
 
-        for split in ['train', 'test']:
-            split_output_dir = os.path.join(self.dest_dir, split)
-            if not os.path.isdir(split_output_dir):
-                if self.verbose >= 1: print(f"Output directory for split '{split}' not found: {split_output_dir}. Skipping scan.")
-                continue
+            return w == self.crop_w and h == self.crop_h
+        except Exception:
+            return False
 
-            current_subdir_targets = set()
-            current_subdir_styles = set() 
-
-            for root, dirs, files in os.walk(split_output_dir):
-                if self.stop_requested: return
-
-                if root == split_output_dir:
-                    # If we are at the root of the split output directory, skip it
-                    continue
-
-                # The directory name is the original base filename without extension
-                original_base_filename_without_ext = os.path.basename(root)
-
-                original_img_path = None
-                split_source = None # Determine the split this directory corresponds to
-
-                # Find the original image path corresponding to this base filename
-                # Check in train images first (using instance attribute)
-                train_match = [p for p in self.train_image_paths if os.path.splitext(os.path.basename(p))[0] == original_base_filename_without_ext]
-                if train_match:
-                     original_img_path = train_match[0]
-                     split_source = 'train'
-                else:
-                     # Check in test images if not found in train (using instance attributes)
-                     if self.test_images_dir:
-                          test_match = [p for p in self.test_image_paths if os.path.splitext(os.path.basename(p))[0] == original_base_filename_without_ext]
-                          if test_match:
-                               original_img_path = test_match[0]
-                               split_source = 'test'
-
-                # If original_img_path is still None, the original image is missing or not from the specified input dirs.
-                # Files in this directory might be considered invalid or from a previous run with different inputs.
-                # For now, we'll still try to parse the filenames, but if the original image is truly gone,
-                # the corresponding specs won't be in the 'full_valid_output_specs'.
-
-                # Pre-scan for target filenames ---
-                found_target_filenames_in_subdir = set()
-                for f_name_pre_scan in files:
-                    p_params_pre_scan = parse_generated_filename(f_name_pre_scan) # Match your existing call (no self.verbose)
-                    if p_params_pre_scan and p_params_pre_scan['type'] == 'target':
-                        # We only need the filename itself for checking existence later.
-                        # Detailed image checks (size, openability) are handled in the main loop.
-                        found_target_filenames_in_subdir.add(f_name_pre_scan)
-
-                for filename in files:
-                    if self.stop_requested: return
-
-                    parsed_params = parse_generated_filename(filename)
-                    if parsed_params:                        
-                        if original_img_path:
-                            try:
-                                with Image.open(os.path.join(root, filename)) as img:
-                                    size = img.size
-                                    width, height = size
-                                if width != self.crop_w or height != self.crop_h:
-                                    self.invalid_files[split].append(os.path.join(root, filename))
-                                    if self.verbose >= 2: print(f"Found file with incorrect size in subdirectory: {os.path.join(root, filename)}")
-                                    continue
-                            except Exception as e:
-                                self.invalid_files[split].append(os.path.join(root, filename))
-                                if self.verbose >= 2: print(f"Error opening image file {os.path.join(root, filename)}: {e}")
-                                continue
-                            if parsed_params['type'] == 'target':
-                                target_spec = (original_img_path, parsed_params['crop_x'], parsed_params['crop_y'], parsed_params['rot_deg'], parsed_params['scale_perc'])
-                                if target_spec not in self.full_valid_target_specs[split_source]:
-                                    self.invalid_files[split_source].append(os.path.join(root, filename))
-                                else:
-                                    self.existing_target_specs[split_source].add(target_spec)
-
-                            elif parsed_params['type'] == 'style':
-                                style_spec = (original_img_path, parsed_params['crop_x'], parsed_params['crop_y'], parsed_params['rot_deg'], parsed_params['scale_perc'], parsed_params['rgb'], parsed_params['pal'], parsed_params['dither'], parsed_params['resolution'])
-                                if style_spec not in self.full_valid_output_specs[split_source]:
-                                    self.invalid_files[split_source].append(os.path.join(root, filename))
-                                else:
-                                    self.existing_output_specs[split_source].add(style_spec)
-                                
-                                # Check for missing target for this style
-                                target_params_for_filename = {
-                                    'crop_x': parsed_params['crop_x'],
-                                    'crop_y': parsed_params['crop_y'],
-                                    'scale_perc': parsed_params['scale_perc'],
-                                    'rot_deg': parsed_params['rot_deg']
-                                }
-                                expected_target_filename = construct_filename(target_params_for_filename, is_target=True)
-                                
-                                if expected_target_filename not in found_target_filenames_in_subdir:
-                                    self.invalid_files[split_source].append(os.path.join(root, filename))
-                                    if self.verbose >= 2:
-                                        warnings.warn(f"Styled file {filename} in {root} has no corresponding target file '{expected_target_filename}'. Marked for deletion.")
-
-                        else:
-                            self.invalid_files[split].append(os.path.join(root, filename))
-
-                    else:
-                        self.invalid_files[split].append(os.path.join(root, filename))
-                        if self.verbose >= 2: print(f"Found file in subdirectory with missing original image: {os.path.join(root, filename)}")
-
-            current_subdir_targets.clear()
-            current_subdir_styles.clear() 
-
-
-        if self.verbose >= 1:
-            print(f"Found {len(self.existing_target_specs['train'])} existing train target crops.")
-            print(f"Found {len(self.existing_output_specs['train'])} existing train styled outputs.")
-            print(f"Found {len(self.existing_target_specs['test'])} existing test target crops.")
-            print(f"Found {len(self.existing_output_specs['test'])} existing test styled outputs.")
-            print(f"Found {len(self.invalid_files['train'])} invalid files in train output.")
-            print(f"Found {len(self.invalid_files['test'])} invalid files in test output.")
+    def _print_mismatch_reason(self, filename, spec, split):
+        """Helper to diagnose why a parsed file doesn't match the current config."""
+        # Find if the target exists but the style parameters are different
+        path, x, y, r, s, cs, pal, dit, res = spec
+        
+        # Check if this specific crop/rotation is even requested
+        is_requested_crop = any(s[:5] == spec[:5] for s in self.full_valid_output_specs[split])
+        
+        if not is_requested_crop:
+            print(f"  [Invalid] {filename}: Crop/Scale/Rotation ({x},{y}, s{s}, r{r}) is not in current plan.")
+        else:
+            print(f"  [Invalid] {filename}: Parameter mismatch for valid crop.")
+            print(f"    - Found: Res={res}, CS={cs}, Pal={pal}, Dither={dit}")
+            # Optional: find the closest match in config to show the difference
 
     def _cleanup_invalid_files(self):
         # Implements Step 5 logic: Clean up Invalid Files (Optional)
@@ -1434,9 +1640,12 @@ class DatasetGenerator:
                 for future in concurrent.futures.as_completed(target_futures):
                     if self.stop_requested: return
                     try:
-                        target_spec, success, message = future.result()
+                        target_spec, success, message, meta = future.result()
                         if success:
                             saved_target_count += 1
+                            mtime, size, full_path = meta
+                            rel_path = os.path.relpath(full_path, self.dest_dir)
+                            self.output_cache.update_image_cache(rel_path, {'mtime': mtime, 'size': size})
                             if self.verbose >= 1:
                                 print(f"Saved target ({saved_target_count}/{targets_to_save_count}): {os.path.basename(target_spec[0])} ({target_spec[1]},{target_spec[2]}) rot {target_spec[3]} scale {target_spec[4]}%")
                         else:
@@ -1475,9 +1684,12 @@ class DatasetGenerator:
                 for future_index, future in enumerate(concurrent.futures.as_completed(styled_futures), start=1):
                     if self.stop_requested: return
                     try:
-                        styled_spec, success, message = future.result()
+                        styled_spec, success, message, meta = future.result()
                         if success:
                             generated_styled_count += 1
+                            mtime, size, full_path = meta
+                            rel_path = os.path.relpath(full_path, self.dest_dir)
+                            self.output_cache.update_image_cache(rel_path, {'mtime': mtime, 'size': size})
                             elapsed_time = time.time() - start_time
                             avg_time_per_item = elapsed_time / future_index
                             remaining_items = styled_to_generate_count - future_index
@@ -1488,8 +1700,9 @@ class DatasetGenerator:
                                 res, sx, sy, s_perc, r_deg, rgb, pal, dm, res_name = styled_spec[8], styled_spec[1], styled_spec[2], styled_spec[4], styled_spec[3], styled_spec[5], styled_spec[6], styled_spec[7], styled_spec[8]
                                 pal_str = str(pal) if pal is not None else 'None'
                                 print(f"Generated styled output ({generated_styled_count}/{styled_to_generate_count}): "
-                                      f"Resolution={res_name}, Crop=({sx},{sy}), Scale={s_perc}%, Rotation={r_deg}°, "
-                                      f"ColorSpace={rgb}, Palette={pal_str}, Dither={dm} | ETA: {eta_formatted}")
+                                      f"ETA: {eta_formatted} | "
+                                      f"Resolution={res_name}, Crop=({sx:4d},{sy:4d}), Scale={s_perc:2d}%, Rotation={r_deg:2d}°, "
+                                      f"ColorSpace={rgb}, Palette={pal_str:>5s}, Dither={dm}")
                         else:
                             warnings.warn(f"Failed to generate styled output {styled_spec[8]}_{styled_spec[1]}_{styled_spec[2]}...: {message}")
                         completed_futures.add(future)
@@ -1657,7 +1870,8 @@ if __name__ == '__main__':
     parser.add_argument("--max_workers", type=int, default=4, help="Maximum number of worker processes. 0 means all CPU cores.")
     parser.add_argument("--verbose", type=int, default=1, choices=[0, 1, 2, 3], help="Verbosity level: 0 (Quiet), 1 (Progress), 2 (Debug).")
     parser.add_argument("--rgb", type=int, nargs='*', default=None, metavar='INT', help="Generate outputs in these RGB formats (e.g., 888 565). Supported: 444, 555, 565, 666, 888.")
-    parser.add_argument("--palette", type=int, nargs='*', default=None, metavar='INT', help="Generate outputs with these palette sizes. Supported: 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096. 0 means all colours.")
+    parser.add_argument("--palette", type=int, nargs='*', default=None, metavar='INT', help="Generate outputs with these palette sizes. Supported: 2, 4, 8, 16, 24, 32, 64, 128, 256, 512, 1024, 2048, 4096. 0 means all colours.")
+    parser.add_argument("--extra_mode", type=str, nargs='*', default=None, metavar='MODE', help="Apply special graphics modes. Supported: HAM6, EHB, SHAM, DynamicHires.")
     parser.add_argument("--rotate", type=int, nargs='*', default=None, metavar='DEGREE', help="Rotate ground truth images by these angles in degrees before cropping (e.g., 0 90 180 270). 0 is default if none specified.")
     parser.add_argument("--downscale", type=int, nargs='*', default=None, metavar='PERCENT', help="Downscale ground truth images to these percentages of the original size before cropping (e.g., 50 75). Must be > 0 and < 100. 0%% is default if none specified.")
     parser.add_argument("--resolution", type=str, nargs='*', default=['lores'], metavar='STYLE', help=f"Generate outputs with these resolution styles. Supported: {SUPPORTED_RESOLUTION_STYLES}. Default: lores.")
